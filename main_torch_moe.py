@@ -108,7 +108,9 @@ class Model(nn.Module):
     def __init__(self, dim: int, layers: int, temp: float = 0.75,
                  num_experts: int = 1, top_k: int = 1,
                  aux_coef: float = 0.01, zloss_coef: float = 0.001,
-                 bptt: int = 64):
+                 bptt: int = 64, ema_tau: float = 0.99,
+                 latent_w: float = 1.0, ce_w: float = 1.0,
+                 var_w: float = 1.0, stop_w: float = 1.0):
         super().__init__()
         self.dim = dim
         self.layercount = layers
@@ -118,8 +120,19 @@ class Model(nn.Module):
         self.aux_coef = aux_coef
         self.zloss_coef = zloss_coef
         self.bptt = max(1, bptt)
+        self.ema_tau = ema_tau
+        self.latent_w = latent_w
+        self.ce_w = ce_w
+        self.var_w = var_w
+        self.stop_w = stop_w
 
         self.encoder = Encoder(dim)
+        # P0.2: entkoppelter Ziel-Encoder (EMA), kein Gradient.
+        self.target_encoder = Encoder(dim)
+        with torch.no_grad():
+            self.target_encoder.load_state_dict(self.encoder.state_dict())
+        for p in self.target_encoder.parameters():
+            p.requires_grad_(False)
         self.decoder = Decoder(dim)
         self.layers = nn.ModuleList(
             [MoELayer(dim, num_experts, self.top_k) for _ in range(layers)]
@@ -175,19 +188,29 @@ class Model(nn.Module):
         return (x, states, decays, auxs, zlosses, infos), (output, stop)
 
     def loss_terms(self, x, output, stop, nextb, end, auxs, zlosses):
-        loss = torch.clamp(1.0 - torch.sqrt(x.var() + 1e-4), min=0.0)
+        loss = self.var_w * torch.clamp(1.0 - torch.sqrt(x.var() + 1e-4), min=0.0)
         if nextb is not None:
             n = torch.tensor(nextb, device=x.device, dtype=torch.long)
             with torch.no_grad():
-                tgt = self.encoder(n)
-            loss = loss + torch.mean((x - tgt) ** 2)
-            loss = loss - output[n] + torch.logsumexp(output, dim=-1)
-            target = torch.tensor([1.0 if end else 0.0], device=x.device)
-            loss = loss + torch.mean((stop.view(-1) - target) ** 2)
+                tgt = self.target_encoder(n)
+            if self.latent_w > 0:
+                loss = loss + self.latent_w * torch.mean((x - tgt) ** 2)
+            if self.ce_w > 0:
+                loss = loss + self.ce_w * (
+                    -output[n] + torch.logsumexp(output, dim=-1))
+            if self.stop_w > 0:
+                target = torch.tensor([1.0 if end else 0.0], device=x.device)
+                loss = loss + self.stop_w * torch.mean((stop.view(-1) - target) ** 2)
             if self.num_experts > 1 and len(auxs) > 0:
                 loss = loss + self.aux_coef * torch.stack(auxs).mean()
                 loss = loss + self.zloss_coef * torch.stack(zlosses).mean()
         return loss
+
+    @torch.no_grad()
+    def update_target_ema(self):
+        for t, o in zip(self.target_encoder.parameters(),
+                        self.encoder.parameters()):
+            t.mul_(self.ema_tau).add_(o.detach(), alpha=1.0 - self.ema_tau)
 
     @torch.no_grad()
     def frozen_call(self, currb: int):
@@ -228,6 +251,7 @@ class Model(nn.Module):
         loss.backward()
         optimizer.step()
         with torch.no_grad():
+            self.update_target_ema()
             for layer, final in zip(self.layers, carries):
                 layer.states.copy_(final.detach())
             b = self.sample(last_out.detach())
@@ -285,11 +309,14 @@ class Runtime:
     def __init__(self, path: str, threshold: float, dim: int, layers: int,
                  temp: float, lr: float, num_experts: int = 1, top_k: int = 1,
                  aux_coef: float = 0.01, zloss_coef: float = 0.001,
-                 bptt: int = 64):
+                 bptt: int = 64, ema_tau: float = 0.99,
+                 latent_w: float = 1.0, ce_w: float = 1.0,
+                 var_w: float = 1.0, stop_w: float = 1.0):
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(dev)
         self.model = Model(dim, layers, temp, num_experts, top_k,
-                           aux_coef, zloss_coef, bptt)
+                           aux_coef, zloss_coef, bptt, ema_tau,
+                           latent_w, ce_w, var_w, stop_w)
         self.model.to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
         self.path = path
@@ -420,9 +447,18 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--threshold", type=float, default=0.35)
     parser.add_argument("--bptt", type=int, default=64)
+    parser.add_argument("--ema-tau", type=float, default=0.99)
+    parser.add_argument("--latent-w", type=float, default=1.0)
+    parser.add_argument("--ce-w", type=float, default=1.0)
+    parser.add_argument("--var-w", type=float, default=1.0)
+    parser.add_argument("--stop-w", type=float, default=1.0)
+    parser.add_argument("--no-latent", dest="latent_w", action="store_const",
+                        const=0.0)
     args = parser.parse_args()
 
     rt = Runtime(path=args.path, threshold=args.threshold, dim=args.dim,
                  layers=args.layers, temp=args.temp, lr=args.lr,
-                 num_experts=args.experts, top_k=args.topk, bptt=args.bptt)
+                 num_experts=args.experts, top_k=args.topk, bptt=args.bptt,
+                 ema_tau=args.ema_tau, latent_w=args.latent_w,
+                 ce_w=args.ce_w, var_w=args.var_w, stop_w=args.stop_w)
     rt(args.mode, args.dataset, args.save, args.frozen)
