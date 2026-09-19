@@ -323,16 +323,27 @@ class Model(nn.Module):
             return 0.0, 0.0, [c.detach() for c in carries]
 
         losses, ce_parts = [], []
+        z_parts = []
+        # P1.7: Switch-Aux über den ganzen Batch: pro Layer Summe der
+        # Router-Probs und geroutete Token-Anteile sammeln.
+        E = self.num_experts
+        sum_p = [torch.zeros(E, device=dev) for _ in self.layers]
+        routed = [torch.zeros(E, device=dev) for _ in self.layers]
         for t in range(T):
             enc = self.encoder(curr[:, t])  # (B, dim)
             x = enc
-            auxs, zlosses = [], []
             new_carries = []
             for i, layer in enumerate(self.layers):
-                x, state, _d, aux, zloss, _in = layer(enc, x, carries[i])
+                x, state, _d, aux, zloss, info = layer(enc, x, carries[i])
                 new_carries.append(state)
-                auxs.append(aux)
-                zlosses.append(zloss)
+                if info is not None:
+                    probs_b, top_b = info  # (B,E), (B,k)
+                    sum_p[i] = sum_p[i] + probs_b.sum(dim=0)
+                    oh = F.one_hot(top_b, num_classes=E).float().sum(dim=(0, 1))
+                    routed[i] = routed[i] + oh
+                    with torch.no_grad():
+                        layer.usage.add_(oh)
+                z_parts.append(zloss.mean())
             carries = new_carries
             output, stop = self.decoder(x)  # (B,256), (B,1)
             step_loss = self.var_w * torch.clamp(
@@ -351,14 +362,20 @@ class Model(nn.Module):
                 pw = torch.tensor([self.stop_pos_w], device=dev)
                 step_loss = step_loss + self.stop_w * F.binary_cross_entropy_with_logits(
                     stop, target, pos_weight=pw)
-            if self.num_experts > 1:
-                step_loss = step_loss + self.aux_coef * torch.stack(
-                    [a.mean() for a in auxs]).mean()
-                step_loss = step_loss + self.zloss_coef * torch.stack(
-                    [z.mean() for z in zlosses]).mean()
             losses.append(step_loss)
         loss = torch.stack(losses).mean()
         ce_mean = torch.stack(ce_parts).mean()
+        if self.num_experts > 1:
+            # Switch-Aux: E * sum(mean_p * frac); ~1.0 bei Balance.
+            n_tok = B * T
+            aux_l = []
+            for i in range(self.layercount):
+                mean_p = sum_p[i] / n_tok
+                frac = routed[i] / n_tok
+                aux_l.append(E * (mean_p * frac).sum())
+            loss = loss + self.aux_coef * torch.stack(aux_l).mean()
+        if z_parts:
+            loss = loss + self.zloss_coef * torch.stack(z_parts).mean()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if grad_clip and grad_clip > 0:
