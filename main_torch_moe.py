@@ -38,7 +38,13 @@ class Decoder(nn.Module):
         self.stop = nn.Linear(dim, 1)
 
     def forward(self, x: torch.Tensor):
-        return self.decode(x), torch.sigmoid(self.stop(x))
+        # P1.6: Stop als rohe Logits (BCEWithLogits im Loss); Sigmoid nur
+        # für Inference via stop_prob().
+        return self.decode(x), self.stop(x)
+
+
+def stop_prob(stop_logits: torch.Tensor) -> torch.Tensor:
+    return torch.sigmoid(stop_logits)
 
 
 class MoELayer(nn.Module):
@@ -124,7 +130,8 @@ class Model(nn.Module):
                  aux_coef: float = 0.01, zloss_coef: float = 0.001,
                  bptt: int = 64, ema_tau: float = 0.99,
                  latent_w: float = 1.0, ce_w: float = 1.0,
-                 var_w: float = 1.0, stop_w: float = 1.0):
+                 var_w: float = 1.0, stop_w: float = 1.0,
+                 stop_pos_w: float = 20.0):
         super().__init__()
         self.dim = dim
         self.layercount = layers
@@ -139,6 +146,7 @@ class Model(nn.Module):
         self.ce_w = ce_w
         self.var_w = var_w
         self.stop_w = stop_w
+        self.stop_pos_w = stop_pos_w
 
         self.encoder = Encoder(dim)
         # P0.2: entkoppelter Ziel-Encoder (EMA), kein Gradient.
@@ -213,8 +221,11 @@ class Model(nn.Module):
                 loss = loss + self.ce_w * (
                     -output[n] + torch.logsumexp(output, dim=-1))
             if self.stop_w > 0:
+                # P1.6: gewichtet (EOS ist selten), statt MSE auf 0/1.
                 target = torch.tensor([1.0 if end else 0.0], device=x.device)
-                loss = loss + self.stop_w * torch.mean((stop.view(-1) - target) ** 2)
+                pw = torch.tensor([self.stop_pos_w], device=x.device)
+                loss = loss + self.stop_w * F.binary_cross_entropy_with_logits(
+                    stop.view(-1), target, pos_weight=pw)
             if self.num_experts > 1 and len(auxs) > 0:
                 loss = loss + self.aux_coef * torch.stack(auxs).mean()
                 loss = loss + self.zloss_coef * torch.stack(zlosses).mean()
@@ -231,7 +242,7 @@ class Model(nn.Module):
         dev = self.device()
         c = torch.tensor(currb, device=dev, dtype=torch.long)
         (_, states, decays, auxs, zlosses, infos), (output, stop) = self.step(c, frozen=True)
-        return self.sample(output), float(stop.view(-1)[0])
+        return self.sample(output), float(stop_prob(stop).view(-1)[0])
 
     def train_window(self, curr_list: list, next_list: list, end_list: list,
                      optimizer, grad_clip: float = 1.0,
@@ -274,7 +285,7 @@ class Model(nn.Module):
             for layer, final in zip(self.layers, carries):
                 layer.states.copy_(final.detach())
             b = self.sample(last_out.detach())
-            s = float(last_stop.detach().view(-1)[0])
+            s = float(stop_prob(last_stop.detach()).view(-1)[0])
         return b, s, float(loss.detach())
 
     def train_step(self, currb: int, nextb, end: bool, optimizer) -> tuple:
@@ -337,7 +348,9 @@ class Model(nn.Module):
                 step_loss = step_loss + self.ce_w * ce_tok.mean()
             if self.stop_w > 0:
                 target = end[:, t].float().unsqueeze(1)
-                step_loss = step_loss + self.stop_w * ((stop - target) ** 2).mean()
+                pw = torch.tensor([self.stop_pos_w], device=dev)
+                step_loss = step_loss + self.stop_w * F.binary_cross_entropy_with_logits(
+                    stop, target, pos_weight=pw)
             if self.num_experts > 1:
                 step_loss = step_loss + self.aux_coef * torch.stack(
                     [a.mean() for a in auxs]).mean()
@@ -413,13 +426,14 @@ class Runtime:
                  bptt: int = 64, ema_tau: float = 0.99,
                  latent_w: float = 1.0, ce_w: float = 1.0,
                  var_w: float = 1.0, stop_w: float = 1.0,
+                 stop_pos_w: float = 20.0,
                  grad_clip: float = 1.0, warmup: int = 200,
                  decay_steps: int = 20000, min_lr_ratio: float = 0.1):
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(dev)
         self.model = Model(dim, layers, temp, num_experts, top_k,
                            aux_coef, zloss_coef, bptt, ema_tau,
-                           latent_w, ce_w, var_w, stop_w)
+                           latent_w, ce_w, var_w, stop_w, stop_pos_w)
         self.model.to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
         self.scheduler = self.make_scheduler(self.optimizer, warmup,
@@ -604,6 +618,7 @@ if __name__ == "__main__":
     parser.add_argument("--ce-w", type=float, default=1.0)
     parser.add_argument("--var-w", type=float, default=1.0)
     parser.add_argument("--stop-w", type=float, default=1.0)
+    parser.add_argument("--stop-pos-w", type=float, default=20.0)
     parser.add_argument("--no-latent", dest="latent_w", action="store_const",
                         const=0.0)
     parser.add_argument("--batch", type=int, default=8)
@@ -619,6 +634,7 @@ if __name__ == "__main__":
                  num_experts=args.experts, top_k=args.topk, bptt=args.bptt,
                  ema_tau=args.ema_tau, latent_w=args.latent_w,
                  ce_w=args.ce_w, var_w=args.var_w, stop_w=args.stop_w,
+                 stop_pos_w=args.stop_pos_w,
                  grad_clip=args.grad_clip, warmup=args.warmup,
                  decay_steps=args.decay_steps,
                  min_lr_ratio=args.min_lr_ratio)
