@@ -52,8 +52,10 @@ class MoELayer(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k if num_experts > 1 else 1
 
-        # trainierbar (wie MLX: self.decay)
-        self.decay = nn.Parameter(torch.zeros(dim))
+        # trainierbar (wie MLX: self.decay).
+        # P1.5: Init für längeres Gedächtnis (sigmoid(2.0) ~= 0.88)
+        # statt Halbwertszeit ~1 Byte bei Null-Init.
+        self.decay = nn.Parameter(torch.full((dim,), 2.0))
 
         # Buffer: recurrenter Carry (kein Gradient über Fenstergrenzen).
         # decaytrace/embedtrace sind deprecated (nur für alte Checkpoints
@@ -68,6 +70,10 @@ class MoELayer(nn.Module):
             [nn.Linear(dim, dim, bias=False) for _ in range(num_experts)]
         )
         self.router = nn.Linear(dim, num_experts) if num_experts > 1 else None
+        if self.router is not None:
+            # P1.5: Router startet nahe uniform (kleine Logits).
+            nn.init.normal_(self.router.weight, std=0.02)
+            nn.init.zeros_(self.router.bias)
         self.silu = nn.SiLU()
 
     def forward_moe(self, h_norm: torch.Tensor):
@@ -228,7 +234,8 @@ class Model(nn.Module):
         return self.sample(output), float(stop.view(-1)[0])
 
     def train_window(self, curr_list: list, next_list: list, end_list: list,
-                     optimizer) -> tuple:
+                     optimizer, grad_clip: float = 1.0,
+                     scheduler=None) -> tuple:
         """TBPTT über ein Fenster: voller Gradient für ALLE Gewichte
         (Encoder, Decoder, Experten, Router, Norm, Decay) innerhalb des
         Fensters; Carry wird nur an der Fenstergrenze detached."""
@@ -257,7 +264,11 @@ class Model(nn.Module):
         loss = torch.stack(losses).mean()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         with torch.no_grad():
             self.update_target_ema()
             for layer, final in zip(self.layers, carries):
@@ -273,7 +284,8 @@ class Model(nn.Module):
 
     def train_batch(self, curr: torch.Tensor, nxt: torch.Tensor,
                     end: torch.Tensor, carries, optimizer,
-                    frozen: bool = False):
+                    frozen: bool = False, grad_clip: float = 1.0,
+                    scheduler=None):
         """Vektorisiertes TBPTT über (B, T) Bytes. Ein Backward pro Batch.
 
         curr/nxt: (B, T) long; end: (B, T) bool. carries: Liste mit je
@@ -336,7 +348,11 @@ class Model(nn.Module):
         ce_mean = torch.stack(ce_parts).mean()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), grad_clip)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         with torch.no_grad():
             self.update_target_ema()
         return (float(loss.detach()), float(ce_mean.detach()),
@@ -396,7 +412,9 @@ class Runtime:
                  aux_coef: float = 0.01, zloss_coef: float = 0.001,
                  bptt: int = 64, ema_tau: float = 0.99,
                  latent_w: float = 1.0, ce_w: float = 1.0,
-                 var_w: float = 1.0, stop_w: float = 1.0):
+                 var_w: float = 1.0, stop_w: float = 1.0,
+                 grad_clip: float = 1.0, warmup: int = 200,
+                 decay_steps: int = 20000, min_lr_ratio: float = 0.1):
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(dev)
         self.model = Model(dim, layers, temp, num_experts, top_k,
@@ -404,9 +422,26 @@ class Runtime:
                            latent_w, ce_w, var_w, stop_w)
         self.model.to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+        self.scheduler = self.make_scheduler(self.optimizer, warmup,
+                                             decay_steps, min_lr_ratio)
+        self.grad_clip = grad_clip
         self.path = path
         self.threshold = threshold
         self.step = 0
+
+    @staticmethod
+    def make_scheduler(optimizer, warmup: int, decay_steps: int,
+                       min_ratio: float):
+        import math as _math
+
+        def lr_lambda(step: int):
+            if step < max(1, warmup):
+                return (step + 1) / max(1, warmup)
+            p = min(1.0, (step - warmup) / max(1, decay_steps))
+            return min_ratio + 0.5 * (1.0 - min_ratio) * (
+                1.0 + _math.cos(_math.pi * p))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     def save_periodic(self):
         self.step += 1
@@ -438,7 +473,9 @@ class Runtime:
                     nn_ = [n for _, n in ch]
                     ee = [i == len(pairs) - 1 for i in
                           range(s, min(s + self.model.bptt, len(pairs)))]
-                    self.model.train_window(cc, nn_, ee, self.optimizer)
+                    self.model.train_window(cc, nn_, ee, self.optimizer,
+                                              grad_clip=self.grad_clip,
+                                              scheduler=self.scheduler)
                     if save:
                         self.save_periodic()
             else:
@@ -490,7 +527,8 @@ class Runtime:
                     end = (nxt == 10)  # \n als EOS-Markierung (P1.6)
                     loss, ce, carries = self.model.train_batch(
                         curr, nxt, end, carries, self.optimizer,
-                        frozen=frozen)
+                        frozen=frozen, grad_clip=self.grad_clip,
+                        scheduler=None if frozen else self.scheduler)
                     carried += (e - s)
                     if not frozen:
                         logged += 1
@@ -502,12 +540,28 @@ class Runtime:
                     if save:
                         self.save_periodic()
 
+    def restore_opt_sched(self):
+        if not os.path.exists(self.path):
+            return
+        try:
+            data = torch.load(self.path, map_location="cpu", weights_only=True)
+        except Exception:
+            return
+        try:
+            if isinstance(data, dict) and "optim" in data:
+                self.optimizer.load_state_dict(data["optim"])
+            if isinstance(data, dict) and "sched" in data:
+                self.scheduler.load_state_dict(data["sched"])
+        except Exception:
+            pass
+
     def now(self):
         return datetime.now().strftime("%d/%m/%Y, %H:%M:%S")
 
     def __call__(self, mode: str, dataset: str, save: bool, frozen: bool,
                  batch: int = 8, max_carry: int = 2048):
         self.model.load(self.path)
+        self.restore_opt_sched()
         self.model.reset()  # P0.4: Inference startet immer mit Null-Memory
         print(f"device: {self.device}, total: {self.model.count_total():,}, "
               f"aktiv: {self.model.count_active():,} "
@@ -524,7 +578,8 @@ class Runtime:
                 tmp = os.path.join(os.path.dirname(self.path) or ".",
                                    "temporary-" + os.path.basename(self.path))
                 torch.save({"model": self.model.weights_state_dict(),
-                            "optim": self.optimizer.state_dict()}, tmp)
+                            "optim": self.optimizer.state_dict(),
+                            "sched": self.scheduler.state_dict()}, tmp)
                 os.replace(tmp, self.path)
 
 
@@ -553,12 +608,19 @@ if __name__ == "__main__":
                         const=0.0)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--max-carry", type=int, default=2048)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--warmup", type=int, default=200)
+    parser.add_argument("--decay-steps", type=int, default=20000)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     args = parser.parse_args()
 
     rt = Runtime(path=args.path, threshold=args.threshold, dim=args.dim,
                  layers=args.layers, temp=args.temp, lr=args.lr,
                  num_experts=args.experts, top_k=args.topk, bptt=args.bptt,
                  ema_tau=args.ema_tau, latent_w=args.latent_w,
-                 ce_w=args.ce_w, var_w=args.var_w, stop_w=args.stop_w)
+                 ce_w=args.ce_w, var_w=args.var_w, stop_w=args.stop_w,
+                 grad_clip=args.grad_clip, warmup=args.warmup,
+                 decay_steps=args.decay_steps,
+                 min_lr_ratio=args.min_lr_ratio)
     rt(args.mode, args.dataset, args.save, args.frozen, batch=args.batch,
        max_carry=args.max_carry)
