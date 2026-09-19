@@ -85,8 +85,9 @@ class MoELayer(nn.Module):
     def forward_moe(self, h_norm: torch.Tensor):
         """Batched MoE: h_norm (..., dim) -> y (..., dim).
 
-        E=1 ist dense. Sonst Top-k über Softmax-Gewichte; Experten werden
-        gestapelt und per gather kombiniert (E klein, Korrektheit > Kernel).
+        E=1 ist dense. Sonst Top-k über Softmax-Gewichte; nur selektierte
+        Experten werden gerechnet (mathematisch identisch zum dichten
+        Stapel, aber ~E/k billiger im Forward).
         """
         if self.num_experts == 1:
             return self.silu(self.experts[0](h_norm)), None, None, None, None
@@ -95,11 +96,20 @@ class MoELayer(nn.Module):
         _top_v, top_idx = torch.topk(logits, self.top_k, dim=-1)  # (..., k)
         w = torch.gather(probs, -1, top_idx)
         w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-        outs = torch.stack([self.silu(e(h_norm)) for e in self.experts],
-                           dim=-2)  # (..., E, dim)
-        idx = top_idx.unsqueeze(-1).expand(*top_idx.shape, h_norm.shape[-1])
-        sel = torch.gather(outs, -2, idx)  # (..., k, dim)
-        y = (sel * w.unsqueeze(-1)).sum(dim=-2)
+        flat_h = h_norm.reshape(-1, h_norm.shape[-1])  # (N, dim)
+        flat_idx = top_idx.reshape(-1, self.top_k)  # (N, k)
+        flat_w = w.reshape(-1, self.top_k)  # (N, k)
+        # Gewichte stapeln + per-Token selektieren: keine Syncs, nur
+        # selektierte (N*k) Matmulen statt E dichte Linears.
+        Wall = torch.stack([e.weight for e in self.experts])  # (E,d,d)
+        Wsel = Wall[flat_idx]  # (N, k, d, d)
+        hsel = flat_h.unsqueeze(1).expand(-1, self.top_k, -1)  # (N,k,d)
+        out = self.silu(torch.bmm(
+            Wsel.reshape(-1, self.dim, self.dim),
+            hsel.reshape(-1, self.dim, 1)).squeeze(-1))  # (N*k, d)
+        out = out.view(-1, self.top_k, self.dim)  # (N, k, d)
+        y_flat = (out * flat_w.unsqueeze(-1)).sum(dim=1)  # (N, d)
+        y = y_flat.view_as(h_norm)
         return y, probs, top_idx, w, logits
 
     def forward(self, enc: torch.Tensor, x: torch.Tensor, prev: torch.Tensor):
