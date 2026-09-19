@@ -71,22 +71,29 @@ class MoELayer(nn.Module):
         self.silu = nn.SiLU()
 
     def forward_moe(self, h_norm: torch.Tensor):
-        """Gibt (y, probs, top_idx, weights) zurück."""
+        """Batched MoE: h_norm (..., dim) -> y (..., dim).
+
+        E=1 ist dense. Sonst Top-k über Softmax-Gewichte; Experten werden
+        gestapelt und per gather kombiniert (E klein, Korrektheit > Kernel).
+        """
         if self.num_experts == 1:
-            return self.silu(self.experts[0](h_norm)), None, None, None
-        logits = self.router(h_norm)  # (E,)
+            return self.silu(self.experts[0](h_norm)), None, None, None, None
+        logits = self.router(h_norm)  # (..., E)
         probs = torch.softmax(logits, dim=-1)
-        top_vals, top_idx = torch.topk(logits, self.top_k)
-        w = probs[top_idx]
-        w = w / (w.sum() + 1e-9)
-        y = torch.zeros_like(h_norm)
-        for j, e_idx in enumerate(top_idx.tolist()):
-            y = y + w[j] * self.silu(self.experts[e_idx](h_norm))
+        _top_v, top_idx = torch.topk(logits, self.top_k, dim=-1)  # (..., k)
+        w = torch.gather(probs, -1, top_idx)
+        w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        outs = torch.stack([self.silu(e(h_norm)) for e in self.experts],
+                           dim=-2)  # (..., E, dim)
+        idx = top_idx.unsqueeze(-1).expand(*top_idx.shape, h_norm.shape[-1])
+        sel = torch.gather(outs, -2, idx)  # (..., k, dim)
+        y = (sel * w.unsqueeze(-1)).sum(dim=-2)
         return y, probs, top_idx, w, logits
 
     def forward(self, enc: torch.Tensor, x: torch.Tensor, prev: torch.Tensor):
-        """Ein Zeitschritt. prev ist der Carry (mit Grad innerhalb Fenster)."""
-        decay = torch.sigmoid(self.decay)  # (dim,)
+        """Ein Zeitschritt. prev ist der Carry (mit Grad innerhalb Fenster).
+        Alle Tensoren (dim,) single-stream oder (B, dim) batched."""
+        decay = torch.sigmoid(self.decay)  # (dim,) broadcastet über Batch
         state = decay * prev + enc
         h_norm = self.norm(state)
         if self.num_experts == 1:
@@ -96,8 +103,9 @@ class MoELayer(nn.Module):
             info = None
         else:
             y, probs, top_idx, w, logits = self.forward_moe(h_norm)
-            # Single-Token Uniformitäts-Aux: E*sum(p^2)-1 in [0, E-1], 0=uniform.
-            aux = self.num_experts * (probs * probs).sum() - 1.0
+            # Uniformitäts-Aux pro Position: E*sum(p^2)-1 in [0, E-1].
+            # Single-Token: Skalar; batched: (...,) und Caller mittelt.
+            aux = self.num_experts * (probs * probs).sum(dim=-1) - 1.0
             zloss = torch.logsumexp(logits, dim=-1).pow(2)
             info = (probs.detach(), top_idx.detach())
         out = x + y
@@ -263,6 +271,77 @@ class Model(nn.Module):
         b, s, _ = self.train_window([currb], [nextb], [end], optimizer)
         return b, s
 
+    def train_batch(self, curr: torch.Tensor, nxt: torch.Tensor,
+                    end: torch.Tensor, carries, optimizer,
+                    frozen: bool = False):
+        """Vektorisiertes TBPTT über (B, T) Bytes. Ein Backward pro Batch.
+
+        curr/nxt: (B, T) long; end: (B, T) bool. carries: Liste mit je
+        (B, dim)-Carry pro Layer (Start des Fensters). Gibt
+        (loss, ce_mean, neue_carries) zurück; frozen=True schiebt nur
+        Carries ohne Gewichts-Update.
+        """
+        B, T = curr.shape
+        dev = curr.device
+        if carries is None:
+            carries = [torch.zeros(B, self.dim, device=dev)
+                       for _ in range(self.layercount)]
+        if frozen:
+            with torch.no_grad():
+                for t in range(T):
+                    enc = self.encoder(curr[:, t])  # (B, dim)
+                    x = enc
+                    new_carries = []
+                    for i, layer in enumerate(self.layers):
+                        x, state, _d, _a, _z, _in = layer(enc, x, carries[i])
+                        new_carries.append(state)
+                    carries = new_carries
+                    self.decoder(x)
+            return 0.0, 0.0, [c.detach() for c in carries]
+
+        losses, ce_parts = [], []
+        for t in range(T):
+            enc = self.encoder(curr[:, t])  # (B, dim)
+            x = enc
+            auxs, zlosses = [], []
+            new_carries = []
+            for i, layer in enumerate(self.layers):
+                x, state, _d, aux, zloss, _in = layer(enc, x, carries[i])
+                new_carries.append(state)
+                auxs.append(aux)
+                zlosses.append(zloss)
+            carries = new_carries
+            output, stop = self.decoder(x)  # (B,256), (B,1)
+            step_loss = self.var_w * torch.clamp(
+                1.0 - torch.sqrt(x.var() + 1e-4), min=0.0)
+            with torch.no_grad():
+                tgt = self.target_encoder(nxt[:, t])  # (B, dim)
+            if self.latent_w > 0:
+                step_loss = step_loss + self.latent_w * ((x - tgt) ** 2).mean()
+            ce_tok = (-output.gather(1, nxt[:, t : t + 1]).squeeze(1)
+                      + torch.logsumexp(output, dim=-1))  # (B,)
+            ce_parts.append(ce_tok.detach().mean())
+            if self.ce_w > 0:
+                step_loss = step_loss + self.ce_w * ce_tok.mean()
+            if self.stop_w > 0:
+                target = end[:, t].float().unsqueeze(1)
+                step_loss = step_loss + self.stop_w * ((stop - target) ** 2).mean()
+            if self.num_experts > 1:
+                step_loss = step_loss + self.aux_coef * torch.stack(
+                    [a.mean() for a in auxs]).mean()
+                step_loss = step_loss + self.zloss_coef * torch.stack(
+                    [z.mean() for z in zlosses]).mean()
+            losses.append(step_loss)
+        loss = torch.stack(losses).mean()
+        ce_mean = torch.stack(ce_parts).mean()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        with torch.no_grad():
+            self.update_target_ema()
+        return (float(loss.detach()), float(ce_mean.detach()),
+                [c.detach() for c in carries])
+
     def __call__(self, currb: int, nextb, end: bool, frozen: bool, optimizer=None):
         if frozen:
             return self.frozen_call(currb)
@@ -371,45 +450,51 @@ class Runtime:
             else:
                 print()
 
-    def train(self, save: bool, frozen: bool, dataset: str):
+    def train(self, save: bool, frozen: bool, dataset: str, batch: int = 8):
         files = glob.glob(dataset, recursive=True)
         if not files:
             raise FileNotFoundError(f"Glob {dataset!r} fand nichts.")
         random.shuffle(files)
-        W = self.model.bptt
+        T = self.model.bptt
+        dev = self.device
         logged = 0
         while True:
             for file in files:
-                with open(file, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        data = line.encode("utf-8")
-                        if len(data) < 2:
-                            continue
-                        pairs = [(c, n) for c, n in itertools.pairwise(data)]
-                        for s in range(0, len(pairs), W):
-                            ch = pairs[s:s + W]
-                            cc = [c for c, _ in ch]
-                            nn_ = [n for _, n in ch]
-                            ee = [(s + j) == len(pairs) - 1
-                                  for j in range(len(ch))]
-                            if frozen:
-                                for c in cc:
-                                    self.model.frozen_call(c)
-                            else:
-                                _, _, loss = self.model.train_window(
-                                    cc, nn_, ee, self.optimizer)
-                                logged += 1
-                                if logged % 50 == 0:
-                                    print(f"\n[win {logged}] loss {loss:.4f} "
-                                          f"(BPC {loss / 0.6931:.4f})",
-                                          flush=True)
-                            if save:
-                                self.save_periodic()
+                with open(file, "rb") as f:
+                    raw = f.read(1 << 20)  # 1 MiB pro File und Epoche
+                if len(raw) < batch * 16 + 1:
+                    continue
+                ids = list(raw)
+                n = (len(ids) - 1) // batch
+                streams = torch.tensor(
+                    [ids[i * n: i * n + n] for i in range(batch)],
+                    dtype=torch.long, device=dev)  # (B, n)
+                carries = None
+                for s in range(0, n - 1, T):
+                    e = min(s + T, n - 1)
+                    if e - s < 8:
+                        continue
+                    curr = streams[:, s:e]
+                    nxt = streams[:, s + 1: e + 1]
+                    end = (nxt == 10)  # \n als EOS-Markierung (P1.6)
+                    loss, ce, carries = self.model.train_batch(
+                        curr, nxt, end, carries, self.optimizer,
+                        frozen=frozen)
+                    if not frozen:
+                        logged += 1
+                        if logged % 20 == 0:
+                            print(f"\n[batch {logged}] loss {loss:.4f} "
+                                  f"CE {ce:.4f} BPC {ce / 0.6931:.4f} "
+                                  f"({batch}x{e-s} tok)",
+                                  flush=True)
+                    if save:
+                        self.save_periodic()
 
     def now(self):
         return datetime.now().strftime("%d/%m/%Y, %H:%M:%S")
 
-    def __call__(self, mode: str, dataset: str, save: bool, frozen: bool):
+    def __call__(self, mode: str, dataset: str, save: bool, frozen: bool,
+                 batch: int = 8):
         # Optimizer-State laden falls vorhanden (Datei speichert nur Modell;
         # Optimizer startet frisch — bewusst, sonst TTT-Drift über Runs)
         self.model.load(self.path)
@@ -418,7 +503,7 @@ class Runtime:
               f"(E={self.model.num_experts}, k={self.model.top_k})")
         try:
             if mode == "train":
-                self.train(save, frozen, dataset)
+                self.train(save, frozen, dataset, batch=batch)
             elif mode == "chat":
                 self.chat(save, frozen)
         finally:
@@ -454,6 +539,7 @@ if __name__ == "__main__":
     parser.add_argument("--stop-w", type=float, default=1.0)
     parser.add_argument("--no-latent", dest="latent_w", action="store_const",
                         const=0.0)
+    parser.add_argument("--batch", type=int, default=8)
     args = parser.parse_args()
 
     rt = Runtime(path=args.path, threshold=args.threshold, dim=args.dim,
@@ -461,4 +547,4 @@ if __name__ == "__main__":
                  num_experts=args.experts, top_k=args.topk, bptt=args.bptt,
                  ema_tau=args.ema_tau, latent_w=args.latent_w,
                  ce_w=args.ce_w, var_w=args.var_w, stop_w=args.stop_w)
-    rt(args.mode, args.dataset, args.save, args.frozen)
+    rt(args.mode, args.dataset, args.save, args.frozen, batch=args.batch)
