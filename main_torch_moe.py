@@ -299,17 +299,57 @@ class Model(nn.Module):
         b, s, _ = self.train_window([currb], [nextb], [end], optimizer)
         return b, s
 
+    def _forward_window(self, curr: torch.Tensor, carries):
+        """Rein funktionaler Fenster-Forward für torch.compile.
+
+        curr: (B, T) long. carries: Liste je (B, dim). Gibt gestapelte
+        Per-Step-Tensoren + Routing-Aggregate + neue Carries zurück.
+        Keine Buffer-Mutation hier (usage macht der Caller).
+        """
+        B, T = curr.shape
+        dev = curr.device
+        E = self.num_experts
+        xs, outs, stops = [], [], []
+        sum_p = [torch.zeros(E, device=dev) for _ in self.layers]
+        routed = [torch.zeros(E, device=dev) for _ in self.layers]
+        z_parts = []
+        for t in range(T):
+            enc = self.encoder(curr[:, t])  # (B, dim)
+            x = enc
+            new_carries = []
+            for i, layer in enumerate(self.layers):
+                x, state, _d, _aux, zloss, info = layer(enc, x, carries[i])
+                new_carries.append(state)
+                if info is not None:
+                    probs_b, top_b = info  # (B,E), (B,k)
+                    sum_p[i] = sum_p[i] + probs_b.sum(dim=0)
+                    routed[i] = routed[i] + F.one_hot(
+                        top_b, num_classes=E).float().sum(dim=(0, 1))
+                z_parts.append(zloss.mean())
+            carries = new_carries
+            output, stop = self.decoder(x)  # (B,256), (B,1)
+            xs.append(x)
+            outs.append(output)
+            stops.append(stop)
+        z_mean = torch.stack(z_parts).mean() if z_parts else None
+        return (torch.stack(xs), torch.stack(outs), torch.stack(stops),
+                sum_p, routed, z_mean, carries)
+
+    def enable_compile(self):
+        """Persistente Kernel: Fenster-Forward wird einmal kompiliert
+        (Inductor + CUDA-Graphs) und danach ohne CPU-Relaunch replayed."""
+        self._compiled_forward = torch.compile(
+            self._forward_window, mode="max-autotune", fullgraph=False,
+            dynamic=False)
+        return self._compiled_forward
+
     def train_batch(self, curr: torch.Tensor, nxt: torch.Tensor,
                     end: torch.Tensor, carries, optimizer,
                     frozen: bool = False, grad_clip: float = 1.0,
-                    scheduler=None):
-        """Vektorisiertes TBPTT über (B, T) Bytes. Ein Backward pro Batch.
-
-        curr/nxt: (B, T) long; end: (B, T) bool. carries: Liste mit je
-        (B, dim)-Carry pro Layer (Start des Fensters). Gibt
-        (loss, ce_mean, neue_carries) zurück; frozen=True schiebt nur
-        Carries ohne Gewichts-Update.
-        """
+                    scheduler=None, amp: bool = False):
+        """Vektorisiertes TBPTT über (B, T) Bytes. Ein Forward + ein
+        Backward pro Batch. Forward läuft optional kompiliert (persistente
+        Kernel via CUDA-Graphs) und in bf16; Losses in fp32."""
         B, T = curr.shape
         dev = curr.device
         if carries is None:
@@ -317,71 +357,44 @@ class Model(nn.Module):
                        for _ in range(self.layercount)]
         if frozen:
             with torch.no_grad():
-                for t in range(T):
-                    enc = self.encoder(curr[:, t])  # (B, dim)
-                    x = enc
-                    new_carries = []
-                    for i, layer in enumerate(self.layers):
-                        x, state, _d, _a, _z, _in = layer(enc, x, carries[i])
-                        new_carries.append(state)
-                    carries = new_carries
-                    self.decoder(x)
+                _, _, _, _, _, _, carries = self._forward_window(curr, carries)
             return 0.0, 0.0, [c.detach() for c in carries]
 
-        losses, ce_parts = [], []
-        z_parts = []
-        # P1.7: Switch-Aux über den ganzen Batch: pro Layer Summe der
-        # Router-Probs und geroutete Token-Anteile sammeln.
-        E = self.num_experts
-        sum_p = [torch.zeros(E, device=dev) for _ in self.layers]
-        routed = [torch.zeros(E, device=dev) for _ in self.layers]
-        for t in range(T):
-            enc = self.encoder(curr[:, t])  # (B, dim)
-            x = enc
-            new_carries = []
-            for i, layer in enumerate(self.layers):
-                x, state, _d, aux, zloss, info = layer(enc, x, carries[i])
-                new_carries.append(state)
-                if info is not None:
-                    probs_b, top_b = info  # (B,E), (B,k)
-                    sum_p[i] = sum_p[i] + probs_b.sum(dim=0)
-                    oh = F.one_hot(top_b, num_classes=E).float().sum(dim=(0, 1))
-                    routed[i] = routed[i] + oh
-                    with torch.no_grad():
-                        layer.usage.add_(oh)
-                z_parts.append(zloss.mean())
-            carries = new_carries
-            output, stop = self.decoder(x)  # (B,256), (B,1)
-            step_loss = self.var_w * torch.clamp(
-                1.0 - torch.sqrt(x.var() + 1e-4), min=0.0)
-            with torch.no_grad():
-                tgt = self.target_encoder(nxt[:, t])  # (B, dim)
-            if self.latent_w > 0:
-                step_loss = step_loss + self.latent_w * ((x - tgt) ** 2).mean()
-            ce_tok = (-output.gather(1, nxt[:, t : t + 1]).squeeze(1)
-                      + torch.logsumexp(output, dim=-1))  # (B,)
-            ce_parts.append(ce_tok.detach().mean())
-            if self.ce_w > 0:
-                step_loss = step_loss + self.ce_w * ce_tok.mean()
-            if self.stop_w > 0:
-                target = end[:, t].float().unsqueeze(1)
-                pw = torch.tensor([self.stop_pos_w], device=dev)
-                step_loss = step_loss + self.stop_w * F.binary_cross_entropy_with_logits(
-                    stop, target, pos_weight=pw)
-            losses.append(step_loss)
-        loss = torch.stack(losses).mean()
-        ce_mean = torch.stack(ce_parts).mean()
+        use_amp = amp and dev.type == "cuda"
+        fwd = getattr(self, "_compiled_forward", None) or self._forward_window
+        with torch.autocast("cuda", torch.bfloat16, enabled=use_amp):
+            xs, outs, stops, sum_p, routed, z_mean, carries = fwd(curr, carries)
+        # usage-Monitoring (kein Grad)
+        with torch.no_grad():
+            for layer, rc in zip(self.layers, routed):
+                layer.usage.add_(rc)
+
+        # --- fp32-Losses über das ganze Fenster (wenige große Kernel) ---
+        loss = self.var_w * torch.clamp(
+            1.0 - torch.sqrt(xs.float().var() + 1e-4), min=0.0)
+        # xs/outs/stops sind time-major (T,B,...), nxt/end batch-major (B,T).
+        with torch.no_grad():
+            tgt = self.target_encoder(nxt.t().reshape(-1)).view_as(xs.float())
+        if self.latent_w > 0:
+            loss = loss + self.latent_w * ((xs.float() - tgt) ** 2).mean()
+        ce_tok = (-outs.float().gather(2, nxt.t().unsqueeze(-1)).squeeze(-1)
+                  + torch.logsumexp(outs.float(), dim=-1))  # (T,B)
+        ce_mean = ce_tok.detach().mean()
+        if self.ce_w > 0:
+            loss = loss + self.ce_w * ce_tok.mean()
+        if self.stop_w > 0:
+            pw = torch.tensor([self.stop_pos_w], device=dev)
+            loss = loss + self.stop_w * F.binary_cross_entropy_with_logits(
+                stops.float().squeeze(-1), end.float().t(), pos_weight=pw)
         if self.num_experts > 1:
             # Switch-Aux: E * sum(mean_p * frac); ~1.0 bei Balance.
             n_tok = B * T
-            aux_l = []
-            for i in range(self.layercount):
-                mean_p = sum_p[i] / n_tok
-                frac = routed[i] / n_tok
-                aux_l.append(E * (mean_p * frac).sum())
+            E = self.num_experts
+            aux_l = [(E * (sp / n_tok * (rc / n_tok)).sum())
+                     for sp, rc in zip(sum_p, routed)]
             loss = loss + self.aux_coef * torch.stack(aux_l).mean()
-        if z_parts:
-            loss = loss + self.zloss_coef * torch.stack(z_parts).mean()
+        if z_mean is not None:
+            loss = loss + self.zloss_coef * z_mean.mean()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if grad_clip and grad_clip > 0:
@@ -451,13 +464,17 @@ class Runtime:
                  var_w: float = 1.0, stop_w: float = 1.0,
                  stop_pos_w: float = 20.0,
                  grad_clip: float = 1.0, warmup: int = 200,
-                 decay_steps: int = 20000, min_lr_ratio: float = 0.1):
+                 decay_steps: int = 20000, min_lr_ratio: float = 0.1,
+                 amp: bool = False, compile: bool = False):
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(dev)
         self.model = Model(dim, layers, temp, num_experts, top_k,
                            aux_coef, zloss_coef, bptt, ema_tau,
                            latent_w, ce_w, var_w, stop_w, stop_pos_w)
         self.model.to(self.device)
+        self.amp = amp
+        if compile:
+            self.model.enable_compile()
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
         self.scheduler = self.make_scheduler(self.optimizer, warmup,
                                              decay_steps, min_lr_ratio)
@@ -539,6 +556,7 @@ class Runtime:
         T = self.model.bptt
         dev = self.device
         logged = 0
+        t0 = time.time()
         while True:
             for file in files:
                 with open(file, "rb") as f:
@@ -565,14 +583,17 @@ class Runtime:
                     loss, ce, carries = self.model.train_batch(
                         curr, nxt, end, carries, self.optimizer,
                         frozen=frozen, grad_clip=self.grad_clip,
-                        scheduler=None if frozen else self.scheduler)
+                        scheduler=None if frozen else self.scheduler,
+                        amp=self.amp)
                     carried += (e - s)
                     if not frozen:
                         logged += 1
                         if logged % 20 == 0:
+                            dt = time.time() - t0
+                            tps = logged * batch * T / max(dt, 1e-6)
                             print(f"\n[batch {logged}] loss {loss:.4f} "
                                   f"CE {ce:.4f} BPC {ce / 0.6931:.4f} "
-                                  f"({batch}x{e-s} tok)",
+                                  f"({batch}x{e-s} tok, {tps:.0f} tok/s)",
                                   flush=True)
                     if save:
                         self.save_periodic()
@@ -650,6 +671,10 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=200)
     parser.add_argument("--decay-steps", type=int, default=20000)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
+    parser.add_argument("--amp", action="store_true",
+                        help="bf16-Autocast im Forward (Loss bleibt fp32)")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile für Fenster-Forward (persistente Kernel)")
     args = parser.parse_args()
 
     rt = Runtime(path=args.path, threshold=args.threshold, dim=args.dim,
@@ -660,6 +685,7 @@ if __name__ == "__main__":
                  stop_pos_w=args.stop_pos_w,
                  grad_clip=args.grad_clip, warmup=args.warmup,
                  decay_steps=args.decay_steps,
-                 min_lr_ratio=args.min_lr_ratio)
+                 min_lr_ratio=args.min_lr_ratio,
+                 amp=args.amp, compile=args.compile)
     rt(args.mode, args.dataset, args.save, args.frozen, batch=args.batch,
        max_carry=args.max_carry)
