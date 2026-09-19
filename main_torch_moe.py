@@ -1,12 +1,10 @@
 """PyTorch-Port von test-model-thing (MLX-Original: main.py) + MoE.
 
-Behält die Original-Semantik bei:
-- Byte-Embedding (256 -> dim), recurrente States mit gelerntem Decay,
-  RTU-ähnliche Eligibility-Traces (embedtrace/decaytrace),
-  Latent-MSE + CE + Variance-Hinge + Stop-MSE, Test-Time-Training,
-  entropie-adaptives Sampling.
-- Neu: Feedforward pro Layer als Mixture-of-Experts mit Top-k Routing,
-  getrennte Zählung totaler vs. aktiver Parameter.
+- Byte-Embedding (256 -> dim), recurrente States mit gelerntem Decay.
+- P0.1: echtes Truncated-BPTT-Fenster über alle Gewichte (statt 1-Step-
+  Dummy-Grad-Hack). States werden nur an Fenstergrenzen detached.
+- Entropie-adaptives Sampling nur für Generierung, nie als Trainingsziel.
+- MoE-Feedforward mit Top-k Routing, getrennte total/aktiv-Zählung.
 
 Datei ist bewusst standalone (nur torch nötig).
 """
@@ -57,7 +55,9 @@ class MoELayer(nn.Module):
         # trainierbar (wie MLX: self.decay)
         self.decay = nn.Parameter(torch.zeros(dim))
 
-        # Buffer (kein Gradient, werden manuell fortgeschrieben)
+        # Buffer: recurrenter Carry (kein Gradient über Fenstergrenzen).
+        # decaytrace/embedtrace sind deprecated (nur für alte Checkpoints
+        # lesbar gehalten) und werden nicht mehr für Grad-Surgery benutzt.
         self.register_buffer("states", torch.zeros(dim))
         self.register_buffer("decaytrace", torch.zeros(dim))
         self.register_buffer("embedtrace", torch.zeros(256, dim))
@@ -84,10 +84,10 @@ class MoELayer(nn.Module):
             y = y + w[j] * self.silu(self.experts[e_idx](h_norm))
         return y, probs, top_idx, w, logits
 
-    def forward(self, enc: torch.Tensor, x: torch.Tensor, dummy: torch.Tensor):
+    def forward(self, enc: torch.Tensor, x: torch.Tensor, prev: torch.Tensor):
+        """Ein Zeitschritt. prev ist der Carry (mit Grad innerhalb Fenster)."""
         decay = torch.sigmoid(self.decay)  # (dim,)
-        prev = self.states.detach()  # kein BPTT durch die Zeit (wie MLX stop_gradient)
-        state = decay * prev + enc + dummy
+        state = decay * prev + enc
         h_norm = self.norm(state)
         if self.num_experts == 1:
             y = self.silu(self.experts[0](h_norm))
@@ -107,7 +107,8 @@ class MoELayer(nn.Module):
 class Model(nn.Module):
     def __init__(self, dim: int, layers: int, temp: float = 0.75,
                  num_experts: int = 1, top_k: int = 1,
-                 aux_coef: float = 0.01, zloss_coef: float = 0.001):
+                 aux_coef: float = 0.01, zloss_coef: float = 0.001,
+                 bptt: int = 64):
         super().__init__()
         self.dim = dim
         self.layercount = layers
@@ -116,6 +117,7 @@ class Model(nn.Module):
         self.top_k = top_k if num_experts > 1 else 1
         self.aux_coef = aux_coef
         self.zloss_coef = zloss_coef
+        self.bptt = max(1, bptt)
 
         self.encoder = Encoder(dim)
         self.decoder = Decoder(dim)
@@ -142,22 +144,28 @@ class Model(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    # -- Forward eines Steps --
+    # -- Forward eines Steps (frozen / Generierung, 1 Byte) --
+    @torch.no_grad()
+    def step_frozen(self, c: torch.Tensor):
+        enc = self.encoder(c)
+        x = enc
+        for layer in self.layers:
+            x, state, decay, aux, zloss, info = layer(enc, x, layer.states)
+            layer.states.copy_(state)
+            if info is not None:
+                for e in info[1].tolist():
+                    layer.usage[e] += 1
+        return self.decoder(x)
+
     def step(self, c: torch.Tensor, dummies=None, frozen: bool = False):
-        dev = c.device if isinstance(c, torch.Tensor) else self.device()
-        if dummies is None:
-            dummies = [torch.zeros(self.dim, device=dev) for _ in range(self.layercount)]
+        # dummies-Arg nur noch aus Kompatibilität (wird ignoriert).
+        if frozen:
+            return (None, None, None, None, None, None), self.step_frozen(c)
         enc = self.encoder(c)
         x = enc
         states, decays, auxs, zlosses, infos = [], [], [], [], []
-        for i, layer in enumerate(self.layers):
-            x, state, decay, aux, zloss, info = layer(enc, x, dummies[i])
-            if frozen:
-                with torch.no_grad():
-                    layer.states.copy_(state.detach())
-                    if info is not None:
-                        for e in info[1].tolist():
-                            layer.usage[e] += 1
+        for layer in self.layers:
+            x, state, decay, aux, zloss, info = layer(enc, x, layer.states)
             states.append(state)
             decays.append(decay)
             auxs.append(aux)
@@ -188,72 +196,47 @@ class Model(nn.Module):
         (_, states, decays, auxs, zlosses, infos), (output, stop) = self.step(c, frozen=True)
         return self.sample(output), float(stop.view(-1)[0])
 
-    def train_step(self, currb: int, nextb, end: bool, optimizer) -> tuple:
-        """Ein Online-Step mit RTRL-ähnlicher Trace-Korrektur (MLX-Original treu)."""
+    def train_window(self, curr_list: list, next_list: list, end_list: list,
+                     optimizer) -> tuple:
+        """TBPTT über ein Fenster: voller Gradient für ALLE Gewichte
+        (Encoder, Decoder, Experten, Router, Norm, Decay) innerhalb des
+        Fensters; Carry wird nur an der Fenstergrenze detached."""
         dev = self.device()
-        c = torch.tensor(currb, device=dev, dtype=torch.long)
-
-        # alte Buffer-Snapshots (prev) für Trace-Formeln
-        prev_states = [l.states.clone() for l in self.layers]
-        prev_embed = [l.embedtrace.clone() for l in self.layers]
-        prev_decaytr = [l.decaytrace.clone() for l in self.layers]
-
-        dummies = [torch.zeros(self.dim, device=dev, requires_grad=True)
-                   for _ in range(self.layercount)]
-
-        (x, states, decays, auxs, zlosses, infos), (output, stop) = self.step(
-            c, dummies, frozen=False
-        )
-        loss = self.loss_terms(x, output, stop, nextb, end, auxs, zlosses)
-
-        params = list(self.parameters())
-        grads = torch.autograd.grad(loss, params + dummies, allow_unused=True)
-        g_params, g_dummies = grads[:len(params)], grads[len(params):]
-
-        grad_map = {id(p): (p, g) for p, g in zip(params, g_params)}
-        enc_w = self.encoder.embed.weight
-        _, enc_g = grad_map[id(enc_w)]
-        if enc_g is None:
-            enc_g = torch.zeros_like(enc_w)
-        else:
-            enc_g = enc_g.clone()
-
-        # Trace-Korrektur pro Layer (faithful zum MLX-Original)
-        oh = torch.zeros(256, self.dim, device=dev)
-        oh[currb, :] = 1.0
-        for i, layer in enumerate(self.layers):
-            dlds = g_dummies[i]
-            if dlds is None:
-                dlds = torch.zeros(self.dim, device=dev)
-            dec = decays[i].detach()  # (dim,)
-            # Encoder: akkumuliere über Layer (Original macht += über 16 Layer)
-            enc_g = enc_g + dlds.unsqueeze(0) * (prev_embed[i] * dec.unsqueeze(0))
-            # Decay: überschreibe mit Trace-Version
-            new_decaytr = dec * prev_decaytr[i] + dec * (1.0 - dec) * prev_states[i]
-            p_obj, _ = grad_map[id(layer.decay)]
-            grad_map[id(layer.decay)] = (p_obj, (dlds * new_decaytr).detach())
-            # Buffer-Updates
-            with torch.no_grad():
-                layer.states.copy_(states[i].detach())
-                layer.decaytrace.copy_(new_decaytr.detach())
-                layer.embedtrace.copy_(
-                    (prev_embed[i] * dec.unsqueeze(0) + oh).detach()
-                )
-                if infos[i] is not None:
-                    for e in infos[i][1].tolist():
-                        layer.usage[e] += 1
-
-        grad_map[id(enc_w)] = (enc_w, enc_g.detach())
-
+        assert len(curr_list) == len(next_list) == len(end_list) and len(curr_list) > 0
+        T = len(curr_list)
+        carries = [l.states.detach().clone() for l in self.layers]
+        losses = []
+        last_out, last_stop = None, None
+        for t in range(T):
+            c = torch.tensor(curr_list[t], device=dev, dtype=torch.long)
+            enc = self.encoder(c)
+            x = enc
+            auxs, zlosses = [], []
+            new_carries = []
+            for i, layer in enumerate(self.layers):
+                x, state, decay, aux, zloss, _info = layer(enc, x, carries[i])
+                new_carries.append(state)
+                auxs.append(aux)
+                zlosses.append(zloss)
+            carries = new_carries
+            output, stop = self.decoder(x)
+            last_out, last_stop = output, stop
+            losses.append(self.loss_terms(x, output, stop, next_list[t],
+                                          end_list[t], auxs, zlosses))
+        loss = torch.stack(losses).mean()
         optimizer.zero_grad(set_to_none=True)
-        for _, (p, g) in grad_map.items():
-            if g is not None:
-                p.grad = g
+        loss.backward()
         optimizer.step()
-
         with torch.no_grad():
-            b = self.sample(output.detach())
-            s = float(stop.detach().view(-1)[0])
+            for layer, final in zip(self.layers, carries):
+                layer.states.copy_(final.detach())
+            b = self.sample(last_out.detach())
+            s = float(last_stop.detach().view(-1)[0])
+        return b, s, float(loss.detach())
+
+    def train_step(self, currb: int, nextb, end: bool, optimizer) -> tuple:
+        # Kompatibilitäts-Wrapper: Fenster der Länge 1.
+        b, s, _ = self.train_window([currb], [nextb], [end], optimizer)
         return b, s
 
     def __call__(self, currb: int, nextb, end: bool, frozen: bool, optimizer=None):
@@ -301,10 +284,12 @@ class Model(nn.Module):
 class Runtime:
     def __init__(self, path: str, threshold: float, dim: int, layers: int,
                  temp: float, lr: float, num_experts: int = 1, top_k: int = 1,
-                 aux_coef: float = 0.01, zloss_coef: float = 0.001):
+                 aux_coef: float = 0.01, zloss_coef: float = 0.001,
+                 bptt: int = 64):
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(dev)
-        self.model = Model(dim, layers, temp, num_experts, top_k, aux_coef, zloss_coef)
+        self.model = Model(dim, layers, temp, num_experts, top_k,
+                           aux_coef, zloss_coef, bptt)
         self.model.to(self.device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
         self.path = path
@@ -328,25 +313,44 @@ class Runtime:
         sys.stdout.flush()
 
     def chat(self, save: bool, frozen: bool):
+        train_w = (not frozen)
         while True:
             text = input(f"\n[{self.now()}]\nUser >> ")
             data = (text + "\n").encode("utf-8")
-            for i, (c, n) in enumerate(itertools.pairwise(data)):
-                self.call(c, n, i == len(data) - 2, save, frozen)
+            pairs = [(c, n) for c, n in itertools.pairwise(data)]
+            if train_w and len(pairs) > 0:
+                # Prompt per TBPTT-Fenster mittrainieren (mit Zielen).
+                for s in range(0, len(pairs), self.model.bptt):
+                    ch = pairs[s:s + self.model.bptt]
+                    cc = [c for c, _ in ch]
+                    nn_ = [n for _, n in ch]
+                    ee = [i == len(pairs) - 1 for i in
+                          range(s, min(s + self.model.bptt, len(pairs)))]
+                    self.model.train_window(cc, nn_, ee, self.optimizer)
+                    if save:
+                        self.save_periodic()
+            else:
+                for i, (c, n) in enumerate(pairs):
+                    self.model.frozen_call(c)
             print(f"\n[{self.now()}]\nModel >> ", end="", flush=True)
             b = data[-1]
-            while True:
-                b, stop = self.call(b, None, False, save, frozen)
+            # Generierung ohne Ziel: Gewichte immer frozen (nur Carry läuft).
+            for _ in range(512):
+                b, stop = self.model.frozen_call(b)
                 self.write(b)
                 if stop > self.threshold:
                     print()
                     break
+            else:
+                print()
 
     def train(self, save: bool, frozen: bool, dataset: str):
         files = glob.glob(dataset, recursive=True)
         if not files:
             raise FileNotFoundError(f"Glob {dataset!r} fand nichts.")
         random.shuffle(files)
+        W = self.model.bptt
+        logged = 0
         while True:
             for file in files:
                 with open(file, "r", encoding="utf-8", errors="ignore") as f:
@@ -354,9 +358,26 @@ class Runtime:
                         data = line.encode("utf-8")
                         if len(data) < 2:
                             continue
-                        for i, (c, n) in enumerate(itertools.pairwise(data)):
-                            b, _ = self.call(c, n, i == len(data) - 2, save, frozen)
-                            self.write(b)
+                        pairs = [(c, n) for c, n in itertools.pairwise(data)]
+                        for s in range(0, len(pairs), W):
+                            ch = pairs[s:s + W]
+                            cc = [c for c, _ in ch]
+                            nn_ = [n for _, n in ch]
+                            ee = [(s + j) == len(pairs) - 1
+                                  for j in range(len(ch))]
+                            if frozen:
+                                for c in cc:
+                                    self.model.frozen_call(c)
+                            else:
+                                _, _, loss = self.model.train_window(
+                                    cc, nn_, ee, self.optimizer)
+                                logged += 1
+                                if logged % 50 == 0:
+                                    print(f"\n[win {logged}] loss {loss:.4f} "
+                                          f"(BPC {loss / 0.6931:.4f})",
+                                          flush=True)
+                            if save:
+                                self.save_periodic()
 
     def now(self):
         return datetime.now().strftime("%d/%m/%Y, %H:%M:%S")
@@ -398,9 +419,10 @@ if __name__ == "__main__":
     parser.add_argument("--temp", type=float, default=0.75)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--threshold", type=float, default=0.35)
+    parser.add_argument("--bptt", type=int, default=64)
     args = parser.parse_args()
 
     rt = Runtime(path=args.path, threshold=args.threshold, dim=args.dim,
                  layers=args.layers, temp=args.temp, lr=args.lr,
-                 num_experts=args.experts, top_k=args.topk)
+                 num_experts=args.experts, top_k=args.topk, bptt=args.bptt)
     rt(args.mode, args.dataset, args.save, args.frozen)
