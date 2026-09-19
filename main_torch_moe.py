@@ -362,12 +362,18 @@ class Model(nn.Module):
     def count(self) -> int:
         return self.count_total()
 
-    # -- Save/Load (state_dict inkl. Buffer) --
+    # -- Save/Load: nur Gewichte, nie recurrentes Memory (P0.4) --
+    METABUFFERS = ("states", "usage", "decaytrace", "embedtrace")
+
+    def weights_state_dict(self):
+        return {k: v for k, v in self.state_dict().items()
+                if not any(k.endswith("." + b) for b in self.METABUFFERS)}
+
     def save(self, path: str):
         tmp = os.path.join(os.path.dirname(path) or ".",
                            "temporary-" + os.path.basename(path))
         torch.save(
-            {"model": self.state_dict(),
+            {"model": self.weights_state_dict(),
              "meta": {"dim": self.dim, "layers": self.layercount,
                       "experts": self.num_experts, "top_k": self.top_k}},
             tmp,
@@ -450,7 +456,8 @@ class Runtime:
             else:
                 print()
 
-    def train(self, save: bool, frozen: bool, dataset: str, batch: int = 8):
+    def train(self, save: bool, frozen: bool, dataset: str, batch: int = 8,
+                max_carry: int = 2048):
         files = glob.glob(dataset, recursive=True)
         if not files:
             raise FileNotFoundError(f"Glob {dataset!r} fand nichts.")
@@ -470,16 +477,21 @@ class Runtime:
                     [ids[i * n: i * n + n] for i in range(batch)],
                     dtype=torch.long, device=dev)  # (B, n)
                 carries = None
+                carried = 0  # Tokens seit Reset (P0.4: Drift begrenzen)
                 for s in range(0, n - 1, T):
                     e = min(s + T, n - 1)
                     if e - s < 8:
                         continue
+                    if carried >= max_carry:
+                        carries = None  # Reset an lies: frischer Carry
+                        carried = 0
                     curr = streams[:, s:e]
                     nxt = streams[:, s + 1: e + 1]
                     end = (nxt == 10)  # \n als EOS-Markierung (P1.6)
                     loss, ce, carries = self.model.train_batch(
                         curr, nxt, end, carries, self.optimizer,
                         frozen=frozen)
+                    carried += (e - s)
                     if not frozen:
                         logged += 1
                         if logged % 20 == 0:
@@ -494,24 +506,24 @@ class Runtime:
         return datetime.now().strftime("%d/%m/%Y, %H:%M:%S")
 
     def __call__(self, mode: str, dataset: str, save: bool, frozen: bool,
-                 batch: int = 8):
-        # Optimizer-State laden falls vorhanden (Datei speichert nur Modell;
-        # Optimizer startet frisch — bewusst, sonst TTT-Drift über Runs)
+                 batch: int = 8, max_carry: int = 2048):
         self.model.load(self.path)
+        self.model.reset()  # P0.4: Inference startet immer mit Null-Memory
         print(f"device: {self.device}, total: {self.model.count_total():,}, "
               f"aktiv: {self.model.count_active():,} "
               f"(E={self.model.num_experts}, k={self.model.top_k})")
         try:
             if mode == "train":
-                self.train(save, frozen, dataset, batch=batch)
+                self.train(save, frozen, dataset, batch=batch,
+                           max_carry=max_carry)
             elif mode == "chat":
                 self.chat(save, frozen)
         finally:
             if save:
-                # kompletter Checkpoint inkl. Optimizer
+                # kompletter Checkpoint: Gewichte + Optimizer, ohne Memory.
                 tmp = os.path.join(os.path.dirname(self.path) or ".",
                                    "temporary-" + os.path.basename(self.path))
-                torch.save({"model": self.model.state_dict(),
+                torch.save({"model": self.model.weights_state_dict(),
                             "optim": self.optimizer.state_dict()}, tmp)
                 os.replace(tmp, self.path)
 
@@ -540,6 +552,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-latent", dest="latent_w", action="store_const",
                         const=0.0)
     parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--max-carry", type=int, default=2048)
     args = parser.parse_args()
 
     rt = Runtime(path=args.path, threshold=args.threshold, dim=args.dim,
@@ -547,4 +560,5 @@ if __name__ == "__main__":
                  num_experts=args.experts, top_k=args.topk, bptt=args.bptt,
                  ema_tau=args.ema_tau, latent_w=args.latent_w,
                  ce_w=args.ce_w, var_w=args.var_w, stop_w=args.stop_w)
-    rt(args.mode, args.dataset, args.save, args.frozen, batch=args.batch)
+    rt(args.mode, args.dataset, args.save, args.frozen, batch=args.batch,
+       max_carry=args.max_carry)
