@@ -139,17 +139,17 @@ __global__ void gather_slot_kernel(const bf16* X, const int* slot_of,
     Xg[pos * D + dd] = X[(long)r * D + dd];
 }
 
-// y[r] = sum_j slotw*silu(Yg_pre[slot]), ein Thread pro Element.
-// Yg hält Pre-Aktivierungen (kein Extraspeicher für silu nötig).
+// y[r] = beta*y[r] + sum_j slotw*silu(Yg_pre[slot]), ein Thread pro Element.
+// Mit beta=1 spart sich der Caller den separaten Residual-Add-Pass.
 __global__ void combine_kernel(const bf16* Yg, const float* slotw,
                                const int* slot_of, bf16* Y, int N, int K,
-                               int D) {
+                               int D, float beta = 0.0f) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     long n = (long)N * D;
     if (i >= n) return;
     long dd = i % D;
     long r = i / D;
-    float acc = 0;
+    float acc = (beta != 0.0f) ? beta * bf2f(Y[i]) : 0.0f;
     for (int j = 0; j < K; ++j) {
         int pos = slot_of[r * K + j];
         acc += slotw[pos] * silu_f(bf2f(Yg[(long)pos * D + dd]));
@@ -284,9 +284,11 @@ __global__ void to_f32_kernel(const bf16* s, float* d, long n) {
 }
 
 __global__ void dense_activation_kernel(const bf16* pre, const bf16* grad,
-                                         bf16* out, long n) {
+                                         bf16* out, long n, float beta = 0.0f) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = f2bf(grad ? silu_bwd(bf2f(pre[i]), bf2f(grad[i])) : silu_f(bf2f(pre[i])));
+    if (i >= n) return;
+    float base = (beta != 0.0f) ? beta * bf2f(out[i]) : 0.0f;
+    out[i] = f2bf(base + (grad ? silu_bwd(bf2f(pre[i]), bf2f(grad[i])) : silu_f(bf2f(pre[i]))));
 }
 
 struct MoeKeep {  // pro Layer, persistent fwd->bwd (vorallokiert)
@@ -367,7 +369,7 @@ inline void moe_ws_free(MoeWs& w) {
 // Gibt Switch-Aux (Host) zurück.
 inline float moe_forward(const bf16* X, const bf16* Wrouter, bf16** Wexp,
                          bf16* Y, MoeKeep& k, MoeWs& w, int N, int E, int K,
-                         int D) {
+                         int D, float beta = 0.0f) {
     k.N = N; k.E = E; k.K = K; k.D = D;
     const int TPB = 256;
     int blocks = (N + TPB - 1) / TPB;
@@ -390,7 +392,8 @@ inline float moe_forward(const bf16* X, const bf16* Wrouter, bf16** Wexp,
     CUDA_CHECK(cudaMemcpy(k.H, X, n * 2, cudaMemcpyDeviceToDevice));
     if (E == 1) {
         linear_fwd(N, D, D, X, Wexp[0], k.Yg);
-        dense_activation_kernel<<<(n + 255) / 256, 256>>>(k.Yg, nullptr, Y, n);
+        dense_activation_kernel<<<(n + 255) / 256, 256>>>(k.Yg, nullptr, Y, n,
+                                                          beta);
         k.Tk = N;
         return 0;
     }
@@ -431,7 +434,8 @@ inline float moe_forward(const bf16* X, const bf16* Wrouter, bf16** Wexp,
     }
     {
         long cblocks = ((long)N * D + TPB - 1) / TPB;
-        combine_kernel<<<cblocks, TPB>>>(k.Yg, k.slotw, k.slot_of, Y, N, K, D);
+        combine_kernel<<<cblocks, TPB>>>(k.Yg, k.slotw, k.slot_of, Y, N, K, D,
+                                         beta);
     }
     aux_sum_kernel<<<1, E>>>(k.probs, w.sum_p, N, E);
     CUDA_CHECK(cudaMemset(w.sum_p + E, 0, 4));
@@ -487,23 +491,15 @@ inline void moe_backward(const bf16* dY, bf16** Wexp,
     // Router: dlogits(N,E) fp32 -> dWrouter(E,D) fp32 via GEMM
     router_bwd_kernel<<<blocks, TPB>>>(k.probs, k.idx, w.s_j, w.dlogits, N, E, K,
                                        k.logits, k.counts, aux, zcoef);
-    {
-        long nn = (long)N * D;
-        to_f32_kernel<<<(nn + TPB - 1) / TPB, TPB>>>(k.H, w.Xf, nn);
-    }
-    {
-        float al = 1, be = 0;
-        cublasStatus_t s = cublasGemmEx(
-            cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_T, D, E, N, &al,
-            w.Xf, CUDA_R_32F, D, w.dlogits, CUDA_R_32F, E, &be,
-            dWrouter, CUDA_R_32F, D,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-        if (s != CUBLAS_STATUS_SUCCESS) { std::printf("router dW FAIL\n"); exit(1); }
-    }
-    // Router-Inputgrad: dX += dlogits_b @ Wrouter (beta=1)
+    // Router: dlogits(N,E) -> dWrouter(E,D) via H (bf16, kein Xf-Cast).
+    // dW = dlog^T @ H (linear_dW-Muster).
     {
         long nn = (long)N * E;
         to_bf16_kernel<<<(nn + TPB - 1) / TPB, TPB>>>(w.dlogits, w.dlog_b, nn);
+    }
+    linear_dW(N, E, D, w.dlog_b, k.H, dWrouter);
+    // Router-Inputgrad: dX += dlogits_b @ Wrouter (beta=1, dlog_b schon da)
+    {
         float al = 1.0f, be = 1.0f;
         cublasStatus_t s2 = cublasGemmEx(
             cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N, D, N, E, &al,

@@ -89,10 +89,10 @@ struct Layer {
     size_t exp[16];
     bf16* input;
     float *S, *mean, *rstd, *initial;  // S(N,D), stats(N), carry(B,D)
-    MoeCache mc;
+    MoeKeep mc;
 };
 struct Model {
-    ~Model() { for (auto& layer : L) moe_cache_free(layer.mc); }
+    ~Model() { for (auto& layer : L) moe_keep_free(layer.mc); }
     Cfg c;
     ParameterStore params;
     DeviceMemory memory;
@@ -101,6 +101,7 @@ struct Model {
     std::vector<MlaLayer> ML;  // gleich groß wie L (use-Flag)
     MlaW MW;                   // shared Workspace
     bf16 *enc, *X, *Sb, *H, *M, *dXs, *dM, *dSnorm, *dH;
+    MoeWs moeW;  // shared MoE-Arena (kein malloc pro Fenster)
     bf16 *logits, *dlogits, *stoplog, *dstop, *tgtX;
     float *dXres, *dEnc, *dEncTmp, *probs, *losstmp, *mv, *dDec;
     int *ids, *nxt, *end;
@@ -149,7 +150,7 @@ static float lr_at(const Cfg& c, int step) {
 
 static void build_model(Model& m) {
     Cfg& c = m.c;
-    int D = c.dim, L = c.layers, E = c.experts;
+    int D = c.dim, L = c.layers, E = c.experts, K = c.topk;
     unsigned seed = c.seed ? c.seed : 1234;
     int B = c.batch, T = c.seqlen;
     int N = B * T;
@@ -219,7 +220,9 @@ static void build_model(Model& m) {
         m.memory.allocate(Ly.rstd, N * 4);
         m.memory.allocate(Ly.initial, (long)B * D * 4);
         m.memory.allocate(Ly.input, ND * 2);
+        moe_keep_alloc(Ly.mc, N, E, K, D);
     }
+    moe_ws_alloc(m.moeW, N, E, K, D);
     m.memory.allocate(m.enc, ND * 2);
     m.memory.allocate(m.X, ND * 2);
     m.memory.allocate(m.Sb, ND * 2);
@@ -379,10 +382,10 @@ static void forward_window(Model& m, StreamState& state, float& tot, float& ce_o
         layernorm_fwd(m.Sb, m.params.at(Ly.gamma).master, m.params.at(Ly.beta).master, m.H,
                       Ly.mean, Ly.rstd, N, D);
         exp_ptrs(m, (int)l, Wx);
-        aux_acc += moe_forward(m.H, m.params.at(Ly.router).work, Wx, m.M,
-                               Ly.mc, N, E, K, D);
+        aux_acc += moe_forward(m.H, m.params.at(Ly.router).work, Wx, m.X,
+                               Ly.mc, m.moeW, N, E, K, D, 1.0f);
         z_acc += Ly.mc.zloss;
-        add_bf16_kernel<<<blocksL, TPB>>>(m.X, m.M, ND);
+        // Residual-Add steckt in combine (beta=1), kein separater Pass.
         // MLA-Block (optional): norm auf X-Stream + Attention + residual
         if (c.mla && m.ML[l].use) {
             MlaLayer& Ml = m.ML[l];
@@ -500,7 +503,7 @@ static void backward_window(Model& m, const StreamState& state) {
         exp_ptrs(m, l, Wx);
         exp_gptrs(m, l, dWxp);
         moe_backward(m.dM, Wx, m.params.at(Ly.router).work, m.params.at(Ly.router).grad, dWxp,
-                     m.dH, Ly.mc, c.aux / c.layers, c.zloss / c.layers);
+                     m.dH, Ly.mc, m.moeW, c.aux / c.layers, c.zloss / c.layers);
         copy_bf16_kernel<<<blocksL, TPB>>>(Ly.S, m.Sb, ND);
         layernorm_bwd(m.Sb, m.dH, m.params.at(Ly.gamma).master, Ly.mean, Ly.rstd,
                       m.dSnorm, m.params.at(Ly.gamma).grad, m.params.at(Ly.beta).grad, N, D);
@@ -519,7 +522,7 @@ static void backward_window(Model& m, const StreamState& state) {
 
 
 static void release_window(Model& m) {
-    for (auto& layer : m.L) moe_cache_free(layer.mc);
+    (void)m;  // Arenas persistieren bewusst (kein malloc/free pro Fenster)
 }
 
 static void optimizer_step(Model& m, int step) {
