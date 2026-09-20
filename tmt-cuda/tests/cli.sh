@@ -31,6 +31,8 @@ fi
 # Cache overflow, partial attention chunks and exact state resume with MLA.
 ./train "$work/data" "$work/mla" dim=16 layers=2 batch=2 seqlen=7 mla=1 mla_heads=2 mla_dh=4 mla_L=4 mla_R=6 mla_cache=17 mla_cc=3 steps=3 saveevery=0 > "$work/mla.log"
 ./train "$work/data" "$work/mla" steps=1 saveevery=0 >> "$work/mla.log"
+./train "$work/data" "$work/mla-whole" dim=16 layers=2 batch=2 seqlen=7 mla=1 mla_heads=2 mla_dh=4 mla_L=4 mla_R=6 mla_cache=17 mla_cc=3 steps=4 saveevery=0 > "$work/mla-whole.log"
+./architecture_test --compare "$work/mla" "$work/mla-whole"
 cp "$work/mla" "$work/mla-saved"
 ./train "$work/heldout" "$work/mla" mode=eval > "$work/mla-eval.log"
 cmp "$work/mla" "$work/mla-saved"

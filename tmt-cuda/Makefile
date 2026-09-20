@@ -9,7 +9,7 @@ bench: src/bench.cu src/cell.cu src/common.h Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o bench src/bench.cu src/cell.cu
 
 # Shared CUDA sources are compiled in one translation unit per executable.
-train: src/model.cu src/checkpoint.h src/config.h src/train_main.cu src/train.cu src/util.h src/linalg.cu src/moe.cu src/norm.cu src/cell.cu src/emb.cu src/loss.cu src/adam.cu src/mla.cu Makefile
+train: src/model.cu src/checkpoint.h src/config.h src/train_main.cu src/train.cu src/common.h src/util.h src/linalg.cu src/moe.cu src/norm.cu src/cell.cu src/emb.cu src/loss.cu src/adam.cu src/mla.cu Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o train src/train_main.cu -lcublas
 
 architecture_test: src/architecture_test.cu $(wildcard src/*.h src/*.cu) Makefile

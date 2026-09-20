@@ -68,7 +68,7 @@ static void validate_cfg(const Cfg& c) {
                 "invalid MLA dimensions (RoPE dimension must be even)");
         require(c.mla_cache >= c.seqlen && c.mla_cc > 0 && c.mla_every > 0 && c.mla_theta > 1,
                 "invalid MLA cache/chunk configuration");
-        require((long)c.mla_heads * ((long)c.mla_dh + c.mla_R) * c.dim <= INT_MAX &&
+        require((long)c.mla_heads * ((long)c.mla_dh + c.mla_R) <= INT_MAX / c.dim &&
                 (long)c.dim * c.mla_L <= INT_MAX && (long)c.dim * c.mla_R <= INT_MAX &&
                 (long)c.batch * c.seqlen * c.mla_heads <= INT_MAX / std::max(c.mla_dh, c.mla_R),
                 "MLA projections exceed supported index range");
