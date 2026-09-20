@@ -1,5 +1,13 @@
 # Test-Model-Thing (TMT)
 
+> **Aktiver Entwicklungspfad: CUDA.** Architektur, Training und Evaluation werden
+> in [tmt-cuda](tmt-cuda/README.md) weiterentwickelt.
+> **Veraltet:** `main_torch_moe.py` und `benchmark_torch_moe.py` sind historische
+> PyTorch-Prototypen; ihre Architektur, Checkpoints und CoLA-Ergebnisse sind nicht
+> mit dem aktuellen CUDA-Modell gleichzusetzen. Sie erhalten hier keine Updates.
+> Die folgende Beschreibung dokumentiert das ursprüngliche MLX-Proof-of-Concept.
+> Der CUDA-README enthält auch den Integrationsplan für Dream-RSI-Learning.
+
 [YouTube Video](https://youtu.be/9UERVVwpNew)
 
 This is a small proof-of-concept language model (not an LLM) that incorporates the following (and some smaller features as well):
