@@ -1,4 +1,4 @@
-// Bench-Harness S1: misst fused Cell gegen CPU-Referenz + Roofline.
+// Standalone normalized recurrence benchmark with CPU reference.
 // Aufruf: ./bench [B T D]   (default 16 128 1280 = run2-Fenster)
 #include "common.h"
 #include <vector>
@@ -14,13 +14,14 @@ int main(int argc, char** argv) {
     int B = argc > 1 ? atoi(argv[1]) : 16;
     int T = argc > 2 ? atoi(argv[2]) : 128;
     int D = argc > 3 ? atoi(argv[3]) : 1280;
+    if (B <= 0 || T <= 0 || D <= 0 || (long)B * T * D > 2147483647L) return 1;
     long N = (long)B * T * D;
     std::printf("cell S1: B=%d T=%d D=%d (%.1fM elem)\n", B, T, D, N / 1e6);
 
     std::mt19937 rng(0);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     std::vector<float> hX(N), hDec(D);
-    for (auto& v : hX) v = dist(rng);
+    for (auto& v : hX) v = bf2f(f2bf(dist(rng)));
     for (auto& v : hDec) v = 2.0f;  // wie P1.5-Init
 
     // CPU-Referenz
@@ -30,7 +31,7 @@ int main(int argc, char** argv) {
             float dec = sigmoid_h(hDec[d]), st = 0.0f;
             for (int t = 0; t < T; ++t) {
                 long row = (long)b * T + t;
-                st = dec * st + hX[row * D + d];
+                st = dec * st + (1.f - dec) * hX[row * D + d];
                 refY[row * D + d] = st;  // States zwischenspeichern
             }
         }
@@ -88,13 +89,11 @@ int main(int argc, char** argv) {
     for (long i = 0; i < N; ++i)
         mx = fmax(mx, fabs(bf2f(hY[i]) - refY[i]));
 
-    // Roofline: bewegte Bytes pro Fenster
-    // X lesen 2B + S schreiben 4B + S lesen 4B(+stats klein) + Y schreiben 2B
-    double bytes = (double)N * (2 + 4 + 4 + 2);
+    // Estimated traffic: X twice, S write + two reads, Y write (excluding stats).
+    double bytes = (double)N * (2 + 4 + 4 + 4 + 2 + 2);
     double gbs = bytes / (ms / 1e3) / 1e9;
     std::printf("max-abw vs CPU: %.4f %s\n", mx, mx < 0.05 ? "OK" : "FAIL");
-    std::printf("fenster: %.3f ms | %.0f GB/s (%.0f%% von ~960)\n",
-                ms, gbs, gbs / 960 * 100);
+    std::printf("fenster: %.3f ms | estimated %.0f GB/s\n", ms, gbs);
     std::printf("launches/fenster: 3 (statt ~%d eager)\n", T * 2 * 10);
     return mx < 0.05 ? 0 : 2;
 }

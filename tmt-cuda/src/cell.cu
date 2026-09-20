@@ -1,7 +1,7 @@
 #pragma once
 // Fused persistente Recurrent-Cell (S1, Forward).
 //
-// state = sigmoid(decay)*state + x        (persistent über T, Register)
+// a = sigmoid(decay + gate*x); state = a*state + (1-a)*x        (persistent über T, Register)
 // y = silu(LN(state)) + x                 (Residual wie TMT-Layer)
 //
 // Layout (B,T,D), D-kontinuierlich -> coalesced. Ein Thread = ein (b,d),
@@ -15,15 +15,16 @@ __global__ void state_pass_kernel(const bf16* __restrict__ X,
                                   float* __restrict__ S,
                                   const float* __restrict__ decay,
                                   const float* __restrict__ carry,
-                                  int B, int T, int D) {
+                                  int B, int T, int D, const float* gate) {
     int b = blockIdx.x;
     int d = blockIdx.y * blockDim.x + threadIdx.x;
     if (b >= B || d >= D) return;
-    float dec = sigmoid_f(decay[d]);
     float state = carry ? carry[(long)b * D + d] : 0.0f;
     for (int t = 0; t < T; ++t) {
         int idx = (b * T + t) * D + d;
-        state = dec * state + bf2f(X[idx]);
+        float x = bf2f(X[idx]);
+        float dec = sigmoid_f(decay[d] + (gate ? gate[d] * x : 0.f));
+        state = dec * state + (1.f - dec) * x;
         S[idx] = state;
     }
 }
@@ -85,10 +86,11 @@ __global__ void out_pass_kernel(const bf16* __restrict__ X,
 // Nur State-Loop (S2-Harness nutzt danach layernorm_fwd aus norm.cu).
 // carry (B,D) fp32 oder nullptr.
 inline void state_forward(const bf16* X, float* S, const float* decay,
-                          const float* carry, int B, int T, int D) {
+                          const float* carry, int B, int T, int D,
+                          const float* gate = nullptr) {
     const int TPB = 256;
     dim3 grid(B, (D + TPB - 1) / TPB);
-    state_pass_kernel<<<grid, TPB>>>(X, S, decay, carry, B, T, D);
+    state_pass_kernel<<<grid, TPB>>>(X, S, decay, carry, B, T, D, gate);
 }
 
 void cell_forward(const bf16* X, float* S, const float* decay,
@@ -97,7 +99,7 @@ void cell_forward(const bf16* X, float* S, const float* decay,
     const int TPB = 256;
     dim3 grid1(B, (D + TPB - 1) / TPB);
     state_pass_kernel<<<grid1, TPB, 0, stream>>>(X, S, decay, nullptr, B, T,
-                                                 D);
+                                                 D, nullptr);
     stats_kernel<<<B * T, TPB, 0, stream>>>(S, mean, rstd, B, T, D);
     out_pass_kernel<<<grid1, TPB, 0, stream>>>(X, S, mean, rstd, Y, B, T, D);
     cudaError_t le = cudaGetLastError();
@@ -108,35 +110,37 @@ void cell_forward(const bf16* X, float* S, const float* decay,
     }
 }
 
-// Backward durch die Zeit (ein Thread pro (b,d), Carry in Registern):
-// dS_total[t] = dSnorm[t] + dec*dS_total[t+1]; dEnc[t] = dS_total[t];
-// dDec[d] += dec*(1-dec) * S[t-1] * dS_total[t]  (S[-1] = 0).
-__global__ void state_bwd_kernel(const bf16* dSnorm, const float* S,
-                                 const float* decay, float* dEnc,
-                                 float* dDec, int B, int T, int D) {
-    int b = blockIdx.x;
-    int d = blockIdx.y * blockDim.x + threadIdx.x;
+// Exact within-window derivative. The incoming carry is constant for TBPTT,
+// but contributes to the decay/gate derivatives at the first position.
+__global__ void state_bwd_kernel(const bf16* dS, const float* S,
+                                 const float* decay, float* dX, float* dDec,
+                                 int B, int T, int D, const bf16* X,
+                                 const float* initial, const float* gate, float* dGate) {
+    int b = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
     if (b >= B || d >= D) return;
-    float p = decay[d];
-    float dec = sigmoid_f(p);
-    float g = dec * (1.0f - dec);
-    float carry = 0.0f, ddec = 0.0f;
+    float future = 0, gd = 0, gg = 0;
     for (int t = T - 1; t >= 0; --t) {
         long idx = ((long)b * T + t) * D + d;
-        float total = bf2f(dSnorm[idx]) + dec * carry;
-        carry = total;
-        dEnc[idx] = total;
-        float prev = (t > 0) ? S[idx - D] : 0.0f;
-        ddec += g * prev * total;
+        float x = bf2f(X[idx]);
+        float a = sigmoid_f(decay[d] + (gate ? gate[d] * x : 0.f));
+        float total = bf2f(dS[idx]) + future;
+        float prev = t ? S[idx - D] : (initial ? initial[(long)b * D + d] : 0.f);
+        float gz = total * (prev - x) * a * (1.f - a);
+        dX[idx] = total * (1.f - a) + (gate ? gz * gate[d] : 0.f);
+        gd += gz; gg += gz * x;
+        future = total * a;
     }
-    atomicAdd(&dDec[d], ddec);
+    atomicAdd(&dDec[d], gd);
+    if (dGate && gate) atomicAdd(&dGate[d], gg);
 }
 
-inline void cell_backward(const bf16* dSnorm, const float* S,
-                          const float* decay, float* dEnc, float* dDec,
-                          int B, int T, int D) {
-    const int TPB = 256;
-    dim3 grid(B, (D + TPB - 1) / TPB);
+inline void cell_backward(const bf16* dS, const float* S,
+                          const float* decay, float* dX, float* dDec,
+                          int B, int T, int D, const bf16* X,
+                          const float* initial, const float* gate, float* dGate) {
+    dim3 grid(B, (D + 255) / 256);
     CUDA_CHECK(cudaMemset(dDec, 0, (size_t)D * 4));
-    state_bwd_kernel<<<grid, TPB>>>(dSnorm, S, decay, dEnc, dDec, B, T, D);
+    if (dGate) CUDA_CHECK(cudaMemset(dGate, 0, (size_t)D * 4));
+    state_bwd_kernel<<<grid, 256>>>(dS, S, decay, dX, dDec, B, T, D,
+                                   X, initial, gate, dGate);
 }

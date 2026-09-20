@@ -101,7 +101,8 @@ __global__ void combine_bwd_kernel(const bf16* dY, const bf16* Yg,
 // Router-Backward durch Softmax+Topk+Renorm (s_j = dL/dw_j).
 __global__ void router_bwd_kernel(const float* probs, const int* idx,
                                   const float* s_j, float* dlogits,
-                                  int N, int E, int K) {
+                                  int N, int E, int K, const float* logits,
+                                  const int* counts, float aux, float zcoef) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= N) return;
     float Z = 0, sp = 0;
@@ -120,6 +121,18 @@ __global__ void router_bwd_kernel(const float* probs, const int* idx,
     for (int e = 0; e < E; ++e) acc += dlogits[r * E + e] * probs[r * E + e];
     for (int e = 0; e < E; ++e)
         dlogits[r * E + e] = probs[r * E + e] * (dlogits[r * E + e] - acc);
+    float expected = 0, mx = logits[r * E], sum = 0;
+    for (int e = 0; e < E; ++e) {
+        expected += probs[r * E + e] * counts[e] / (float)(N * K);
+        mx = fmaxf(mx, logits[r * E + e]);
+    }
+    for (int e = 0; e < E; ++e) sum += expf(logits[r * E + e] - mx);
+    float lse = mx + logf(sum);
+    for (int e = 0; e < E; ++e) {
+        float p = probs[r * E + e];
+        dlogits[r * E + e] += aux * E / N * p * (counts[e] / (float)(N * K) - expected)
+                             + zcoef * 2.f / N * lse * p;
+    }
 }
 
 // dX[r] += sum_j dXg[slot] (bf16, ein Thread pro r, keine Atomics;
@@ -144,13 +157,23 @@ __global__ void to_bf16_kernel(const float* s, bf16* d, long n) {
 
 // Switch-Aux: E*sum(mean_p*frac); fragt counts + summierte probs.
 __global__ void aux_sum_kernel(const float* probs, float* sum_p,
-                               int N, int E) {
+                               int N, int E, const float* logits) {
     // ein Block, E Threads
     int e = threadIdx.x;
     if (e >= E) return;
     float acc = 0;
     for (int r = 0; r < N; ++r) acc += probs[(long)r * E + e];
     sum_p[e] = acc;
+    if (e == 0) {
+        float z = 0;
+        for (int r = 0; r < N; ++r) {
+            float mx = logits[r * E], sum = 0;
+            for (int j = 1; j < E; ++j) mx = fmaxf(mx, logits[r * E + j]);
+            for (int j = 0; j < E; ++j) sum += expf(logits[r * E + j] - mx);
+            float lse = mx + logf(sum); z += lse * lse;
+        }
+        sum_p[E] = z / N;
+    }
 }
 
 // bf16 -> fp32 Cast (für Router-dW in fp32).
@@ -159,7 +182,14 @@ __global__ void to_f32_kernel(const bf16* s, float* d, long n) {
     if (i < n) d[i] = bf2f(s[i]);
 }
 
+__global__ void dense_activation_kernel(const bf16* pre, const bf16* grad,
+                                         bf16* out, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = f2bf(grad ? silu_bwd(bf2f(pre[i]), bf2f(grad[i])) : silu_f(bf2f(pre[i])));
+}
+
 struct MoeCache {
+    float zloss = 0;
     float* logits = nullptr; // (N,E) fp32
     int* idx = nullptr;      // (N,K)
     float* w = nullptr;      // (N,K)
@@ -192,6 +222,15 @@ inline void moe_cache_free(MoeCache& c) {
 inline float moe_forward(const bf16* X, const bf16* Wrouter, bf16** Wexp,
                          bf16* Y, MoeCache& c, int N, int E, int K, int D) {
     c.N = N; c.E = E; c.K = K; c.D = D;
+    if (E == 1) {
+        long n = (long)N * D;
+        CUDA_CHECK(cudaMalloc(&c.Xg, n * 2));
+        CUDA_CHECK(cudaMalloc(&c.Yg, n * 2));
+        CUDA_CHECK(cudaMemcpy(c.Xg, X, n * 2, cudaMemcpyDeviceToDevice));
+        linear_fwd(N, D, D, X, Wexp[0], c.Yg);
+        dense_activation_kernel<<<(n + 255) / 256, 256>>>(c.Yg, nullptr, Y, n);
+        return 0;
+    }
     CUDA_CHECK(cudaMalloc(&c.logits, (size_t)N * E * 4));
     CUDA_CHECK(cudaMalloc(&c.idx, (size_t)N * K * 4));
     CUDA_CHECK(cudaMalloc(&c.w, (size_t)N * K * 4));
@@ -199,16 +238,17 @@ inline float moe_forward(const bf16* X, const bf16* Wrouter, bf16** Wexp,
     CUDA_CHECK(cudaMalloc(&c.slot_of, (size_t)N * K * 4));
     CUDA_CHECK(cudaMalloc(&c.counts, (size_t)E * 4));
     CUDA_CHECK(cudaMalloc(&c.offsets, (size_t)E * 4));
-    CUDA_CHECK(cudaMalloc(&c.sum_p, (size_t)E * 4));
+    CUDA_CHECK(cudaMalloc(&c.sum_p, (size_t)(E + 1) * 4));
     CUDA_CHECK(cudaMemset(c.counts, 0, (size_t)E * 4));
     const int TPB = 256;
     int blocks = (N + TPB - 1) / TPB;
-    // Router: logits^T(E,N) = Wrouter(E,D) @ Xt(D,N), fp32 out
+    // Router: logits(N,E) = X(N,D) @ Wr(E,D)^T, llm.c-Muster
+    // (OP_T, OP_N, E, N, D, Wr, D, X, D, logits, E), fp32 out.
     {
         float al = 1, be = 0;
         cublasStatus_t s = cublasGemmEx(
-            cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N, E, N, D, &al,
-            Wrouter, CUDA_R_16BF, E, X, CUDA_R_16BF, D, &be,
+            cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, E, N, D, &al,
+            Wrouter, CUDA_R_16BF, D, X, CUDA_R_16BF, D, &be,
             c.logits, CUDA_R_32F, E,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         if (s != CUBLAS_STATUS_SUCCESS) { std::printf("router GEMM FAIL\n"); exit(1); }
@@ -248,13 +288,14 @@ inline float moe_forward(const bf16* X, const bf16* Wrouter, bf16** Wexp,
         }
     }
     combine_kernel<<<blocks, TPB>>>(c.Yg, c.slotw, c.slot_of, Y, N, K, D);
-    aux_sum_kernel<<<1, E>>>(c.probs, c.sum_p, N, E);
+    aux_sum_kernel<<<1, E>>>(c.probs, c.sum_p, N, E, c.logits);
     // Switch-Aux auf Host
-    float hsum[16];
-    CUDA_CHECK(cudaMemcpy(hsum, c.sum_p, (size_t)E * 4, cudaMemcpyDeviceToHost));
+    float hsum[17];
+    CUDA_CHECK(cudaMemcpy(hsum, c.sum_p, (size_t)(E + 1) * 4, cudaMemcpyDeviceToHost));
+    c.zloss = hsum[E];
     float aux = 0;
     for (int e = 0; e < E; ++e)
-        aux += (hsum[e] / N) * (c.hcnt[e] / (float)N);
+        aux += (hsum[e] / N) * (c.hcnt[e] / (float)(N * K));
     return E * aux;
 }
 
@@ -262,12 +303,23 @@ inline float moe_forward(const bf16* X, const bf16* Wrouter, bf16** Wexp,
 // dWexp[E] fp32, dWrouter(E,D) fp32.
 inline void moe_backward(const bf16* dY, bf16** Wexp,
                          const bf16* Wrouter, float* dWrouter,
-                         float** dWexp, bf16* dX, MoeCache& c) {
+                         float** dWexp, bf16* dX, MoeCache& c,
+                         float aux = 0.f, float zcoef = 0.f) {
     int N = c.N, E = c.E, K = c.K, D = c.D, tk = c.Tk;
     const int TPB = 256;
     int blocks = (N + TPB - 1) / TPB;
     CUDA_CHECK(cudaMemset(dX, 0, (size_t)N * D * 2));
     CUDA_CHECK(cudaMemset(dWrouter, 0, (size_t)E * D * 4));
+    if (E == 1) {
+        long n = (long)N * D;
+        bf16* dpre;
+        CUDA_CHECK(cudaMalloc(&dpre, n * 2));
+        dense_activation_kernel<<<(n + 255) / 256, 256>>>(c.Yg, dY, dpre, n);
+        linear_dW(N, D, D, dpre, c.Xg, dWexp[0]);
+        linear_dX(N, D, D, dpre, Wexp[0], dX);
+        CUDA_CHECK(cudaFree(dpre));
+        return;
+    }
     if (tk == 0) return;
     bf16* dYg;
     float* s_j;
@@ -278,13 +330,15 @@ inline void moe_backward(const bf16* dY, bf16** Wexp,
     // Router: dlogits(N,E) fp32 -> dWrouter(E,D) fp32 via GEMM
     float* dlogits;
     CUDA_CHECK(cudaMalloc(&dlogits, (size_t)N * E * 4));
-    router_bwd_kernel<<<blocks, TPB>>>(c.probs, c.idx, s_j, dlogits, N, E, K);
+    router_bwd_kernel<<<blocks, TPB>>>(c.probs, c.idx, s_j, dlogits, N, E, K,
+                                       c.logits, c.counts, aux, zcoef);
     {
-        // dWt(D,E) = Xf_c(D,N) @ dlogits(N,E): m=D,n=E,k=N
+        // dWt(D,E) = Xf(D,N) @ dlogits(N,E): A=Xf OP_N lda=D (Xf^T),
+        // B=dlogits OP_T lda=E (dlogits selbst). Elementweise verifiziert.
         float al = 1, be = 0;
         cublasStatus_t s = cublasGemmEx(
-            cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N, D, E, N, &al,
-            c.Xf, CUDA_R_32F, D, dlogits, CUDA_R_32F, N, &be,
+            cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_T, D, E, N, &al,
+            c.Xf, CUDA_R_32F, D, dlogits, CUDA_R_32F, E, &be,
             dWrouter, CUDA_R_32F, D,
             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         if (s != CUBLAS_STATUS_SUCCESS) { std::printf("router dW FAIL\n"); exit(1); }
@@ -310,6 +364,15 @@ inline void moe_backward(const bf16* dY, bf16** Wexp,
     // Experten pro Gruppe
     bf16* dXg;
     CUDA_CHECK(cudaMalloc(&dXg, (size_t)tk * D * 2));
+    if (getenv("TMT_DEBUG")) {
+        std::printf("moe_bwd: N=%d E=%d K=%d D=%d tk=%d\n", N, E, K, D, tk);
+        for (int e = 0; e < E; ++e)
+            std::printf("  e=%d cnt=%d off=%d dW=%p W=%p\n", e, c.hcnt[e],
+                        c.hoff[e], (void*)dWexp[e], (void*)Wexp[e]);
+        std::printf("  dYg=%p dXg=%p Xg=%p\n", (void*)dYg, (void*)dXg,
+                    (void*)c.Xg);
+        fflush(stdout);
+    }
     for (int e = 0; e < E; ++e) {
         if (c.hcnt[e] == 0) continue;
         long off = (long)c.hoff[e] * D;

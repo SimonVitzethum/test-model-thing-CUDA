@@ -24,10 +24,10 @@ __host__ __device__ __forceinline__ float silu_bwd(float x, float dy) {
 }
 
 #define CUDA_CHECK(call) do { \
-    cudaError_t e = (call); \
-    if (e != cudaSuccess) { \
+    cudaError_t cerr__ = (call); \
+    if (cerr__ != cudaSuccess) { \
         std::printf("CUDA %s:%d: %s\n", __FILE__, __LINE__, \
-                    cudaGetErrorString(e)); \
+                    cudaGetErrorString(cerr__)); \
         exit(1); \
     } \
 } while (0)

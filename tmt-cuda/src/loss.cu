@@ -42,8 +42,8 @@ __global__ void stop_fwd_kernel(const bf16* s, const int* end, float* loss_out,
     float z = bf2f(s[r]);
     float t = end[r] ? 1.0f : 0.0f;
     // -[pw*t*log(s) + (1-t)*log(1-s)], stabil
-    float l = -(pos_w * t * (-log1pf(expf(-z))) +
-                (1.0f - t) * (-z - log1pf(expf(-z))));
+    float softplus = fmaxf(-z, 0.f) + log1pf(expf(-fabsf(z)));
+    float l = t > .5f ? pos_w * softplus : z + softplus;
     loss_out[r] = l;
 }
 

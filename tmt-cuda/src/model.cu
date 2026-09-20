@@ -1,0 +1,550 @@
+#pragma once
+// CUDA model, explicit streaming state and shared forward/backward path.
+#include "train.cu"
+#include <string>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+// ---------- Elementar-Kernel ----------
+__global__ void add_bf16_kernel(bf16* a, const bf16* b, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] = f2bf(bf2f(a[i]) + bf2f(b[i]));
+}
+__global__ void add_f32_kernel(float* a, const float* b, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i];
+}
+__global__ void zero_f32_kernel(float* a, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] = 0;
+}
+__global__ void extract_carry_kernel(const float* S, float* carry, int B,
+                                     int T, int D) {
+    int b = blockIdx.x;
+    int d = blockIdx.y * blockDim.x + threadIdx.x;
+    if (b >= B || d >= D) return;
+    carry[(long)b * D + d] = S[((long)b * T + T - 1) * D + d];
+}
+__global__ void meanvar_kernel(const bf16* X, float* out2, long n) {
+    __shared__ float b1[256], b2[256];
+    float s = 0, q = 0;
+    for (long i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = bf2f(X[i]);
+        s += v; q += v * v;
+    }
+    b1[threadIdx.x] = s; b2[threadIdx.x] = q;
+    __syncthreads();
+    for (int t = 128; t > 0; t >>= 1) {
+        if (threadIdx.x < t) {
+            b1[threadIdx.x] += b1[threadIdx.x + t];
+            b2[threadIdx.x] += b2[threadIdx.x + t];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float m = b1[0] / n;
+        out2[0] = m; out2[1] = b2[0] / n - m * m;
+    }
+}
+__global__ void ema_kernel(float* tgt, const float* src, float tau, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) tgt[i] = tau * tgt[i] + (1 - tau) * src[i];
+}
+__global__ void copy_bf16_kernel(const float* s, bf16* d, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = f2bf(s[i]);
+}
+__global__ void mse_mean_kernel(const float* a, const float* b, float* out,
+                                long n) {
+    __shared__ float buf[256];
+    float s = 0;
+    for (long i = threadIdx.x; i < n; i += blockDim.x) {
+        float d = a[i] - b[i];
+        s += d * d;
+    }
+    buf[threadIdx.x] = s;
+    __syncthreads();
+    for (int t = 128; t > 0; t >>= 1) {
+        if (threadIdx.x < t) buf[threadIdx.x] += buf[threadIdx.x + t];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = buf[0] / n;
+}
+__global__ void f32_of_bf16_kernel(const bf16* s, float* d, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = bf2f(s[i]);
+}
+
+// ---------- Modell ----------
+struct MlaLayer {
+    int use = 0;
+    MlaP p;             // Param-Indizes
+    MlaKeep keep;       // Keep pro Fenster
+    float *mmean = nullptr, *mrstd = nullptr;  // (N,)
+    bf16* Xsnap = nullptr;                     // (N,D) Norm-Input-Snapshot
+};
+struct Layer {
+    size_t decay, gate, gamma, beta, router;
+    size_t exp[16];
+    bf16* input;
+    float *S, *mean, *rstd, *initial;  // S(N,D), stats(N), carry(B,D)
+    MoeCache mc;
+};
+struct Model {
+    ~Model() { for (auto& layer : L) moe_cache_free(layer.mc); }
+    Cfg c;
+    ParameterStore params;
+    DeviceMemory memory;
+    size_t emb, tgt, dec, stop;
+    std::vector<Layer> L;
+    std::vector<MlaLayer> ML;  // gleich groß wie L (use-Flag)
+    MlaW MW;                   // shared Workspace
+    bf16 *enc, *X, *Sb, *H, *M, *dXs, *dM, *dSnorm, *dH;
+    bf16 *logits, *dlogits, *stoplog, *dstop, *tgtX;
+    float *dXres, *dEnc, *dEncTmp, *probs, *losstmp, *mv, *dDec;
+    int *ids, *nxt, *end;
+    long* pos = nullptr;   // (N,) Positionen Device
+};
+
+struct StreamState {
+    DeviceMemory memory;
+    std::vector<float*> carry;
+    std::vector<MlaC> cache;
+    long position = 0;
+};
+
+static void reset_state(StreamState& state, const Cfg& c) {
+    for (auto* carry : state.carry)
+        CUDA_CHECK(cudaMemset(carry, 0, (long)c.batch * c.dim * sizeof(float)));
+    for (auto& cache : state.cache) { cache.head = 0; cache.base0 = 0; }
+    state.position = 0;
+}
+
+static void build_state(StreamState& state, const Model& m) {
+    const Cfg& c = m.c;
+    state.carry.resize(c.layers);
+    state.cache.resize(c.layers);
+    for (int l = 0; l < c.layers; ++l) {
+        state.memory.allocate(state.carry[l], (long)c.batch * c.dim * 4);
+        if (m.ML[l].use) {
+            auto& cache = state.cache[l];
+            cache.B = c.batch; cache.Cmax = c.mla_cache;
+            cache.L = c.mla_L; cache.R = c.mla_R;
+            state.memory.allocate(cache.lat, (long)c.batch * c.mla_cache * c.mla_L * 2);
+            state.memory.allocate(cache.kr, (long)c.batch * c.mla_cache * c.mla_R * 2);
+            CUDA_CHECK(cudaMemset(cache.lat, 0, (long)c.batch * c.mla_cache * c.mla_L * 2));
+            CUDA_CHECK(cudaMemset(cache.kr, 0, (long)c.batch * c.mla_cache * c.mla_R * 2));
+        }
+    }
+    reset_state(state, c);
+}
+
+static float lr_at(const Cfg& c, int step) {
+    if (step < c.warmup) return c.lr * (step + 1) / (float)c.warmup;
+    float p = fminf(1.0f, (step - c.warmup) / (float)c.decaysteps);
+    return c.lr * (c.minlr + 0.5f * (1 - c.minlr) *
+                   (1 + cosf(3.14159265f * p)));
+}
+
+static void build_model(Model& m) {
+    Cfg& c = m.c;
+    int D = c.dim, L = c.layers, E = c.experts;
+    unsigned seed = c.seed ? c.seed : 1234;
+    int B = c.batch, T = c.seqlen;
+    int N = B * T;
+    long ND = (long)N * D;
+    std::vector<float> h;
+    auto init_u = [&](size_t p, float a, float b) {
+        h.resize(m.params.at(p).n); host_init(h.data(), m.params.at(p).n, a, b, seed);
+        CUDA_CHECK(cudaMemcpy(m.params.at(p).master, h.data(), m.params.at(p).n * 4,
+                              cudaMemcpyHostToDevice));
+        long n = m.params.at(p).n;
+        copy_bf16_kernel<<<(n + 255) / 256, 256>>>(m.params.at(p).master, m.params.at(p).work, n);
+    };
+    m.emb = m.params.add(256L * D);
+    init_u(m.emb, -0.05f, 0.05f);
+    m.tgt = m.params.add(256L * D);
+    CUDA_CHECK(cudaMemcpy(m.params.at(m.tgt).master, m.params.at(m.emb).master, 256L * D * 4,
+                          cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(m.params.at(m.tgt).work, m.params.at(m.emb).work, 256L * D * 2,
+                          cudaMemcpyDeviceToDevice));
+    m.dec = m.params.add(256L * D);
+    { float a = sqrtf(1.0f / D); init_u(m.dec, -a, a); }
+    m.stop = m.params.add(1L * D);
+    init_u(m.stop, -0.01f, 0.01f);
+    m.L.resize(L);
+    for (int l = 0; l < L; ++l) {
+        Layer& Ly = m.L[l];
+        Ly.decay = m.params.add(D);
+        h.resize(D);
+        for (int d = 0; d < D; ++d) {
+            float half = c.half_min * powf(c.half_max / c.half_min,
+                                          d / (float)std::max(1, D - 1));
+            float a = expf(-logf(2.0f) / half);
+            h[d] = logf(a / (1.0f - a));
+        }
+        CUDA_CHECK(cudaMemcpy(m.params.at(Ly.decay).master, h.data(), D * 4,
+                              cudaMemcpyHostToDevice));
+        copy_bf16_kernel<<<(D + 255) / 256, 256>>>(
+            m.params.at(Ly.decay).master, m.params.at(Ly.decay).work, D);
+        Ly.gate = m.params.add(D);
+        init_u(Ly.gate, 0.f, 0.f);
+        Ly.gamma = m.params.add(D);
+        h.assign(D, 1.0f);
+        CUDA_CHECK(cudaMemcpy(m.params.at(Ly.gamma).master, h.data(), D * 4,
+                              cudaMemcpyHostToDevice));
+        copy_bf16_kernel<<<(D + 255) / 256, 256>>>(
+            m.params.at(Ly.gamma).master, m.params.at(Ly.gamma).work, D);
+        Ly.beta = m.params.add(D);
+        CUDA_CHECK(cudaMemset(m.params.at(Ly.beta).master, 0, D * 4));
+        CUDA_CHECK(cudaMemset(m.params.at(Ly.beta).work, 0, D * 2));
+        Ly.router = m.params.add((long)E * D);
+        h.resize((long)E * D);
+        host_normal(h.data(), h.size(), 0.02f, seed);
+        CUDA_CHECK(cudaMemcpy(m.params.at(Ly.router).master, h.data(),
+                              (long)E * D * 4, cudaMemcpyHostToDevice));
+        {
+            long n = m.params.at(Ly.router).n;
+            copy_bf16_kernel<<<(n + 255) / 256, 256>>>(
+                m.params.at(Ly.router).master, m.params.at(Ly.router).work, n);
+        }
+        float a = sqrtf(1.0f / D);
+        for (int e = 0; e < E; ++e) {
+            Ly.exp[e] = m.params.add((long)D * D);
+            init_u(Ly.exp[e], -a, a);
+        }
+        m.memory.allocate(Ly.S, ND * 4);
+        m.memory.allocate(Ly.mean, N * 4);
+        m.memory.allocate(Ly.rstd, N * 4);
+        m.memory.allocate(Ly.initial, (long)B * D * 4);
+        m.memory.allocate(Ly.input, ND * 2);
+    }
+    m.memory.allocate(m.enc, ND * 2);
+    m.memory.allocate(m.X, ND * 2);
+    m.memory.allocate(m.Sb, ND * 2);
+    m.memory.allocate(m.H, ND * 2);
+    m.memory.allocate(m.M, ND * 2);
+    m.memory.allocate(m.dXs, ND * 2);
+    m.memory.allocate(m.dM, ND * 2);
+    m.memory.allocate(m.dSnorm, ND * 2);
+    m.memory.allocate(m.dH, ND * 2);
+    m.memory.allocate(m.dXres, ND * 4);
+    m.memory.allocate(m.dEnc, ND * 4);
+    m.memory.allocate(m.dEncTmp, ND * 4);
+    m.memory.allocate(m.dDec, (size_t)D * 4);
+    m.memory.allocate(m.ids, N * 4);
+    m.memory.allocate(m.nxt, N * 4);
+    m.memory.allocate(m.end, N * 4);
+    m.memory.allocate(m.logits, (long)N * 256 * 2);
+    m.memory.allocate(m.dlogits, (long)N * 256 * 2);
+    m.memory.allocate(m.stoplog, (long)N * 2);
+    m.memory.allocate(m.dstop, (long)N * 2);
+    m.memory.allocate(m.probs, (long)N * 256 * 4);
+    m.memory.allocate(m.losstmp, (long)N * 4);
+    m.memory.allocate(m.tgtX, ND * 2);
+    m.memory.allocate(m.mv, 8);
+    m.memory.allocate(m.pos, N * 8);
+    // ---- MLA (optional) ----
+    m.ML.resize(L);
+    if (c.mla) {
+        int H = c.mla_heads, dh = c.mla_dh, Lr = c.mla_L, R = c.mla_R;
+        int Cc = c.mla_cc;
+        float a = sqrtf(1.0f / D);
+        for (int l = 0; l < L; ++l) {
+            MlaLayer& Ml = m.ML[l];
+            Ml.use = (l % c.mla_every == 0) ? 1 : 0;
+            if (!Ml.use) continue;
+            Ml.p.q = m.params.add((long)D * H * (dh + R)); init_u(Ml.p.q, -a, a);
+            Ml.p.dkv = m.params.add((long)D * Lr); init_u(Ml.p.dkv, -a, a);
+            Ml.p.kr = m.params.add((long)D * R); init_u(Ml.p.kr, -a, a);
+            { float b = sqrtf(1.0f / Lr);
+              Ml.p.uk = m.params.add((long)Lr * H * dh); init_u(Ml.p.uk, -b, b);
+              Ml.p.uv = m.params.add((long)Lr * H * dh); init_u(Ml.p.uv, -b, b); }
+            { float b2 = sqrtf(1.0f / (H * dh));
+              Ml.p.o = m.params.add((long)H * dh * D); init_u(Ml.p.o, -b2, b2); }
+            Ml.p.gamma = m.params.add(D);
+            h.assign(D, 1.0f);
+            CUDA_CHECK(cudaMemcpy(m.params.at(Ml.p.gamma).master, h.data(), D * 4,
+                                  cudaMemcpyHostToDevice));
+            copy_bf16_kernel<<<(D + 255) / 256, 256>>>(
+                m.params.at(Ml.p.gamma).master, m.params.at(Ml.p.gamma).work, D);
+            Ml.p.beta = m.params.add(D);
+            CUDA_CHECK(cudaMemset(m.params.at(Ml.p.beta).master, 0, D * 4));
+            CUDA_CHECK(cudaMemset(m.params.at(Ml.p.beta).work, 0, D * 2));
+            m.memory.allocate(Ml.keep.qc, (long)B * H * T * dh * 2);
+            m.memory.allocate(Ml.keep.qr, (long)B * H * T * R * 2);
+            m.memory.allocate(Ml.keep.Oflat, (long)N * H * dh * 2);
+            m.memory.allocate(Ml.keep.Xq, ND * 2);
+            m.memory.allocate(Ml.keep.LSE, (long)B * H * T * 4);
+            m.memory.allocate(Ml.mmean, N * 4);
+            m.memory.allocate(Ml.mrstd, N * 4);
+            m.memory.allocate(Ml.Xsnap, ND * 2);
+        }
+        // Workspace einmal max (Cc aus Config)
+        MlaW& W = m.MW;
+        long BH = (long)B * H;
+        m.memory.allocate(W.qf, (long)N * H * (dh + R) * 2);
+        m.memory.allocate(W.qcnh, (long)N * H * dh * 2);
+        m.memory.allocate(W.qrnh, (long)N * H * R * 2);
+        m.memory.allocate(W.qrb, (long)N * H * R * 2);
+        m.memory.allocate(W.latw, (long)N * Lr * 2);
+        m.memory.allocate(W.krw, (long)N * R * 2);
+        m.memory.allocate(W.krb, (long)N * R * 2);
+        m.memory.allocate(W.qcb, BH * T * dh * 2);
+        m.memory.allocate(W.qrb2, BH * T * R * 2);
+        m.memory.allocate(W.Kc, BH * Cc * dh * 2);
+        m.memory.allocate(W.Vc, BH * Cc * dh * 2);
+        m.memory.allocate(W.Kcf, (long)B * Cc * H * dh * 2);
+        m.memory.allocate(W.Vcf, (long)B * Cc * H * dh * 2);
+        m.memory.allocate(W.krck, BH * Cc * R * 2);
+        m.memory.allocate(W.clat, (long)B * Cc * Lr * 2);
+        m.memory.allocate(W.ckr, (long)B * Cc * R * 2);
+        m.memory.allocate(W.S, BH * T * Cc * 4);
+        m.memory.allocate(W.P, BH * T * Cc * 2);
+        m.memory.allocate(W.dS, BH * T * Cc * 2);
+        m.memory.allocate(W.dP, BH * T * Cc * 4);
+        m.memory.allocate(W.O, BH * T * dh * 4);
+        m.memory.allocate(W.m, BH * T * 4);
+        m.memory.allocate(W.l, BH * T * 4);
+        m.memory.allocate(W.al, BH * T * 4);
+        m.memory.allocate(W.dKc, BH * Cc * dh * 4);
+        m.memory.allocate(W.dVc, BH * Cc * dh * 4);
+        m.memory.allocate(W.dKrH, BH * Cc * R * 4);
+        m.memory.allocate(W.dQc, BH * T * dh * 4);
+        m.memory.allocate(W.dQr, BH * T * R * 4);
+        m.memory.allocate(W.dOf, BH * T * dh * 4);
+        m.memory.allocate(W.dOb, BH * T * dh * 2);
+        m.memory.allocate(W.dLatc, (long)B * Cc * std::max(Lr, R) * 4);
+        m.memory.allocate(W.dKrc, (long)B * Cc * R * 4);
+        m.memory.allocate(W.dLat, (long)N * Lr * 4);
+        m.memory.allocate(W.dKr, (long)N * R * 4);
+        m.memory.allocate(W.dLatb, (long)N * Lr * 2);
+        m.memory.allocate(W.dKrb, (long)N * R * 2);
+        m.memory.allocate(W.dOflat, (long)N * H * dh * 2);
+        m.memory.allocate(W.dQflat, (long)N * H * (dh + R) * 2);
+        m.memory.allocate(W.dKVb, (long)B * Cc * H * dh * 2);
+    }
+}
+
+static float host_sum(float* d, int n) {
+    std::vector<float> h;
+    h.resize(n);
+    CUDA_CHECK(cudaMemcpy(h.data(), d, (size_t)n * 4, cudaMemcpyDeviceToHost));
+    double s = 0;
+    for (int i = 0; i < n; ++i) s += h[i];
+    return (float)s;
+}
+
+// Per-Experten bf16-Zeigerliste (Host) für moe_forward/backward.
+static void exp_ptrs(Model& m, int l, bf16** out) {
+    for (int e = 0; e < m.c.experts; ++e) out[e] = m.params.at(m.L[l].exp[e]).work;
+}
+static void exp_gptrs(Model& m, int l, float** out) {
+    for (int e = 0; e < m.c.experts; ++e) out[e] = m.params.at(m.L[l].exp[e]).grad;
+}
+
+// ---------- Fenster-Step (Forward + Backward + Adam) ----------
+static void forward_window(Model& m, StreamState& state, float& tot, float& ce_out) {
+    Cfg& c = m.c;
+    int B = c.batch, T = c.seqlen, D = c.dim, E = c.experts, K = c.topk;
+    int N = B * T;
+    long ND = (long)N * D;
+    const int TPB = 256;
+    long blocksL = (ND + TPB - 1) / TPB;
+    int blocks = (N + TPB - 1) / TPB;
+
+    // ---- Forward ----
+    emb_forward(m.params.at(m.emb).work, m.ids, m.enc, N, D);
+    CUDA_CHECK(cudaMemcpy(m.X, m.enc, ND * 2, cudaMemcpyDeviceToDevice));
+    // Positionen (Lockstep über Streams)
+    if (c.mla) {
+        std::vector<long> hp;
+        hp.resize(N);
+        for (int b = 0; b < B; ++b)
+            for (int t = 0; t < T; ++t) hp[b * T + t] = state.position + t;
+        CUDA_CHECK(cudaMemcpy(m.pos, hp.data(), (size_t)N * 8,
+                              cudaMemcpyHostToDevice));
+    }
+    float aux_acc = 0, z_acc = 0;
+    bf16* Wx[16];
+    for (size_t l = 0; l < m.L.size(); ++l) {
+        Layer& Ly = m.L[l];
+        CUDA_CHECK(cudaMemcpy(Ly.input, m.X, ND * 2, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(Ly.initial, state.carry[l], (long)B * D * 4,
+                              cudaMemcpyDeviceToDevice));
+        state_forward(Ly.input, Ly.S, m.params.at(Ly.decay).master, Ly.initial,
+                      B, T, D, c.gated ? m.params.at(Ly.gate).master : nullptr);
+        copy_bf16_kernel<<<blocksL, TPB>>>(Ly.S, m.Sb, ND);
+        layernorm_fwd(m.Sb, m.params.at(Ly.gamma).master, m.params.at(Ly.beta).master, m.H,
+                      Ly.mean, Ly.rstd, N, D);
+        exp_ptrs(m, (int)l, Wx);
+        aux_acc += moe_forward(m.H, m.params.at(Ly.router).work, Wx, m.M,
+                               Ly.mc, N, E, K, D);
+        z_acc += Ly.mc.zloss;
+        add_bf16_kernel<<<blocksL, TPB>>>(m.X, m.M, ND);
+        // MLA-Block (optional): norm auf X-Stream + Attention + residual
+        if (c.mla && m.ML[l].use) {
+            MlaLayer& Ml = m.ML[l];
+            CUDA_CHECK(cudaMemcpy(Ml.Xsnap, m.X, ND * 2,
+                                  cudaMemcpyDeviceToDevice));
+            layernorm_fwd(m.X, m.params.at(Ml.p.gamma).master, m.params.at(Ml.p.beta).master,
+                          m.H, Ml.mmean, Ml.mrstd, N, D);
+            float sc = 1.0f / sqrtf((float)c.mla_dh);
+            mla_forward(m.H, N, m.params.at(Ml.p.q).work, m.params.at(Ml.p.dkv).work,
+                        m.params.at(Ml.p.kr).work, m.params.at(Ml.p.uk).work, m.params.at(Ml.p.uv).work,
+                        m.params.at(Ml.p.o).work, state.cache[l], Ml.keep, m.MW, m.M,
+                        m.pos, B, T, c.mla_heads, c.mla_dh, c.mla_L,
+                        c.mla_R, c.mla_cc, c.mla_cache, c.mla_theta, sc, D);
+            add_bf16_kernel<<<blocksL, TPB>>>(m.X, m.M, ND);
+        }
+        // carry-out
+        dim3 gc(B, (D + TPB - 1) / TPB);
+        extract_carry_kernel<<<gc, TPB>>>(Ly.S, state.carry[l], B, T, D);
+    }
+    state.position += T;
+    // Decode
+    linear_fwd(N, 256, D, m.X, m.params.at(m.dec).work, m.logits);
+    linear_fwd(N, 1, D, m.X, m.params.at(m.stop).work, m.stoplog);
+    // CE
+    ce_fwd_kernel<<<blocks, TPB>>>(m.logits, m.nxt, m.probs, m.losstmp, N);
+    float ce_sum = host_sum(m.losstmp, N);
+    ce_out = ce_sum / N;
+    // Stop
+    stop_fwd_kernel<<<blocks, TPB>>>(m.stoplog, m.end, m.losstmp, c.stopposw,
+                                     N);
+    float stop_mean = host_sum(m.losstmp, N) / N;
+    // Latent-Target
+    emb_forward(m.params.at(m.tgt).work, m.nxt, m.tgtX, N, D);
+    // Var-Hinge
+    meanvar_kernel<<<1, 256>>>(m.X, m.mv, ND);
+    float hmv[2];
+    CUDA_CHECK(cudaMemcpy(hmv, m.mv, 8, cudaMemcpyDeviceToHost));
+    float var_loss = fmaxf(0.0f, 1.0f - sqrtf(hmv[1] + 1e-4f));
+    // Latent-MSE-Wert
+    f32_of_bf16_kernel<<<blocksL, TPB>>>(m.X, m.dXres, ND);  // reuse als tmp
+    // (mse via Kernel unten nach tgtX-f32? tgtX bf16 -> cast nötig: reuse dEnc)
+    f32_of_bf16_kernel<<<blocksL, TPB>>>(m.tgtX, m.dEnc, ND);
+    mse_mean_kernel<<<1, 256>>>(m.dXres, m.dEnc, m.mv, ND);
+    float hmse[1];
+    CUDA_CHECK(cudaMemcpy(hmse, m.mv, 4, cudaMemcpyDeviceToHost));
+    tot = c.var * var_loss + c.latent * hmse[0] + c.ce * ce_out +
+          c.stop * stop_mean + (c.aux * aux_acc + c.zloss * z_acc) / m.L.size();
+
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Forward must immediately precede backward on this model's workspace.
+static void backward_window(Model& m, const StreamState& state) {
+    const Cfg& c = m.c;
+    int B = c.batch, T = c.seqlen, D = c.dim, N = B * T;
+    long ND = (long)N * D;
+    const int TPB = 256;
+    long blocksL = (ND + TPB - 1) / TPB;
+    int blocks = (N + TPB - 1) / TPB;
+    bf16* Wx[16];
+    for (auto& p : m.params.values) CUDA_CHECK(cudaMemset(p.grad, 0, p.n * 4));
+    // Reconstruct loss auxiliaries from the shared forward activations.
+    float hmv[2];
+    meanvar_kernel<<<1, 256>>>(m.X, m.mv, ND);
+    CUDA_CHECK(cudaMemcpy(hmv, m.mv, 8, cudaMemcpyDeviceToHost));
+    f32_of_bf16_kernel<<<blocksL, TPB>>>(m.tgtX, m.dEnc, ND);
+    // ---- Backward ----
+    CUDA_CHECK(cudaMemset(m.dXres, 0, ND * 4));
+    ce_bwd_kernel<<<blocks, TPB>>>(m.probs, m.nxt, m.dlogits, c.ce, N);
+    linear_dW(N, 256, D, m.dlogits, m.X, m.params.at(m.dec).grad);
+    linear_dX(N, 256, D, m.dlogits, m.params.at(m.dec).work, m.dXs);
+    cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dXres, ND);  // bf16->fp32
+    stop_bwd_kernel<<<blocks, TPB>>>(m.stoplog, m.end, m.dstop, c.stopposw,
+                                     c.stop, N);
+    linear_dW(N, 1, D, m.dstop, m.X, m.params.at(m.stop).grad);
+    linear_dX(N, 1, D, m.dstop, m.params.at(m.stop).work, m.dXs);
+    cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dXres, ND);
+    // Latent-Anteil (X-f32 nach dEncTmp; tgt-f32 steht noch in dEnc)
+    f32_of_bf16_kernel<<<blocksL, TPB>>>(m.X, m.dEncTmp, ND);
+    latent_bwd_kernel<<<blocksL, TPB>>>(m.dEncTmp, m.dEnc, m.dXres, c.latent,
+                                        ND);
+    // Var-Anteil (nur aktiv wenn Hinge greift)
+    var_bwd_kernel<<<blocksL, TPB>>>(
+        m.dEncTmp, m.dXres, hmv[0],
+        (hmv[1] + 1e-4f >= 1.0f)
+            ? 0.0f
+            : -0.5f / sqrtf(hmv[1] + 1e-4f) * c.var,
+        ND);
+    // Residual-Stream zurück nach bf16; dEnc neu für State-Pfad
+    copy_bf16_kernel<<<blocksL, TPB>>>(m.dXres, m.dXs, ND);
+    CUDA_CHECK(cudaMemset(m.dEnc, 0, ND * 4));
+    float* dWxp[16];
+    for (int l = (int)m.L.size() - 1; l >= 0; --l) {
+        Layer& Ly = m.L[l];
+        // MLA zuerst (war zuletzt im Forward)
+        if (c.mla && m.ML[l].use) {
+            MlaLayer& Ml = m.ML[l];
+            CUDA_CHECK(cudaMemcpy(m.dM, m.dXs, ND * 2,
+                                  cudaMemcpyDeviceToDevice));
+            float sc = 1.0f / sqrtf((float)c.mla_dh);
+            mla_backward(m.dM, N, m.params.at(Ml.p.q).work, m.params.at(Ml.p.dkv).work,
+                         m.params.at(Ml.p.kr).work, m.params.at(Ml.p.uk).work, m.params.at(Ml.p.uv).work,
+                         m.params.at(Ml.p.o).work, m.params.at(Ml.p.q).grad, m.params.at(Ml.p.dkv).grad,
+                         m.params.at(Ml.p.kr).grad, m.params.at(Ml.p.uk).grad, m.params.at(Ml.p.uv).grad,
+                         m.params.at(Ml.p.o).grad, state.cache[l], Ml.keep, m.MW, m.dH,
+                         Ml.keep.Xq, m.pos, B, T, c.mla_heads, c.mla_dh,
+                         c.mla_L, c.mla_R, c.mla_cc, c.mla_theta, sc, D);
+            layernorm_bwd(Ml.Xsnap, m.dH, m.params.at(Ml.p.gamma).master, Ml.mmean,
+                          Ml.mrstd, m.dSnorm, m.params.at(Ml.p.gamma).grad,
+                          m.params.at(Ml.p.beta).grad, N, D);
+            add_bf16_kernel<<<blocksL, TPB>>>(m.dXs, m.dSnorm, ND);
+        }
+        // dM = dXs-Kopie; Residual-Passthrough bleibt in dXs stehen
+        CUDA_CHECK(cudaMemcpy(m.dM, m.dXs, ND * 2, cudaMemcpyDeviceToDevice));
+        exp_ptrs(m, l, Wx);
+        exp_gptrs(m, l, dWxp);
+        moe_backward(m.dM, Wx, m.params.at(Ly.router).work, m.params.at(Ly.router).grad, dWxp,
+                     m.dH, Ly.mc, c.aux / c.layers, c.zloss / c.layers);
+        copy_bf16_kernel<<<blocksL, TPB>>>(Ly.S, m.Sb, ND);
+        layernorm_bwd(m.Sb, m.dH, m.params.at(Ly.gamma).master, Ly.mean, Ly.rstd,
+                      m.dSnorm, m.params.at(Ly.gamma).grad, m.params.at(Ly.beta).grad, N, D);
+        cell_backward(m.dSnorm, Ly.S, m.params.at(Ly.decay).master, m.dEncTmp,
+                      m.params.at(Ly.decay).grad, B, T, D, Ly.input, Ly.initial,
+                      c.gated ? m.params.at(Ly.gate).master : nullptr,
+                      m.params.at(Ly.gate).grad);
+        // Chain through the previous layer, including residual passthrough.
+        cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dEncTmp, ND);
+        copy_bf16_kernel<<<blocksL, TPB>>>(m.dEncTmp, m.dXs, ND);
+    }
+    // Residual-Start + Embed-Grade
+    cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dEnc, ND);
+    emb_backward(m.dEnc, m.ids, m.params.at(m.emb).grad, N, D);
+}
+
+
+static void release_window(Model& m) {
+    for (auto& layer : m.L) moe_cache_free(layer.mc);
+}
+
+static void optimizer_step(Model& m, int step) {
+    const Cfg& c = m.c;
+    double sum = 0;
+    for (size_t i = 0; i < m.params.values.size(); ++i) {
+        if (i == m.tgt) continue;
+        auto& p = m.params.at(i);
+        float norm = 0;
+        if (cublasSnrm2(cublas_handle(), (int)p.n, p.grad, 1, &norm) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("gradient norm failed");
+        sum += (double)norm * norm;
+    }
+    if (!std::isfinite(sum)) throw std::runtime_error("non-finite gradient; update refused");
+    float scale = c.gradclip > 0 ? fminf(1.f, c.gradclip / fmaxf(sqrtf(sum), 1e-12f)) : 1.f;
+    for (size_t i = 0; i < m.params.values.size(); ++i) {
+        if (i == m.tgt || (i == m.stop && c.stop == 0)) continue;
+        auto& p = m.params.at(i);
+        if (scale < 1 && cublasSscal(cublas_handle(), (int)p.n, &scale, p.grad, 1) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("gradient scaling failed");
+        adam_step_one(p.master, p.m, p.v, p.work, p.grad, p.n, lr_at(c, step),
+                      .9f, .999f, 1e-8f, .01f, step + 1);
+    }
+    auto& tgt = m.params.at(m.tgt);
+    ema_kernel<<<(tgt.n + 255) / 256, 256>>>(tgt.master, m.params.at(m.emb).master, c.ematau, tgt.n);
+    copy_bf16_kernel<<<(tgt.n + 255) / 256, 256>>>(tgt.master, tgt.work, tgt.n);
+    CUDA_CHECK(cudaGetLastError());
+}

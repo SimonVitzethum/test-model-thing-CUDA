@@ -3,14 +3,23 @@ NVCC ?= nvcc
 ARCH = -gencode arch=compute_120a,code=sm_120a
 OPTS = -O3 -std=c++17 -Xcompiler -Wall --use_fast_math
 
-all: bench train
+all: bench train architecture_test
 
 bench: src/bench.cu src/cell.cu src/common.h Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o bench src/bench.cu src/cell.cu
 
-# S2: alles in einer TU (inline-Host-Helper), kein Link-Aerger
-train: src/train_main.cu src/train.cu src/util.h src/linalg.cu src/moe.cu src/norm.cu src/cell.cu src/emb.cu src/loss.cu src/adam.cu Makefile
+# Shared CUDA sources are compiled in one translation unit per executable.
+train: src/model.cu src/checkpoint.h src/config.h src/train_main.cu src/train.cu src/util.h src/linalg.cu src/moe.cu src/norm.cu src/cell.cu src/emb.cu src/loss.cu src/adam.cu src/mla.cu Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o train src/train_main.cu -lcublas
 
+architecture_test: src/architecture_test.cu $(wildcard src/*.h src/*.cu) Makefile
+	$(NVCC) $(ARCH) $(OPTS) -o $@ src/architecture_test.cu -lcublas
+
+check: architecture_test train
+	./architecture_test
+	sh tests/cli.sh
+
 clean:
-	rm -f bench train
+	rm -f bench train selftest architecture_test
+
+.PHONY: all check clean

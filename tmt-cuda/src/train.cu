@@ -1,5 +1,5 @@
 #pragma once
-// S2-Trainings-Loop (Recurrence + MoE, noch ohne MLA):
+// Shared CUDA operators, configuration and owned parameter storage:
 // Byte-Shards, Fenster-TBPTT, CE+Stop+Latent+Var, AdamW, Checkpoints.
 // Aufruf: ./train data ckpt [key=val ...]
 //   dim layers experts topk batch seqlen lr warmup decaysteps minlr
@@ -13,54 +13,50 @@
 #include "emb.cu"
 #include "loss.cu"
 #include "adam.cu"
+#include "mla.cu"
 #include <cmath>
 #include <cstring>
 #include <ctime>
 
-// ---------- Config ----------
-struct Cfg {
-    int dim = 1280, layers = 32, experts = 8, topk = 2;
-    int batch = 16, seqlen = 128;
-    float lr = 5e-4f; int warmup = 200, decaysteps = 8000; float minlr = 0.1f;
-    float aux = 0.01f, zloss = 0.001f, latent = 1.f, ce = 1.f, var = 1.f;
-    float stop = 1.f, stopposw = 20.f, ematau = 0.99f, gradclip = 1.f;
-    int maxcarry = 2048, steps = 0, saveevery = 500, seed = 0;
+#include "config.h"
+#include <stdexcept>
+
+// Per-model ownership: independent models never share parameter indices.
+struct DeviceMemory {
+    std::vector<void*> allocations;
+    DeviceMemory() = default;
+    DeviceMemory(const DeviceMemory&) = delete;
+    DeviceMemory& operator=(const DeviceMemory&) = delete;
+    template<class T> void allocate(T*& ptr, size_t bytes) {
+        CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        allocations.push_back(ptr);
+    }
+    ~DeviceMemory() { for (void* ptr : allocations) cudaFree(ptr); }
 };
-
-static void set_cfg(Cfg& c, const char* k, const char* v) {
-#define I(f) if (!strcmp(k, #f)) { c.f = atoi(v); return; }
-#define F(f) if (!strcmp(k, #f)) { c.f = (float)atof(v); return; }
-    I(dim) I(layers) I(experts) I(topk) I(batch) I(seqlen)
-    F(lr) I(warmup) I(decaysteps) F(minlr)
-    F(aux) F(zloss) F(latent) F(ce) F(var) F(stop) F(stopposw) F(ematau)
-    F(gradclip) I(maxcarry) I(steps) I(saveevery) I(seed)
-    std::printf("unbekannt: %s\n", k); exit(1);
-#undef I
-#undef F
-}
-
-// ---------- Parameter (per Index, nie Pointer halten!) ----------
 struct Par {
     float *master, *m, *v, *grad;
     bf16* work;
     long n;
 };
-static std::vector<Par> PARS;
-inline Par& P(size_t i) { return PARS[i]; }
-static size_t new_par(long n) {
-    Par p;
-    p.n = n;
-    CUDA_CHECK(cudaMalloc(&p.master, n * 4));
-    CUDA_CHECK(cudaMalloc(&p.m, n * 4));
-    CUDA_CHECK(cudaMalloc(&p.v, n * 4));
-    CUDA_CHECK(cudaMalloc(&p.grad, n * 4));
-    CUDA_CHECK(cudaMalloc(&p.work, n * 2));
-    CUDA_CHECK(cudaMemset(p.m, 0, n * 4));
-    CUDA_CHECK(cudaMemset(p.v, 0, n * 4));
-    CUDA_CHECK(cudaMemset(p.grad, 0, n * 4));
-    PARS.push_back(p);
-    return PARS.size() - 1;
-}
+struct ParameterStore {
+    DeviceMemory memory;
+    std::vector<Par> values;
+    Par& at(size_t i) { return values.at(i); }
+    size_t add(long n) {
+        if (n <= 0 || n > INT_MAX) throw std::runtime_error("parameter too large");
+        Par p{}; p.n = n;
+        memory.allocate(p.master, n * 4);
+        memory.allocate(p.m, n * 4);
+        memory.allocate(p.v, n * 4);
+        memory.allocate(p.grad, n * 4);
+        memory.allocate(p.work, n * 2);
+        CUDA_CHECK(cudaMemset(p.m, 0, n * 4));
+        CUDA_CHECK(cudaMemset(p.v, 0, n * 4));
+        CUDA_CHECK(cudaMemset(p.grad, 0, n * 4));
+        values.push_back(p);
+        return values.size() - 1;
+    }
+};
 
 static void host_init(float* h, long n, float a, float b, unsigned& s) {
     for (long i = 0; i < n; ++i) {
