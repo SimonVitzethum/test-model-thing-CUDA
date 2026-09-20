@@ -80,6 +80,10 @@ int main(int argc, char** argv) {
         std::vector<float> losses(N);
         uint64_t begin_step = progress.step, measured = 0;
         double ce_sum = 0;
+        // Router-Balance-Akku (gegen MoE-Collapse)
+        std::vector<std::vector<long>> use_acc(cfg.layers,
+                                               std::vector<long>(cfg.experts, 0));
+        long use_win = 0;
         auto begin = std::chrono::steady_clock::now();
         std::signal(SIGINT, stop_requested); std::signal(SIGTERM, stop_requested);
         std::printf("CUDA hierarchical byte model: D=%d L=%d E=%d k=%d B=%d T=%d mode=%s step=%llu\n",
@@ -113,6 +117,12 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemcpy(m.nxt, targets.data(), N * 4, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(m.end, ends.data(), N * 4, cudaMemcpyHostToDevice));
             float loss, ce; forward_window(m, state, loss, ce);
+            if (!evaluation && cfg.experts > 1) {
+                for (int l = 0; l < cfg.layers; ++l)
+                    for (int e = 0; e < cfg.experts; ++e)
+                        use_acc[l][e] += m.L[l].mc.hcnt[e];
+                ++use_win;
+            }
             if (evaluation) {
                 // Score only real next-byte pairs in the final padded window.
                 ce_fwd_kernel<<<(N + 255) / 256, 256>>>(m.logits, m.nxt, m.probs, m.losstmp, N);
@@ -130,6 +140,23 @@ int main(int argc, char** argv) {
                 save_checkpoint(path, m, state, progress);
             if (progress.step % 20 == 0)
                 std::printf("step=%llu loss=%.6f ce=%.6f bpb=%.6f\n", (unsigned long long)progress.step, loss, ce, ce / log(2.));
+            if (!evaluation && cfg.experts > 1 && use_win > 0 && progress.step % 100 == 0) {
+                long tot = 0;
+                for (auto& row : use_acc)
+                    for (long v : row) tot += v;
+                double mn = 1, mx = 0;
+                long dead = 0;
+                for (auto& row : use_acc)
+                    for (long v : row) {
+                        double s = tot ? (double)v / tot * cfg.layers * cfg.experts : 0;
+                        mn = std::min(mn, s); mx = std::max(mx, s);
+                        if (s < 0.01) ++dead;
+                    }
+                std::printf("router: min=%.3f max=%.3f dead=%ld/%d (share 1.0=uniform)\n",
+                            mn, mx, dead, cfg.layers * cfg.experts);
+                for (auto& row : use_acc) std::fill(row.begin(), row.end(), 0);
+                use_win = 0;
+            }
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
