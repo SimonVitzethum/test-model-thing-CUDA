@@ -18,6 +18,10 @@ __host__ __device__ __forceinline__ float sigmoid_f(float x) {
 __host__ __device__ __forceinline__ float silu_f(float x) {
     return x * sigmoid_f(x);
 }
+__host__ __device__ __forceinline__ float silu_bwd(float x, float dy) {
+    float s = sigmoid_f(x);
+    return dy * s * (1.0f + x * (1.0f - s));
+}
 
 #define CUDA_CHECK(call) do { \
     cudaError_t e = (call); \
