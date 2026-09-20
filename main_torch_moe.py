@@ -675,6 +675,8 @@ if __name__ == "__main__":
                         help="bf16-Autocast im Forward (Loss bleibt fp32)")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile für Fenster-Forward (persistente Kernel)")
+    parser.add_argument("--aux-coef", type=float, default=0.01)
+    parser.add_argument("--zloss-coef", type=float, default=0.001)
     args = parser.parse_args()
 
     rt = Runtime(path=args.path, threshold=args.threshold, dim=args.dim,
@@ -686,6 +688,7 @@ if __name__ == "__main__":
                  grad_clip=args.grad_clip, warmup=args.warmup,
                  decay_steps=args.decay_steps,
                  min_lr_ratio=args.min_lr_ratio,
-                 amp=args.amp, compile=args.compile)
+                 amp=args.amp, compile=args.compile,
+                 aux_coef=args.aux_coef, zloss_coef=args.zloss_coef)
     rt(args.mode, args.dataset, args.save, args.frozen, batch=args.batch,
        max_carry=args.max_carry)
