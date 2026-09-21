@@ -1,58 +1,58 @@
 # TMT-CUDA
 
-Aktiver CUDA-Entwicklungspfad des Byte-Modells. PyTorch (`main_torch_moe.py`,
-`benchmark_torch_moe.py`) ist veraltet; das MLX-Modell dokumentiert den ursprünglichen
-Prototyp. Neue CUDA-Checkpoints sind mit beiden nicht kompatibel.
+Active CUDA development path of the byte model. PyTorch (`main_torch_moe.py`,
+`benchmark_torch_moe.py`) is deprecated; the MLX model documents the original
+prototype. New CUDA checkpoints are compatible with neither.
 
-## Bauen und prüfen
+## Building and testing
 
-Benötigt werden Linux, ein NVIDIA-Treiber, CUDA mit BF16/cuBLAS und ein C++17-Hostcompiler.
-Die Makefile-Voreinstellung ist Consumer-Blackwell (`sm_120a`). Andere GPUs benötigen
-passende `ARCH`-Flags und BF16-Unterstützung, beispielsweise:
+Requires Linux, an NVIDIA driver, CUDA with BF16/cuBLAS, and a C++17 host compiler.
+The Makefile default is consumer Blackwell (`sm_120a`). Other GPUs need
+matching `ARCH` flags and BF16 support, for example:
 
 ```sh
 cd tmt-cuda
 make
 make check
-# Beispiel für eine andere Zielarchitektur:
+# Example for a different target architecture:
 make ARCH='-gencode arch=compute_89,code=sm_89'
-# Nach Änderung von ARCH zuerst `make clean` ausführen.
+# After changing ARCH, run `make clean` first.
 ```
 
-`make check` benötigt eine GPU, aber weder Python noch PyTorch. Es prüft:
+`make check` requires a GPU but neither Python nor PyTorch. It checks:
 
-- normalisierte Rekurrenz mit/ohne Eingabe-Gate, nichtleerem Carry und numerischen Gradienten;
-- Gradienten von MoE-Load-Balancing und Router-z-Loss;
-- Abhängigkeit höherer Schichten von niedrigeren Experten und Lernfortschritt;
-- getrennte Streaming-Zustände, Checkpoint-Fortsetzung und Korruptionserkennung;
-- MLA mit mehreren/teilweisen Chunks, Cache-Verdrängung und nichtnull RoPE-Positionen;
-- MLA-Forward und alle Gradienten gegen eine unabhängige FP64-CPU-Referenz;
-- CLI-Training, Evaluation einschließlich Restfenster und ungültige Eingaben.
+- normalized recurrence with/without input gate, nonempty carry, and numeric gradients;
+- gradients of MoE load balancing and router z-loss;
+- dependence of higher layers on lower experts, and learning progress;
+- separate streaming states, checkpoint resume, and corruption detection;
+- MLA with multiple/partial chunks, cache eviction, and nonzero RoPE positions;
+- MLA forward and all gradients against an independent FP64 CPU reference;
+- CLI training, evaluation including tail windows, and invalid inputs.
 
-Zusätzliche Speicherprüfung:
+Additional memory checking:
 
 ```sh
 compute-sanitizer --tool memcheck --error-exitcode 99 ./architecture_test
 ./bench 2 32 128
 ```
 
-`bench` misst nur die rekurrente Zelle. Es ist kein Durchsatzbenchmark des gesamten
-Trainings. Seine Bandbreitenangabe ist aus dem geschätzten Datenverkehr berechnet.
+`bench` measures only the recurrent cell. It is not a throughput benchmark of the
+entire training run. Its bandwidth figure is computed from estimated data traffic.
 
-## Modell und Architekturentscheidungen
+## Model and architecture decisions
 
 ```text
-Bytes → Embedding → [hierarchische Rekurrenz → LayerNorm → Dense/MoE + Residual] × L
-                       optional nach ausgewählten Blöcken: LayerNorm → MLA + Residual
-      → finale Repräsentation → Byte-Logits (256)
+Bytes → Embedding → [hierarchical recurrence → LayerNorm → Dense/MoE + Residual] × L
+                        optionally after selected blocks: LayerNorm → MLA + Residual
+      → final representation → byte logits (256)
 ```
 
-Jede Schicht erhält den Residualstrom **der vorherigen Schicht**. Der vorherige
-Prototyp speiste alle rekurrenten Schichten direkt aus demselben Byte-Embedding.
-Die neue Struktur ermöglicht hierarchische Merkmalsverarbeitung und führt den
-Gradienten entsprechend durch alle vorherigen Schichten zurück.
+Each layer receives the residual stream **of the previous layer**. The previous
+prototype fed all recurrent layers directly from the same byte embedding.
+The new structure enables hierarchical feature processing and routes the
+gradient back through all previous layers accordingly.
 
-Pro Kanal, Schicht und Byte gilt:
+Per channel, layer, and byte:
 
 ```text
 a_t = sigmoid(decay + gate * x_t)
@@ -60,299 +60,297 @@ s_t = a_t * s_(t-1) + (1 - a_t) * x_t
 x_out = x_t + FFN(LayerNorm(s_t))
 ```
 
-Das normalisierte Update begrenzt die Akkumulation bei langsamen Decays. Das Gate
-startet bei null und wird gelernt; `gated=0` erlaubt die statische Ablation.
-Die initialen Halbwertszeiten sind logarithmisch von `half_min=2` bis `half_max=512`
-Bytes verteilt. Bei einem eingabeabhängigen Gate ist die tatsächliche Zeitskala
-anschließend kontextabhängig. Ein fortlaufender Zustand garantiert kein unbegrenztes
-Erinnerungsvermögen.
+The normalized update bounds accumulation at slow decays. The gate
+starts at zero and is learned; `gated=0` allows the static ablation.
+Initial half-lives are logarithmically spread from `half_min=2` to `half_max=512`
+bytes. With an input-dependent gate, the actual timescale then becomes
+context-dependent. A running state does not guarantee unbounded
+memory.
 
-Standard ist ein kleines dichtes Modell: `dim=256 layers=4 experts=1 topk=1`.
-Der dichte Pfad führt keine Routing-Operationen aus. Für `experts>1` werden nur
-zugewiesene Token-Experten-Paare berechnet. Der Load-Balancing-Loss verwendet die
-Zuordnungsanteile `counts / (N * topk)`; sein Gradient und der z-Loss fließen in
-den Router ein. MoE-Dispatch verwendet noch dynamische Allokationen und
-Host-Synchronisation. Eine pauschale Beschleunigung durch MoE ist nicht belegt.
+The default is a small dense model: `dim=256 layers=4 experts=1 topk=1`.
+The dense path performs no routing operations. For `experts>1` only
+assigned token-expert pairs are computed. The load-balancing loss uses the
+assignment fractions `counts / (N * topk)`; its gradient and the z-loss flow
+into the router. MoE dispatch still uses dynamic allocations and
+host synchronization. A blanket MoE speedup is not established.
 
-BF16 wird für Arbeitsgewichte/Aktivierungen und GEMMs verwendet. Rekurrente
-Zustände, Mastergewichte, Adam-Momente und wesentliche Reduktionen sind FP32.
-Das Training verwendet TBPTT: Der eingehende Carry ist an der Fenstergrenze
-abgetrennt, trägt aber korrekt zum Decay-/Gate-Gradienten des ersten Bytes bei.
+BF16 is used for working weights/activations and GEMMs. Recurrent
+states, master weights, Adam moments, and essential reductions are FP32.
+Training uses TBPTT: the incoming carry is detached at the window boundary
+but correctly contributes to the decay/gate gradient of the first byte.
 
-Next-Byte-Cross-Entropy ist das Standardziel. `latent=0 var=0 stop=0` deaktiviert die
-zusätzlichen Zielanteile. Diese lassen sich für kontrollierte Ablationen aktivieren.
-Der EMA-Zielencoder wird ausschließlich per EMA aktualisiert, nicht durch AdamW.
-Der optionale Stop-Loss benutzt das nächste Newline-Byte als Ziel; dies ist keine
-allgemeine Dialog-Endemarkierung.
+Next-byte cross-entropy is the default objective. `latent=0 var=0 stop=0`
+disables the extra objective terms. They can be enabled for controlled ablations.
+The EMA target encoder is updated exclusively by EMA, not by AdamW.
+The optional stop loss uses the next newline byte as target; this is not a
+general dialog end marker.
 
-## Kleine gemeinsame Schnittstelle
+## Small shared interface
 
-| Datei | Verantwortung |
+| File | Responsibility |
 |---|---|
-| `src/config.h` | Ein Konfigurationsschema für CLI, Validierung und Checkpoints |
-| `src/train.cu` | Gemeinsame CUDA-Operatoren und modellbezogener Parameterspeicher |
-| `src/model.cu` | Modellaufbau, expliziter Zustand, Forward, Backward und Optimizer-Schritt |
-| `src/checkpoint.h` | Versionierte Speicherung, Prüfung und Wiederherstellung |
-| `src/train_main.cu` | Datenzugriff, Trainings-/Evaluationsablauf und Messausgabe |
-| `src/architecture_test.cu` | Native numerische und Integrationstests |
+| `src/config.h` | One configuration schema for CLI, validation, and checkpoints |
+| `src/train.cu` | Shared CUDA operators and model-owned parameter store |
+| `src/model.cu` | Model construction, explicit state, forward, backward, and optimizer step |
+| `src/checkpoint.h` | Versioned storage, verification, and restore |
+| `src/train_main.cu` | Data access, training/evaluation flow, and measurement output |
+| `src/architecture_test.cu` | Native numeric and integration tests |
 
-Die interne CUDA-Schnittstelle ist bewusst klein:
+The internal CUDA interface is deliberately small:
 
 ```cpp
 build_model(model);
 build_state(state, model);
-forward_window(model, state, loss, ce); // aktualisiert ausschließlich den übergebenen Stream
-// model.X: finale Repräsentationen [B,T,D]; model.logits: [B,T,256]
-backward_window(model, state);         // nur beim Training, direkt nach Forward
+forward_window(model, state, loss, ce); // updates only the passed stream
+// model.X: final representations [B,T,D]; model.logits: [B,T,256]
+backward_window(model, state);         // training only, right after forward
 optimizer_step(model, step);
-release_window(model);                // Forward-Scratch nach Nutzung freigeben
-reset_state(state, model.c);           // Gewichte bleiben unverändert
+release_window(model);                // release forward scratch after use
+reset_state(state, model.c);          // weights stay unchanged
 ```
 
-Mehrere Modelle haben getrennte Parameterspeicher. Mehrere `StreamState`-Objekte
-können dasselbe Modell nacheinander verwenden. Der Forward-Arbeitsspeicher gehört
-zum Modell; gleichzeitige Aufrufe auf demselben Modell sind nicht unterstützt.
-Forward muss vor einem Backward unmittelbar auf demselben Modell gelaufen sein.
-Repräsentationen werden beim nächsten Forward überschrieben und müssen bei Bedarf
-kopiert werden. Das erlaubt später korrekte Klassifikations-Probes auf dem tatsächlichen
-Modellausgang. Ein CUDA-CoLA-Adapter ist noch nicht implementiert.
+Multiple models have separate parameter stores. Multiple `StreamState` objects
+can use the same model one after another. The forward workspace belongs
+to the model; concurrent calls on the same model are not supported.
+Forward must have run on the same model immediately before a backward.
+Representations are overwritten by the next forward and must be copied if needed.
+This later allows correct classification probes on the actual model output.
+A CUDA CoLA adapter is not implemented yet.
 
-## Training und Evaluation
+## Training and evaluation
 
-Die Datendatei enthält rohe Bytes, ohne Tokenizer. `mmap` erlaubt dateiweises
-Paging durch das Betriebssystem; es gibt keine bisherige 8-GB-Dateigrenze und
-keine Begrenzung auf das erste MiB. Die Datei muss während eines Laufs unverändert
-bleiben. Für die Fortsetzung wird ihre Identität anhand von Größe und Inhaltshash geprüft.
+The data file holds raw bytes, no tokenizer. `mmap` allows OS-level file paging;
+there is no 8 GB file limit anymore and no restriction to the first MiB. The file
+must stay unchanged during a run. Resume checks its identity by size and content hash.
 
 ```sh
-# Neuer Lauf; begrenztes Budget empfohlen, steps=0 läuft bis zum Abbruch.
+# New run; limited budget recommended, steps=0 runs until abort.
 ./train train.bin model.ckpt steps=1000 saveevery=100
 
-# Konfiguration, Adam, Datenposition und Streaming-Zustand werden geladen.
-# steps zählt zusätzliche Schritte, nicht die globale Zielschrittzahl.
+# Configuration, Adam, data position, and streaming state are loaded.
+# steps counts additional steps, not the global target step count.
 ./train train.bin model.ckpt steps=1000
 
-# Gewichte unverändert; frischer Stream, keine Checkpoint-Schreibzugriffe.
+# Weights unchanged; fresh stream, no checkpoint writes.
 ./train validation.bin model.ckpt mode=eval
 
-# Eigenständiges MoE-Experiment, gleicher Daten-/Budgetvergleich erforderlich.
+# Standalone MoE experiment, same data/budget comparison required.
 ./train train.bin moe.ckpt experts=4 topk=2 steps=1000
 
-# Ablationen jeweils mit eigenem Checkpoint-Pfad und festem Seed.
+# Ablations each with own checkpoint path and fixed seed.
 ./train train.bin static.ckpt gated=0 steps=1000
 ./train train.bin latent.ckpt latent=1 steps=1000
 ```
 
-Bestehende Checkpoints liefern ihre Konfiguration automatisch. Abweichende
-Modell- oder Trainingsparameter werden beim Fortsetzen abgewiesen. Für eine
-andere Konfiguration wird ein neuer Checkpoint-Pfad verwendet. `mode`, `steps`
-und `saveevery` sind Laufsteuerung und gehören nicht zur gespeicherten Konfiguration.
-`saveevery=0` speichert nur am Ende. SIGINT/SIGTERM beendet nach dem aktuellen
-Fenster und speichert beim Training; bei einem Prozessabsturz bleibt der letzte
-vollständige Checkpoint erhalten.
+Existing checkpoints supply their configuration automatically. Diverging
+model or training parameters are rejected on resume. A different configuration
+gets a new checkpoint path. `mode`, `steps`, and `saveevery` are run control
+and are not part of the stored configuration. `saveevery=0` saves only at the end.
+SIGINT/SIGTERM stops after the current window and saves during training; after a
+process crash the last complete checkpoint remains.
 
-Wichtige Optionen:
+Important options:
 
-| Optionen | Standard / Bedeutung |
+| Options | Default / meaning |
 |---|---|
 | `dim`, `layers`, `experts`, `topk` | `256`, `4`, `1`, `1` |
-| `batch`, `seqlen` | `8`, `128`; TBPTT-Fenster in Bytes |
+| `batch`, `seqlen` | `8`, `128`; TBPTT window in bytes |
 | `gated`, `half_min`, `half_max` | `1`, `2`, `512` |
 | `lr`, `warmup`, `decaysteps`, `minlr` | `0.0005`, `200`, `8000`, `0.1` |
 | `ce`, `latent`, `var`, `stop` | `1`, `0`, `0`, `0` |
-| `aux`, `zloss` | `0.01`, `0.001`; nur bei MoE |
+| `aux`, `zloss` | `0.01`, `0.001`; MoE only |
 | `gradclip`, `ematau`, `seed` | `1`, `0.99`, `1234` |
-| `maxcarry` | `0`: kein periodischer Reset; positive Werte: Reset zwischen Fenstern |
+| `maxcarry` | `0`: no periodic reset; positive values: reset between windows |
 
-Die Datei wird in `batch` zusammenhängende Streams aufgeteilt. Jeder Stream
-startet mit leerem Zustand. Training verarbeitet vollständige Fenster; am Ende
-einer Epoche werden Restbytes verworfen und alle Zustände zurückgesetzt. Die
-Evaluation verarbeitet auch Restfenster; Padding geht nicht in CE/BPB ein.
-Übergänge zwischen den Streams werden nicht bewertet. Vergleiche müssen daher
-dieselbe Aufteilung und denselben Reset-Modus verwenden.
+The file is split into `batch` contiguous streams. Each stream
+starts with empty state. Training processes complete windows; at the
+end of an epoch leftover bytes are discarded and all states reset.
+Evaluation also processes tail windows; padding does not enter CE/BPB.
+Transitions between streams are not scored. Comparisons must therefore
+use the same split and the same reset mode.
 
-Die letzte Ausgabezeile ist ein JSON-Objekt mit `mode`, `steps`, `bytes`, `ce`,
-`bpb`, `seconds` und `bytes_per_second`. BPB bedeutet Bits pro Byte (`CE / ln(2)`),
-nicht Perplexität pro Subword-Token. Die Trainingsmessung enthält Forward, Backward,
-Updates und gegebenenfalls periodische Checkpoints; Initialisierung und der letzte
-Checkpoint liegen außerhalb der Zeitmessung. Evaluation enthält Forward und
-Scoring. Ein Lauf mit `steps>0 mode=eval` bewertet nur einen Präfix.
+The last output line is a JSON object with `mode`, `steps`, `bytes`, `ce`,
+`bpb`, `seconds`, and `bytes_per_second`. BPB means bits per byte (`CE / ln(2)`),
+not perplexity per subword token. The training measurement includes forward,
+backward, updates, and periodic checkpoints where applicable; initialization and the
+final checkpoint are outside the timing. Evaluation includes forward and
+scoring. A run with `steps>0 mode=eval` scores only a prefix.
 
-## Checkpoints und Reproduzierbarkeit
+## Checkpoints and reproducibility
 
-Format V3 speichert die vollständige Konfiguration, FP32-Mastergewichte,
-Adam-Momente, EMA-Encoder, globalen Optimizer-Schritt, Datenposition/Epoche,
-Datensatzfingerabdruck, rekurrente Zustände und den gültigen MLA-Cache einschließlich
-absoluter Positionen. BF16-Arbeitsgewichte werden daraus rekonstruiert.
+Format V3 stores the full configuration, FP32 master weights,
+Adam moments, EMA encoder, global optimizer step, data position/epoch,
+dataset fingerprint, recurrent states, and the valid MLA cache including
+absolute positions. BF16 working weights are reconstructed from these.
 
-Dateien werden über eine temporäre Datei mit Flush und atomarem Rename ersetzt.
-Ein Inhaltschecksum wird vor der Wiederherstellung geprüft. Alte V2-, MLX- und
-PyTorch-Checkpoints werden nicht stillschweigend als neue Modelle geladen.
-V3 ist ein natives Linux-64-Bit-Binärformat, kein plattformunabhängiges Austauschformat.
-Der Hash dient der Erkennung versehentlicher Änderungen, nicht der Authentifizierung.
+Files are replaced via a temporary file with flush and atomic rename.
+A content checksum is verified before restore. Old V2, MLX, and
+PyTorch checkpoints are not silently loaded as new models.
+V3 is a native Linux 64-bit binary format, not a portable exchange format.
+The hash detects accidental changes, not authentication.
 
-Seed und Datenfortschritt sind reproduzierbar. CUDA-Atomics und cuBLAS können
-kleine Rundungsunterschiede verursachen; bitidentische Ergebnisse über beliebige
-GPUs, Treiber oder Dispatch-Reihenfolgen sind nicht garantiert. Fortsetzung wird
-numerisch gegen einen ununterbrochenen Update geprüft.
+Seed and data progress are reproducible. CUDA atomics and cuBLAS can
+cause small rounding differences; bit-identical results across arbitrary
+GPUs, drivers, or dispatch orders are not guaranteed. Resume is
+checked numerically against an uninterrupted run.
 
-## Optionaler MLA-Cache
+## Optional MLA cache
 
 ```sh
 ./train train.bin attention.ckpt mla=1 mla_every=2 mla_cache=4096 mla_cc=256 steps=1000
 ```
 
-MLA ist standardmäßig deaktiviert. Der Cache speichert je aktivem Attention-Block
-und Stream komprimierte KV-Latents plus RoPE-Keys. Die reine Cachegröße beträgt:
+MLA is disabled by default. The cache stores compressed KV latents plus RoPE keys
+per active attention block and stream. The pure cache size is:
 
 ```text
-batch × Anzahl MLA-Blöcke × mla_cache × (mla_L + mla_R) × 2 Bytes
+batch × number of MLA blocks × mla_cache × (mla_L + mla_R) × 2 bytes
 ```
 
-Gewichte, Optimizer, Aktivierungen und Attention-Arbeitsspeicher kommen hinzu.
-Die Attention liest den gesamten gültigen Cache in Chunks. Ihre Rechenkosten
-wachsen deshalb mit der Kontextlänge trotz komprimierter Speicherung.
+Weights, optimizer, activations, and attention workspace come on top.
+Attention reads the entire valid cache in chunks. Its compute cost therefore
+grows with context length despite compressed storage.
 
-Bei Überlauf wird nur der älteste nötige Präfix entfernt. Die Verdrängung geschieht
-vor einem ganzen Fenster: Das erste Byte dieses Fensters hat bis zu `seqlen-1`
-ältere Positionen weniger zur Verfügung als bei einem strikt byteweisen Sliding
-Window. Absolute RoPE-Positionen bleiben erhalten. Vergangene Cache-Einträge
-sind an der TBPTT-Grenze abgetrennt; die Up-Projektionen erhalten weiterhin Gradienten.
+On overflow only the oldest necessary prefix is removed. Eviction happens
+before a whole window: the first byte of that window has up to `seqlen-1`
+fewer older positions available than with a strictly byte-wise sliding
+window. Absolute RoPE positions are preserved. Past cache entries
+are detached at the TBPTT boundary; the up-projections still receive gradients.
 
-`mla_cache=131072` ist konfigurierbar, aber weder Abrufqualität noch Durchsatz bei
-128k Bytes sind durch die kleinen Regressionstests belegt. Der Cache ist kein
-verlustfreies Archiv und es gibt keine Garantie eines „exakten 128k-Abrufs“.
+`mla_cache=131072` is configurable, but neither retrieval quality nor throughput
+at 128k bytes is covered by the small regression tests. The cache is not a
+lossless archive and there is no guaranteed "exact 128k retrieval".
 
-## Plan: RSI-Learning über mehrere Aufgabenfamilien
+## Plan: RSI learning across multiple task families
 
-**Status: geplant, kein automatischer RSI-Controller implementiert.** Das aktuelle
-CUDA-Training und die unverändernde Evaluation bilden die ausführbare Grundlage.
+**Status: planned, no automatic RSI controller implemented.** The current
+CUDA training and the non-modifying evaluation form the executable foundation.
 
-[Dream-RSI](https://arxiv.org/html/2609.14858v1) verbessert im Paper die ausführbare
-Explorationsstrategie um einen festen Agenten. Historische Versuchsbäume dienen
-als Replay-Welten; neue Strategien entscheiden über Fortsetzung, Verzweigung und
-Abbruch. Das Verfahren ersetzt kein Gewichtslernen. Replay deckt nur tatsächlich
-beobachtete Fortsetzungen ab. Verbesserungen auf alten Bäumen garantieren keinen
-Transfer auf neue Aufgaben. Die folgende Übertragung auf TMT ist ein Projektplan.
+[Dream-RSI](https://arxiv.org/html/2609.14858v1) improves, in the paper, the executable
+exploration strategy with a fixed agent. Historic attempt trees serve
+as replay worlds; new strategies decide continuation, branching, and
+termination. The method does not replace weight learning. Replay covers only actually
+observed continuations. Improvements on old trees guarantee no
+transfer to new tasks. The following transfer to TMT is a project plan.
 
-### 1. Verlässliche Aufgaben und Baselines
+### 1. Reliable tasks and baselines
 
-Ein fester Evaluator erhält ausschließlich ein Modellartefakt, ein versioniertes
-Aufgabenmanifest und ein Budget. Alle Modelländerungen passieren außerhalb des
-Evaluators. Zuerst werden folgende CUDA-Adapter umgesetzt:
+A fixed evaluator receives only a model artifact, a versioned
+task manifest, and a budget. All model changes happen outside the
+evaluator. First, the following CUDA adapters are implemented:
 
-| Familie | Aufgaben / Protokoll | Zielgröße |
+| Family | Tasks / protocol | Target metric |
 |---|---|---|
-| Sprache | Zurückgehaltene Texte aus mehreren Quellen | BPB je Quelle |
-| Grammatik | CoLA-Probe auf finaler Repräsentation; BLiMP-Satzwahrscheinlichkeiten | MCC / Paar-Genauigkeit |
-| Gedächtnis | Copy, verzögerter Abruf, Schlüssel-Wert-Zuordnung | Genauigkeit nach Distanz |
-| Algorithmen | Addition, Klammerprüfung, kleine Zustandsautomaten | Exakte Lösung, längere Eingaben |
-| Fortlaufendes Lernen | Domänenwechsel und Rückkehr zu alten Aufgaben | Anpassung und Vergessen |
-| Ressourcen | Feste Shapes und Warmup-Regeln | Laufzeit, Bytes/s, GPU-Spitzenspeicher |
+| Language | Held-back texts from multiple sources | BPB per source |
+| Grammar | CoLA probe on final representation; BLiMP sentence likelihoods | MCC / pair accuracy |
+| Memory | Copy, delayed retrieval, key-value mapping | Accuracy by distance |
+| Algorithms | Addition, bracket checking, small state machines | Exact solution, longer inputs |
+| Continual learning | Domain switches and return to old tasks | Adaptation and forgetting |
+| Resources | Fixed shapes and warmup rules | Runtime, bytes/s, peak GPU memory |
 
-[BLiMP](https://github.com/alexwarstadt/blimp) ist eine Sammlung grammatischer
-Minimalpaare. Bei Byte-Modellen muss die vollständige Satzwahrscheinlichkeit
-mit identischer Zustandsinitialisierung verglichen werden.
+[BLiMP](https://github.com/alexwarstadt/blimp) is a collection of grammatical
+minimal pairs. For byte models the full sentence likelihood must
+be compared with identical state initialization.
 
-Trainingsdaten, Entwicklungsdaten und gesperrte Testdaten werden getrennt.
-Generierte Aufgaben bekommen getrennte Seeds und zusätzlich zurückgehaltene
-Längen/Strukturen. Ganze Aufgabenfamilien werden für Transfertests ausgeschlossen.
-Testdaten dürfen weder in Prompts noch in Strategieauswahl oder Gewichtsupdates gelangen.
+Training, development, and locked test data are separated.
+Generated tasks get separate seeds plus additionally held-back
+lengths/structures. Entire task families are excluded for transfer tests.
+Test data must not enter prompts, strategy selection, or weight updates.
 
-Abnahme: reproduzierbare Manifeste und Einzelmesswerte, mindestens drei Seeds,
-Vergleich der dichten Baseline mit statischer/gesteuerter Rekurrenz bei gleichem
-Budget. Die Tests im Repository ersetzen diese Qualitätsbenchmarks nicht.
+Acceptance: reproducible manifests and individual measurements, at least three seeds,
+comparison of the dense baseline against static/gated recurrence at equal
+budget. The in-repository tests do not replace these quality benchmarks.
 
-### 2. Einheitliches Experimentprotokoll
+### 2. Uniform experiment protocol
 
-Ein kleiner Runner (Rust ist für Prozessverwaltung und Ablage vorgesehen) startet
-CUDA-Prozesse mit begrenzter GPU-Zeit und sammelt deren JSON-Ergebnisse. Es gibt
-zunächst eine lokale Job-Warteschlange statt einer verteilten Servicearchitektur.
-Ein Aufgabenadapter liefert über dieselbe Schnittstelle Eingaben und überprüfbare
-Ergebnisse; pro Benchmark entsteht kein eigenes Trainingssystem.
+A small runner (Rust is intended for process management and storage) starts
+CUDA processes with limited GPU time and collects their JSON results. There is
+first a local job queue instead of a distributed service architecture.
+A task adapter delivers inputs and verifiable
+results through the same interface; each benchmark gets no training system of its own.
 
-Jeder Versuch protokolliert:
+Each attempt logs:
 
-- Versuch-ID, Eltern-ID, Code-/Build-Hash und vollständige Konfiguration;
-- Daten-/Aufgabenmanifest, Seeds und Hardware-/Treiber-Version;
-- Ausgangs- und Endcheckpoint einschließlich Optimizer-/Streaming-Zustand;
-- alle Einzelmetriken, Fehler und Abbrüche;
-- GPU-Zeit, Peak-Speicher sowie Agenten-Tokens/-Kosten.
+- attempt ID, parent ID, code/build hash, and full configuration;
+- data/task manifest, seeds, and hardware/driver version;
+- starting and ending checkpoint including optimizer/streaming state;
+- all individual metrics, errors, and aborts;
+- GPU time, peak memory, and agent tokens/cost.
 
-Das spätere Controller-Interface lautet konzeptionell:
+The later controller interface reads conceptually:
 
 ```text
 select(observed_history, remaining_budget) -> parent_ids
 execute(parent_id, experiment_spec, budget) -> observation + artifact
 ```
 
-Die leere Auswahl beendet eine Suche. Zunächst werden nur kompatible
-Trainingsfortsetzungen aus einem Checkpoint unterstützt. Eine geänderte Architektur
-startet als neuer Wurzelversuch; das heutige strenge Checkpoint-Laden wird dafür
-nicht aufgeweicht. Eine Curriculum-Erweiterung muss Datensatzwechsel explizit
-protokollieren und bekommt einen separaten Import-/Fortsetzungsvertrag.
+Empty selection ends a search. Only compatible
+training continuations from a checkpoint are supported at first. A changed architecture
+starts as a new root attempt; today's strict checkpoint loading is
+not relaxed for that. A curriculum extension must log dataset changes explicitly
+and gets a separate import/continuation contract.
 
-Abnahme: wiederholbare Wiederaufnahme nach Abbruch, unveränderlicher Evaluator,
-gleiche Budgets für alle Kandidaten und vollständig nachvollziehbare Herkunft.
+Acceptance: repeatable resume after abort, immutable evaluator,
+equal budgets for all candidates, and fully traceable provenance.
 
-### 3. Feste Suche vor lernender Suche
+### 3. Fixed search before learned search
 
-Erst zufällige Suche, eine feste Verzweigungsstrategie und Successive Halving als
-Vergleich implementieren. Klein beginnen: Gates, Zeitskalen, Lernrate,
-Fensterlänge und Loss-Ablationen. MoE/MLA erst nach stabilen Baselines hinzufügen.
-Ein vorhandener Coding-Agent kann später Änderungen vorschlagen; dass das kleine
-TMT selbst solchen Code schreiben kann, ist bisher nicht nachgewiesen.
+First implement random search, a fixed branching strategy, and successive halving as
+comparison. Start small: gates, timescales, learning rate,
+window length, and loss ablations. Add MoE/MLA only after stable baselines.
+An existing coding agent can suggest changes later; whether the small
+TMT itself can write such code is unproven so far.
 
-Qualität wird je Aufgabenfamilie auf vorab festgelegte Baselines normiert. Familien
-werden gleich gewichtet, nicht nach Anzahl ihrer Untertests. Einzelwerte bleiben
-sichtbar. Eine mögliche Auswahlregel lautet:
+Quality is normalized per task family against pre-set baselines. Families
+are weighted equally, not by number of subtests. Individual values stay
+visible. A possible selection rule reads:
 
 ```text
 score = mean(normalized_family_scores) - lambda * normalized_total_cost
 ```
 
-Kosten umfassen Online-Versuche UND Strategieentwicklung. Ressourcenlimits,
-Korrektheit und maximal erlaubte Regressionen sind harte Zulassungsbedingungen.
-Die Gewichte/Normierung werden vor dem Experiment festgelegt, nicht nach Sichtung
-der Testergebnisse angepasst.
+Costs include online attempts AND strategy development. Resource limits,
+correctness, and maximum allowed regressions are hard admission criteria.
+Weights/normalization are fixed before the experiment, not adjusted after seeing
+test results.
 
-### 4. Historisches Replay und reale Validierung
+### 4. Historic replay and real validation
 
-Aus protokollierten Versuchen entstehen versionierte Replay-Bäume. Jede alternative
-Strategie startet mit leerem Beobachtungszustand. Der Controller sieht ausschließlich
-bereits freigelegte Ergebnisse. Weder zukünftige Scores noch ausgeblendete Zweige
-werden als Features zugänglich gemacht.
+Versioned replay trees grow from logged attempts. Every alternative
+strategy starts with empty observation state. The controller sees only
+already revealed results. Neither future scores nor hidden branches
+are accessible as features.
 
-Eine aufgezeichnete Fortsetzung wird nur dann wiederverwendet, wenn Elternartefakt,
-Aktion und Ausführungskontext übereinstimmen. Fehlende Fortsetzungen heißen
-„unbekannt“; ihnen wird kein erfundener Erfolg oder Misserfolg zugeordnet. Neue
-Aktionen müssen online ausgeführt werden. Die Suche enthält weiterhin neue
-Wurzelversuche, um die historische Abdeckung zu erweitern.
+A recorded continuation is reused only if parent artifact,
+action, and execution context match. Missing continuations mean
+"unknown"; they get no invented success or failure assigned. New
+actions must run online. The search keeps adding new
+root attempts to extend historic coverage.
 
-Strategien werden auf getrennten historischen Bäumen entwickelt und validiert.
-Der beste Replay-Kandidat tritt anschließend online gegen die bisherige Strategie
-an. Er wird nur bei einem belastbaren Vorteil unter gleichem Gesamtbudget übernommen.
-Messgrößen: Qualität bei festem Budget, Kosten bis zu einer Zielqualität, Regressionen
-und Transfer auf zurückgehaltene Aufgabenfamilien.
+Strategies are developed and validated on separate historic trees.
+The best replay candidate then competes online against the incumbent strategy.
+It is adopted only on robust advantage under equal total budget. Metrics:
+quality at fixed budget, cost to a target quality, regressions,
+and transfer to held-back tasks.
 
-### 5. Tatsächliches Lernen der Modellgewichte
+### 5. Actual learning of the model weights
 
-Die ausgewählten Trainingsläufe verbessern TMT per Gradientenlernen. Überprüfbare
-synthetische Aufgaben liefern Eingabe-Ziel-Paare; korrekte Agentenlösungen können
-nach Prüfung und Deduplikation als zusätzliche Trainingsdaten dienen. Frühere
-Domänen bleiben in einer festgelegten Mischung erhalten, um Vergessen zu messen
-und zu begrenzen. Ein Benchmark-Gesamtscore allein ist kein ausreichendes
-supervisiertes Trainingssignal.
+The selected training runs improve TMT by gradient learning. Verifiable
+synthetic tasks deliver input-target pairs; correct agent solutions can
+serve as additional training data after review and deduplication. Earlier
+domains stay in a fixed mixture to measure
+and limit forgetting. A benchmark total score alone is not sufficient
+supervised training signal.
 
-Reinforcement Learning wäre ein gesondertes Experiment mit festem Verifier,
-Policy-/Referenzcheckpoint und unabhängiger Evaluation. Es gehört nicht zur ersten
-Dream-RSI-Integration. Zuerst muss die Kombination aus überwachten Aufgaben,
-reproduzierbaren Experimenten und gelernter Suchsteuerung die festen Baselines schlagen.
+Reinforcement learning would be a separate experiment with fixed verifier,
+policy/reference checkpoint, and independent evaluation. It is not part of the first
+Dream-RSI integration. First, the combination of supervised tasks,
+reproducible experiments, and learned search control must beat the fixed baselines.
 
-## Stand der Verifikation
+## Verification status
 
-Die nativen Architekturtests und die CLI-Tests wurden auf einer NVIDIA GeForce
-RTX 5070 Laptop GPU ausgeführt. CUDA Compute Sanitizer (`memcheck`) meldete für
-die Architekturtests keine Fehler. Dies bestätigt die geprüften kleinen Shapes
-und Rechenwege; Modellqualität auf den geplanten Benchmarks und Skalierung auf
-128k Bytes sind weiterhin offen.
+The native architecture tests and CLI tests ran on an NVIDIA GeForce
+RTX 5070 Laptop GPU. CUDA Compute Sanitizer (`memcheck`) reported no errors
+for the architecture tests. This confirms the tested small shapes
+and code paths; model quality on the planned benchmarks and scaling to
+128k bytes remain open.
