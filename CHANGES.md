@@ -25,7 +25,7 @@ BPC 1.31 (run2) and 2.50 (8h laptop run), reproducibly checkpointed.
 ## 2. Training and stability
 
 - **Batches instead of byte-by-byte:** (B,T) windows, one backward per batch (before: one sync per byte).
-- **State hygiene:** memory/resets per file + `maxcarry` cap; checkpoints contain **no memory** anymore (before: drift across runs, not reproducible).
+- **State hygiene:** state resets per epoch + optional `maxcarry` cap; checkpoints store the training stream state (recurrent carry + MLA cache) only for exact resume, while eval and sampling always start with a fresh state (before: memory carried into every later run, drift, not reproducible).
 - **Optimization:** AdamW + warmup/cosine schedule + grad clip + **NaN guard** (non-finite gradient → update refused instead of poisoning weights); generation never trains weights (before: aimless TTT while sampling).
 - **Init:** decay for long memory, router N(0,0.02) for uniform start.
 - **Eval discipline:** held-out split (5 MB), `mode=eval` with CE/BPB JSON, CoLA anecdotes replaced by measurement.
@@ -50,7 +50,7 @@ BPC 1.31 (run2) and 2.50 (8h laptop run), reproducibly checkpointed.
 
 ## 5. Discarded/removed
 
-MLX original (`main.py`), PyTorch port + MoE (`main_torch_moe.py`), both benchmark scripts, old READMEs, V2 checkpoints, dummy-gradient hack, RTRL approximation, memory-in-checkpoint, per-byte-stdout training.
+MLX original (`main.py`), PyTorch port + MoE (`main_torch_moe.py`), both benchmark scripts, old READMEs, V2 checkpoints, dummy-gradient hack, RTRL approximation, memory carried from training into chat/inference, per-byte-stdout training.
 
 ## 6. Open
 
