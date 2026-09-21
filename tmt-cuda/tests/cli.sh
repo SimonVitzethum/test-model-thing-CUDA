@@ -14,6 +14,8 @@ printf 'ABCDEFGHIJKLMNOPQRSTUVWXYZ12345' > "$work/heldout"
 ./train "$work/heldout" "$work/split" mode=eval > "$work/eval.log"
 # 31 bytes partitioned into two streams: 29 next-byte pairs, including tail.
 grep '"bytes":29,' "$work/eval.log"
+# Evaluation may override the window and the carry limit (context ablation).
+./train "$work/heldout" "$work/split" mode=eval seqlen=3 maxcarry=6 > "$work/eval-override.log"
 cmp "$work/split" "$work/saved"
 if ./train "$work/data" "$work/split" dim=32 steps=1 > "$work/error.log" 2>&1; then
     echo 'FAIL: mismatching configuration accepted'; exit 1

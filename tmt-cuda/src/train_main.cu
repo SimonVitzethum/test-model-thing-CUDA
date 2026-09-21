@@ -113,7 +113,14 @@ int main(int argc, char** argv) {
         bool evaluation = mode == "eval";
         if (evaluation && !exists) throw std::runtime_error("evaluation requires an existing checkpoint");
         validate_cfg(cfg);
-        if (exists && config_text(cfg) != saved_config)
+        // Evaluation may change seqlen and maxcarry: neither affects weights
+        // or the stored state layout, and eval starts from a fresh state.
+        Cfg compared = cfg;
+        if (evaluation && exists) {
+            Cfg stored = checkpoint_config(path);
+            compared.seqlen = stored.seqlen; compared.maxcarry = stored.maxcarry;
+        }
+        if (exists && config_text(compared) != saved_config)
             throw std::runtime_error("configuration differs from checkpoint; choose a new checkpoint path");
         Dataset data(argv[1]);
         if (data.size < (size_t)cfg.batch * (evaluation ? 2 : cfg.seqlen + 1))

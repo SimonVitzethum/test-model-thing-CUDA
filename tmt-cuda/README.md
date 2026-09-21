@@ -144,7 +144,7 @@ must stay unchanged during a run. Resume checks its identity by size and content
 
 Existing checkpoints supply their configuration automatically. Diverging
 model or training parameters are rejected on resume. A different configuration
-gets a new checkpoint path. `mode`, `steps`, and `saveevery` are run control
+gets a new checkpoint path. With `mode=eval`, `seqlen` and `maxcarry` may also differ (e.g. `maxcarry=1024` for a context ablation). `mode`, `steps`, and `saveevery` are run control
 and are not part of the stored configuration. `saveevery=0` saves only at the end.
 SIGINT/SIGTERM stops after the current window and saves during training; after a
 process crash the last complete checkpoint remains.
