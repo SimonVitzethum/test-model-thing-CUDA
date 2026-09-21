@@ -310,6 +310,30 @@ Evaluation reports exact match (every answer byte is the argmax given the correc
 prefix) and answer CE. The memory helps only if `on` beats both `off` and
 `shuffled`; `on ≈ shuffled` means the model ignores the memory's content.
 
+**Stage-1 result** (2026-09-21, RTX 5070 Laptop). Wikidata subset from the API
+(seeds: countries, big cities, writers, politicians, films): 18,011 nodes,
+59,689 facts; 19,843 training examples (9,098 subjects), 2,269 test examples on
+1,008 subjects that never appear in training. Model `dim=256 layers=4`, memory
+defaults, `batch=32 seqlen=128`, 20,000 steps (8 minutes):
+
+| Memory | Exact match (test subjects) | Answer CE |
+|---|---|---|
+| on (the subject's facts) | **90.3%** | 0.07 |
+| off | 0.1% | 2.70 |
+| shuffled (another subject's facts) | 4.0% | 8.21 |
+
+On training subjects: 99.95% with the memory, 4.2% with shuffled facts, so the
+facts are read from the memory rather than memorized in the weights. Most
+remaining errors are single-byte copy slips ("Kithuanian litan"). An earlier run
+on only 464 examples memorized instead (`on ≈ shuffled`); more subjects made
+copying the cheaper strategy.
+
+**Next stages.** Stage 2: the model finds the entity itself from its state while
+reading the question and queries an index over all nodes (optionally with
+personalized PageRank for neighboring facts); no oracle retrieval. Stage 3:
+pretraining on plain text, then joint training with the graph for free-form
+questions, ambiguous names, combining facts and using them in sentences.
+
 ## Checkpoints and reproducibility
 
 Format V3 stores the full configuration, FP32 master weights,
