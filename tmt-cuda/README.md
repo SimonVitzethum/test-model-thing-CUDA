@@ -355,6 +355,26 @@ an external gradient equal to the CE gradient reproduces the CE backward.
 ./kgtrain eval kg_test.tsv s2.ckpt nodes=kg_nodes.tsv memory=retrieved
 ```
 
+**Stage-2 result** (same data and model size as stage 1, `mem_rdim=128`,
+10,000 steps, 24 minutes while sharing the GPU with another run). Index: all
+18,011 nodes; test questions about 1,008 subjects never seen in training:
+
+| | Test |
+|---|---|
+| retrieval top-1 (exact node) | **99.25%** |
+| retrieval top-1 (same label) | 99.82% |
+| retrieval top-5 | 100.00% |
+| exact match, retrieved memory | **79.7%** |
+| exact match, oracle memory (stage-1 setting) | 79.9% |
+| exact match, no memory / shuffled facts | 0.0% / 4.2% |
+
+Retrieval costs almost nothing end to end (79.7% vs 79.9% with the oracle). The
+gap to stage 1 (90.3%) comes from the shorter training of the answer pass
+(10,000 vs 20,000 steps), not from retrieval. Caveat: the subject's name
+appears verbatim in the question, so retrieval is essentially name matching
+through the model's state; ambiguous names and paraphrased subjects are not
+tested.
+
 `memory=retrieved` reports retrieval top-1/top-5 over the whole index (exact
 node; `top1_label` also accepts a different node with the same label) and the
 end-to-end exact match. The index is scored exhaustively on the host, which is
