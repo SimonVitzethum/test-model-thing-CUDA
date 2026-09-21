@@ -99,6 +99,19 @@ s_t = a_t * s_(t-1) + (1 - a_t) * x_t
 x_out = x_t + FFN(LayerNorm(s_t))
 ```
 
+### Changes compared to the original architecture
+
+| Area | Original (MLX) | Now (CUDA) |
+|---|---|---|
+| Layer structure | all recurrent layers fed directly from the byte embedding | each layer receives the residual stream of the previous layer (hierarchical) |
+| Recurrence | `state = decay·state + enc`, unbounded, single timescale (half-life ~1 byte) | gated and normalized (bounded), half-lives staggered from 2 to 512 bytes, input-dependent gate |
+| Time credit | 1-step gradient + hand-built traces (embedding/decay only) | exact TBPTT window (default 128 bytes) including the incoming carry |
+| Feedforward | one dense linear per layer | dense or MoE top-k with token dispatch, SiLU, load-balancing + z-loss |
+| Long range | effectively dozens of bytes | optional MLA cache with RoPE, up to 128k bytes |
+| Objective | JEPA latent loss + CE on the same vector | next-byte CE by default; latent loss against an EMA target encoder optional |
+| Stop head | MSE on line endings | optional BCE with `pos_weight`, newline as target |
+| Memory | stored in checkpoints, drifts across runs | explicit stream state decoupled from the model, resets per epoch or via `maxcarry` |
+
 See [ARCHITECTURE.md](tmt-cuda/ARCHITECTURE.md) for the full design and
 [tmt-cuda/README.md](tmt-cuda/README.md) for the planned Dream-RSI learning
 integration.
