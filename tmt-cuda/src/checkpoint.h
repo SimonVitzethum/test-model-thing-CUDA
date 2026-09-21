@@ -97,7 +97,7 @@ static void checkpoint_header(Checkpoint& io, Cfg& cfg) {
         while (std::getline(canonical, line)) {
             std::string key = line.substr(0, line.find('='));
             if (stored_keys.find(" " + key + " ") != std::string::npos) expected += line + "\n";
-            else if (key != "traces" && key != "trace_decay" && key != "docsep")
+            else if (key != "traces" && key != "trace_decay" && key != "docsep" && key.rfind("mem", 0) != 0)
                 throw std::runtime_error("checkpoint configuration schema mismatch");
         }
         if (expected != text) throw std::runtime_error("checkpoint configuration schema mismatch");
@@ -128,7 +128,9 @@ static void require_same_model(const Cfg& a, const Cfg& b) {
         a.mla_heads != b.mla_heads || a.mla_dh != b.mla_dh ||
         a.mla_L != b.mla_L || a.mla_R != b.mla_R ||
         a.mla_cache != b.mla_cache || a.mla_every != b.mla_every ||
-        a.mla_cc != b.mla_cc || a.mla_theta != b.mla_theta)
+        a.mla_cc != b.mla_cc || a.mla_theta != b.mla_theta || a.mem != b.mem ||
+        (a.mem && (a.mem_len != b.mem_len || a.mem_heads != b.mem_heads ||
+                   a.mem_dh != b.mem_dh || a.mem_every != b.mem_every)))
         throw std::runtime_error("checkpoint architecture differs; use a new path for a new experiment");
 }
 static void checkpoint_payload(Checkpoint& io, Model& m, StreamState& state, Progress& progress) {

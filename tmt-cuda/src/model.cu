@@ -111,6 +111,8 @@ struct Model {
     float* trlog = nullptr;
     int *ids, *nxt, *end;
     long* pos = nullptr;   // (N,) Positionen Device
+    std::vector<MemLayer> MEM;  // fact memory (mem=1), same size as L
+    MemShared MS;
 };
 
 struct StreamState {
@@ -351,6 +353,61 @@ static void build_model(Model& m) {
         m.memory.allocate(W.dQflat, (long)N * H * (dh + R) * 2);
         m.memory.allocate(W.dKVb, (long)B * Cc * H * dh * 2);
     }
+    // ---- Fact memory (optional). Added last so all other parameters keep
+    // their initialization; Wo = 0 makes the untrained memory an exact no-op.
+    m.MEM.resize(L);
+    if (c.mem) {
+        int M = c.mem_len, HD = c.mem_heads * c.mem_dh;
+        MemShared& S = m.MS;
+        S.eprev = m.params.add(256L * D); init_u(S.eprev, -0.05f, 0.05f);
+        S.pos = m.params.add((long)M * D); init_u(S.pos, -0.05f, 0.05f);
+        S.decay = m.params.add(D);  // encoder half-lives 1..64 bytes, gate starts at 0
+        h.resize(D);
+        for (int d = 0; d < D; ++d) {
+            float half = powf(64.f, d / (float)std::max(1, D - 1));
+            float a = expf(-logf(2.0f) / half);
+            h[d] = logf(a / (1.0f - a));
+        }
+        CUDA_CHECK(cudaMemcpy(m.params.at(S.decay).master, h.data(), D * 4, cudaMemcpyHostToDevice));
+        copy_bf16_kernel<<<(D + 255) / 256, 256>>>(m.params.at(S.decay).master, m.params.at(S.decay).work, D);
+        S.gate = m.params.add(D); init_u(S.gate, 0.f, 0.f);
+        float a = sqrtf(1.0f / D);
+        for (int l = 0; l < L; ++l) {
+            MemLayer& Me = m.MEM[l];
+            Me.use = (l + 1) % c.mem_every == 0;
+            if (!Me.use) continue;
+            Me.gamma = m.params.add(D);
+            h.assign(D, 1.0f);
+            CUDA_CHECK(cudaMemcpy(m.params.at(Me.gamma).master, h.data(), D * 4, cudaMemcpyHostToDevice));
+            copy_bf16_kernel<<<(D + 255) / 256, 256>>>(m.params.at(Me.gamma).master, m.params.at(Me.gamma).work, D);
+            Me.beta = m.params.add(D);
+            Me.wq = m.params.add((long)HD * D); init_u(Me.wq, -a, a);
+            Me.wk = m.params.add((long)HD * D); init_u(Me.wk, -a, a);
+            Me.wv = m.params.add((long)HD * D); init_u(Me.wv, -a, a);
+            Me.wo = m.params.add((long)D * HD);
+            for (size_t p : {Me.beta, Me.wo}) {
+                CUDA_CHECK(cudaMemset(m.params.at(p).master, 0, m.params.at(p).n * 4));
+                CUDA_CHECK(cudaMemset(m.params.at(p).work, 0, m.params.at(p).n * 2));
+            }
+            m.memory.allocate(Me.Xsnap, ND * 2); m.memory.allocate(Me.Hn, ND * 2);
+            m.memory.allocate(Me.Q, (long)N * HD * 2); m.memory.allocate(Me.O, (long)N * HD * 2);
+            m.memory.allocate(Me.K, (long)B * M * HD * 2); m.memory.allocate(Me.V, (long)B * M * HD * 2);
+            m.memory.allocate(Me.mean, N * 4); m.memory.allocate(Me.rstd, N * 4);
+            m.memory.allocate(Me.P, (long)B * c.mem_heads * T * M * 4);
+        }
+        m.memory.allocate(S.ids, (long)B * M * 4);
+        CUDA_CHECK(cudaMemset(S.ids, 0xff, (long)B * M * 4));  // -1: no memory
+        m.memory.allocate(S.enc, (long)B * M * D * 2);
+        m.memory.allocate(S.enc0, (long)B * M * D * 2);
+        m.memory.allocate(S.state, (long)B * M * D * 4);
+        m.memory.allocate(S.dEnc0, (long)B * M * D * 4);
+        m.memory.allocate(S.dO, (long)N * HD * 2); m.memory.allocate(S.dQ, (long)N * HD * 2);
+        m.memory.allocate(S.dK, (long)B * M * HD * 2); m.memory.allocate(S.dV, (long)B * M * HD * 2);
+        m.memory.allocate(S.dHn, ND * 2); m.memory.allocate(S.dXln, ND * 2);
+        m.memory.allocate(S.dEncB, (long)B * M * D * 2);
+        m.memory.allocate(S.dS, (long)B * c.mem_heads * T * M * 4);
+        m.memory.allocate(S.dEnc, (long)B * M * D * 4);
+    }
 }
 
 static float host_sum(float* d, int n) {
@@ -383,6 +440,9 @@ static void forward_window(Model& m, StreamState& state, float& tot, float& ce_o
     // ---- Forward ----
     emb_forward(m.params.at(m.emb).work, m.ids, m.enc, N, D);
     CUDA_CHECK(cudaMemcpy(m.X, m.enc, ND * 2, cudaMemcpyDeviceToDevice));
+    if (c.mem)
+        mem_encode(m.params.at(m.emb).work, m.params.at(m.MS.eprev).work, m.params.at(m.MS.pos).work,
+                   m.params.at(m.MS.decay).master, m.params.at(m.MS.gate).master, m.MS, B, c.mem_len, D);
     // Positionen (Lockstep über Streams)
     if (c.mla) {
         std::vector<long> hp;
@@ -424,6 +484,12 @@ static void forward_window(Model& m, StreamState& state, float& tot, float& ce_o
                         m.pos, B, T, c.mla_heads, c.mla_dh, c.mla_L,
                         c.mla_R, c.mla_cc, c.mla_cache, c.mla_theta, sc, D);
             add_bf16_kernel<<<blocksL, TPB>>>(m.X, m.M, ND);
+        }
+        if (c.mem && m.MEM[l].use) {
+            MemLayer& Me = m.MEM[l];
+            mem_forward(m.X, Me, m.MS, m.params.at(Me.gamma).master, m.params.at(Me.beta).master,
+                        m.params.at(Me.wq).work, m.params.at(Me.wk).work, m.params.at(Me.wv).work,
+                        m.params.at(Me.wo).work, m.M, B, T, c.mem_len, c.mem_heads, c.mem_dh, D);
         }
         // carry-out
         dim3 gc(B, (D + TPB - 1) / TPB);
@@ -505,8 +571,18 @@ static void backward_window(Model& m, StreamState& state) {
     copy_bf16_kernel<<<blocksL, TPB>>>(m.dXres, m.dXs, ND);
     CUDA_CHECK(cudaMemset(m.dEnc, 0, ND * 4));
     float* dWxp[16];
+    if (c.mem) CUDA_CHECK(cudaMemset(m.MS.dEnc, 0, (long)B * c.mem_len * D * 4));
     for (int l = (int)m.L.size() - 1; l >= 0; --l) {
         Layer& Ly = m.L[l];
+        // Memory was last in the forward, so it comes first here.
+        if (c.mem && m.MEM[l].use) {
+            MemLayer& Me = m.MEM[l];
+            auto G = [&](size_t p) { return m.params.at(p).grad; };
+            mem_backward(m.dXs, Me, m.MS, m.params.at(Me.gamma).master, m.params.at(Me.wq).work,
+                         m.params.at(Me.wk).work, m.params.at(Me.wv).work, m.params.at(Me.wo).work,
+                         G(Me.gamma), G(Me.beta), G(Me.wq), G(Me.wk), G(Me.wv), G(Me.wo),
+                         B, T, c.mem_len, c.mem_heads, c.mem_dh, D);
+        }
         // MLA zuerst (war zuletzt im Forward)
         if (c.mla && m.ML[l].use) {
             MlaLayer& Ml = m.ML[l];
@@ -554,6 +630,11 @@ static void backward_window(Model& m, StreamState& state) {
         cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dEncTmp, ND);
         copy_bf16_kernel<<<blocksL, TPB>>>(m.dEncTmp, m.dXs, ND);
     }
+    if (c.mem)
+        mem_encode_backward(m.MS, m.params.at(m.MS.decay).master, m.params.at(m.MS.gate).master,
+                            m.params.at(m.MS.decay).grad, m.params.at(m.MS.gate).grad,
+                            m.params.at(m.emb).grad, m.params.at(m.MS.eprev).grad,
+                            m.params.at(m.MS.pos).grad, B, c.mem_len, D);
     // Residual-Start + Embed-Grade
     cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dEnc, ND);
     emb_backward(m.dEnc, m.ids, m.params.at(m.emb).grad, N, D);

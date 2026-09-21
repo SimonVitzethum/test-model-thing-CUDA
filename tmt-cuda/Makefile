@@ -3,7 +3,7 @@ NVCC ?= nvcc
 ARCH = -gencode arch=compute_120a,code=sm_120a
 OPTS = -O3 -std=c++17 -Xcompiler -Wall --use_fast_math
 
-all: bench train architecture_test sample gradcheck profile roofline
+all: bench train architecture_test sample gradcheck kgtrain kgprep profile roofline
 
 bench: src/bench.cu src/cell.cu src/common.h Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o bench src/bench.cu src/cell.cu
@@ -21,17 +21,24 @@ sample: src/sample.cu $(wildcard src/*.h src/*.cu) Makefile
 gradcheck: src/gradcheck.cu $(wildcard src/*.h src/*.cu) Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/gradcheck.cu -lcublas
 
+kgtrain: src/kg_main.cu $(wildcard src/*.h src/*.cu) Makefile
+	$(NVCC) $(ARCH) $(OPTS) -o $@ src/kg_main.cu -lcublas
+
+kgprep: tools/kgprep.cpp Makefile
+	$(CXX) -O3 -std=c++17 -Wall -pthread -o $@ tools/kgprep.cpp
+
 profile: src/profile.cu src/util.h src/linalg.cu src/moe.cu Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/profile.cu -lcublas
 
 roofline: src/roofline.cu src/common.h Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/roofline.cu -lcublas
 
-check: architecture_test train sample gradcheck
+check: architecture_test train sample gradcheck kgtrain kgprep
 	./architecture_test
 	sh tests/cli.sh
+	sh tests/kg.sh
 
 clean:
-	rm -f bench train selftest architecture_test sample gradcheck profile roofline
+	rm -f bench train selftest architecture_test sample gradcheck kgtrain kgprep profile roofline
 
 .PHONY: all check clean

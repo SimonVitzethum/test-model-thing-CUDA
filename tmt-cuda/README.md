@@ -164,6 +164,7 @@ Important options:
 | `traces` | `0`; `1` enables hybrid traces across window boundaries (see below) |
 | `trace_decay` | `1`; per-byte trace decay γ (`e_t = γ·a_t·e_(t-1) + …`), independent of `seqlen` |
 | `docsep` | `-1`; byte value that starts a new document (state and traces reset there) |
+| `mem`, `mem_len`, `mem_heads`, `mem_dh`, `mem_every` | `0`, `256`, `4`, `32`, `2`; fact memory (see below) |
 
 The file is split into `batch` contiguous streams. Each stream
 starts with empty state. Training processes complete windows; at the
@@ -254,6 +255,60 @@ It trains nothing and is much cheaper and less noisy than training runs. On the
 With half-lives up to 512 bytes, TBPTT is already close to exact and the hybrid
 mainly helps the gate. Checkpoints trained with long half-lives are the real
 test.
+
+## Knowledge-graph fact memory (`mem=1`, stage 1)
+
+Idea from the TMT community: facts live in a knowledge graph instead of the
+weights, and the model reads them through its own state. Stage 1 answers the
+first question: **can the model use facts it is given?** Retrieval is done by the
+data loader (the subject of each question is known); state-driven retrieval
+(stage 2) builds on this.
+
+**Architecture.** The facts of the subject are placed as bytes in a per-stream
+memory of `mem_len` slots. Each slot is encoded as
+`e_j = E[byte_j] + Eprev[byte_(j-1)] + P[j]` (sharing the model's byte embedding),
+followed by a causal gated recurrence over the memory (`m_j = e_j + s_j`, half-lives
+1..64 bytes), so a slot knows what precedes it ("Asia" follows "continent: ").
+After every `mem_every`-th layer, a cross-attention reads the memory:
+`x += softmax(LN(x)Wq (mWk)^T / sqrt(dh)) (mWv) Wo^T`. `Wo` starts at zero, so an
+untrained memory, or an empty one, is an exact no-op (tested bit for bit); memory
+parameters are created last, so all other weights initialize as with `mem=0`.
+Forward and all gradients are tested against an FP64 CPU reference.
+
+**Data (C++ for everything compute-heavy).**
+
+```sh
+# Subset through the Wikidata API (network-bound helper, standard library only)
+python3 tools/wikidata_kg.py --seed P31=Q6256 --seed P31=Q1549591 \
+    --seed P106=Q36180 --per-seed 3000 --out graph.tsv
+# ...or the full dump in one streaming, multi-threaded pass
+pigz -dc latest-all.json.gz | ./kgprep dump graph.tsv
+# QA rows (question, answer, memory), split by subject
+./kgprep qa graph.tsv kg mem_len=256 test_frac=0.1
+```
+
+`kgprep dump` keeps the item-valued facts of 15 properties (capital, continent,
+currency, country, occupation, author, ...) for entities with an English
+Wikipedia article, preferred rank over normal, no deprecated statements, no
+self-references. It holds every English item label in RAM (several GB for the
+full dump). `kgprep qa` renders each subject's facts as
+`France: capital: Paris; continent: Europe; ...` (shuffled, whole facts within
+`mem_len`) and asks about single-valued facts only. Test subjects never appear
+in training, so the test set measures use of the memory, not memorization.
+
+**Training and evaluation.**
+
+```sh
+./kgtrain train kg_train.tsv kg.ckpt dim=256 layers=4 batch=32 seqlen=128 steps=20000
+./kgtrain eval kg_test.tsv kg.ckpt memory=on        # facts of the subject
+./kgtrain eval kg_test.tsv kg.ckpt memory=off       # no memory
+./kgtrain eval kg_test.tsv kg.ckpt memory=shuffled  # another subject's facts (control)
+```
+
+Each example is one window `question answer\n`; the loss covers the answer only.
+Evaluation reports exact match (every answer byte is the argmax given the correct
+prefix) and answer CE. The memory helps only if `on` beats both `off` and
+`shuffled`; `on ≈ shuffled` means the model ignores the memory's content.
 
 ## Checkpoints and reproducibility
 

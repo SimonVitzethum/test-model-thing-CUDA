@@ -13,6 +13,7 @@ while reworking the architecture, training, and infrastructure:
 * Optional MLA long-range cache (DeepSeek-style compressed KV latents, up to 128k bytes)
 * Optional latent-space prediction with an EMA target encoder
 * Continuous data streaming with explicit, checkpointed stream state
+* Knowledge-graph fact memory from Wikidata (`mem=1`, stage 1: cross-attention over retrieved facts)
 
 Everything lives in [`tmt-cuda/`](tmt-cuda/README.md). The original MLX and PyTorch
 prototypes have been removed; their checkpoints and results are not comparable to

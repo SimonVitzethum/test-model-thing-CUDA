@@ -14,6 +14,7 @@
 #include "loss.cu"
 #include "adam.cu"
 #include "mla.cu"
+#include "memory.cu"
 #include <cmath>
 #include <cstring>
 #include <ctime>

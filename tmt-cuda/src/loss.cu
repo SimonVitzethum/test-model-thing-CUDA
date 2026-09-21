@@ -20,7 +20,7 @@ __global__ void ce_fwd_kernel(const bf16* logits, const int* tgt,
     float lse = logf(se) + mx;
     for (int i = 0; i < 256; ++i)
         probs[(long)r * 256 + i] = expf(bf2f(L[i]) - mx) / se;
-    loss_out[r] = lse - bf2f(L[tgt[r]]);
+    loss_out[r] = tgt[r] < 0 ? 0.f : lse - bf2f(L[tgt[r]]);  // tgt < 0: ignored
 }
 
 // dLogits = w*(p - onehot)/N (bf16)
@@ -30,7 +30,7 @@ __global__ void ce_bwd_kernel(const float* probs, const int* tgt,
     if (r >= N) return;
     for (int i = 0; i < 256; ++i) {
         float p = probs[(long)r * 256 + i] - (i == tgt[r] ? 1.0f : 0.0f);
-        dLogits[(long)r * 256 + i] = f2bf(w * p / N);
+        dLogits[(long)r * 256 + i] = f2bf(tgt[r] < 0 ? 0.f : w * p / N);
     }
 }
 

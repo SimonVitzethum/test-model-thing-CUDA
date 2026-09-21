@@ -8,8 +8,9 @@ __global__ void emb_gather_kernel(const bf16* W, const int* ids, bf16* Out,
                                   int N, int D) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    const bf16* s = W + (long)ids[i] * D;
     bf16* d = Out + (long)i * D;
+    if (ids[i] < 0) { for (int dd = 0; dd < D; ++dd) d[dd] = f2bf(0.f); return; }  // ignored target
+    const bf16* s = W + (long)ids[i] * D;
     for (int dd = 0; dd < D; ++dd) d[dd] = s[dd];
 }
 

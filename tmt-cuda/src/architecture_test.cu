@@ -261,6 +261,105 @@ static void test_moe_backward() {
         "embedding gradient through MoE differs from dense");
     std::puts("PASS MoE backward: identical experts reproduce dense expert and input gradients");
 }
+// Fact memory: (1) with Wo = 0 the model is bit-identical to mem=0 even with a
+// filled memory; (2) forward and all gradients of one memory layer, including
+// the encoding scatter, against an independent FP64 CPU reference.
+static void test_memory() {
+    Cfg base=small_config();Cfg cm=base;cm.mem=1;cm.mem_len=9;cm.mem_heads=2;cm.mem_dh=4;cm.mem_every=1;
+    {Model a,b;a.c=base;b.c=cm;build_model(a);build_model(b);StreamState sa,sb;build_state(sa,a);build_state(sb,b);
+     inputs(a);inputs(b);std::vector<int> ids(cm.batch*cm.mem_len);for(size_t i=0;i<ids.size();++i)ids[i]=97+i%7;
+     CUDA_CHECK(cudaMemcpy(b.MS.ids,ids.data(),ids.size()*4,cudaMemcpyHostToDevice));
+     float l1,c1,l2,c2;forward_window(a,sa,l1,c1);forward_window(b,sb,l2,c2);
+     auto x=read_gpu(a.logits,base.batch*base.seqlen*256),y=read_gpu(b.logits,x.size());
+     for(size_t i=0;i<x.size();++i)near(bf2f(x[i]),bf2f(y[i]),0,0,"untrained memory changes the model");}
+    const int B=2,T=5,M=6,H=2,F=3,D=8,HD=H*F,N=B*T;
+    std::mt19937 rng(3);std::uniform_real_distribution<float> U(-1,1);
+    auto rb=[&](int n,float s){std::vector<bf16> v(n);for(auto& e:v)e=f2bf(U(rng)*s);return v;};
+    auto rf=[&](int n,float s,float o){std::vector<float> v(n);for(auto& e:v)e=o+U(rng)*s;return v;};
+    auto X=rb(N*D,1),E=rb(256*D,.5f),Ep=rb(256*D,.5f),Pp=rb(M*D,.5f),Wq=rb(HD*D,.5f),Wk=rb(HD*D,.5f),Wv=rb(HD*D,.5f),Wo=rb(D*HD,.5f),dY=rb(N*D,1);
+    auto gamma=rf(D,.3f,1),beta=rf(D,.3f,0),edec=rf(D,1.5f,0),egate=rf(D,.8f,0);
+    // stream 0: slots 0..3 valid, 4..5 padding; stream 1: no memory at all.
+    std::vector<int> ids{3,7,3,9,-1,-1,-1,-1,-1,-1,-1,-1};
+    DeviceMemory mem;MemLayer L;MemShared S;
+    auto dX_=upload(mem,X),dE=upload(mem,E),dEp=upload(mem,Ep),dPos=upload(mem,Pp),dWq=upload(mem,Wq),dWk=upload(mem,Wk),dWv=upload(mem,Wv),dWo=upload(mem,Wo),dDY=upload(mem,dY);
+    auto dG=upload(mem,gamma),dBt=upload(mem,beta),dDec=upload(mem,edec),dGat=upload(mem,egate);S.ids=upload(mem,ids);
+    bf16* Y;mem.allocate(Y,N*D*2);
+    mem.allocate(S.enc,B*M*D*2);mem.allocate(S.enc0,B*M*D*2);mem.allocate(S.state,B*M*D*4);mem.allocate(S.dEnc0,B*M*D*4);mem.allocate(L.Xsnap,N*D*2);mem.allocate(L.Hn,N*D*2);mem.allocate(L.Q,N*HD*2);mem.allocate(L.O,N*HD*2);
+    mem.allocate(L.K,B*M*HD*2);mem.allocate(L.V,B*M*HD*2);mem.allocate(L.mean,N*4);mem.allocate(L.rstd,N*4);mem.allocate(L.P,B*H*T*M*4);
+    mem.allocate(S.dO,N*HD*2);mem.allocate(S.dQ,N*HD*2);mem.allocate(S.dK,B*M*HD*2);mem.allocate(S.dV,B*M*HD*2);mem.allocate(S.dHn,N*D*2);
+    mem.allocate(S.dXln,N*D*2);mem.allocate(S.dEncB,B*M*D*2);mem.allocate(S.dS,B*H*T*M*4);mem.allocate(S.dEnc,B*M*D*4);
+    CUDA_CHECK(cudaMemset(S.dEnc,0,B*M*D*4));
+    float *gG,*gB,*gQ,*gK,*gV,*gO,*gE,*gEp,*gP;
+    for(float** p:{&gG,&gB}){mem.allocate(*p,D*4);}
+    for(float** p:{&gQ,&gK,&gV,&gO}){mem.allocate(*p,HD*D*4);}
+    for(float** p:{&gE,&gEp}){mem.allocate(*p,256*D*4);CUDA_CHECK(cudaMemset(*p,0,256*D*4));}
+    mem.allocate(gP,M*D*4);CUDA_CHECK(cudaMemset(gP,0,M*D*4));
+    float *gDec,*gGat;mem.allocate(gDec,D*4);mem.allocate(gGat,D*4);
+    mem_encode(dE,dEp,dPos,dDec,dGat,S,B,M,D);
+    mem_forward(dX_,L,S,dG,dBt,dWq,dWk,dWv,dWo,Y,B,T,M,H,F,D);
+    auto xout=read_gpu(dX_,N*D);auto enc=read_gpu(S.enc,B*M*D);
+    CUDA_CHECK(cudaMemcpy(dX_,dY.data(),N*D*2,cudaMemcpyHostToDevice));  // dX <- dL/dx_out
+    mem_backward(dX_,L,S,dG,dWq,dWk,dWv,dWo,gG,gB,gQ,gK,gV,gO,B,T,M,H,F,D);
+    mem_encode_backward(S,dDec,dGat,gDec,gGat,gE,gEp,gP,B,M,D);
+    // ---- FP64 reference: loss = sum(dY * x_out) ----
+    auto f=[](const std::vector<bf16>& v){std::vector<double> o(v.size());for(size_t i=0;i<v.size();++i)o[i]=bf2f(v[i]);return o;};
+    auto x=f(X),e=f(E),ep=f(Ep),pp=f(Pp),wq=f(Wq),wk=f(Wk),wv=f(Wv),wo=f(Wo),gy=f(dY);
+    std::vector<double> m(B*M*D,0);
+    for(int b=0;b<B;++b)for(int j=0;j<M;++j){int id=ids[b*M+j];if(id<0)continue;int pv=j?ids[b*M+j-1]:-1;
+        for(int d=0;d<D;++d)m[(b*M+j)*D+d]=e[id*D+d]+pp[j*D+d]+(pv>=0?ep[pv*D+d]:0);}
+    // Encoder recurrence: s_j = a s_(j-1) + (1-a) e_j, a = sigmoid(dec + gate e_j); m = e + s.
+    std::vector<double> e0(m),st(B*M*D);
+    for(int b=0;b<B;++b)for(int d=0;d<D;++d){double sv=0;for(int j=0;j<M;++j){int i=(b*M+j)*D+d;double xv=e0[i];
+        double a=1/(1+exp(-edec[d]-egate[d]*xv));sv=a*sv+(1-a)*xv;st[i]=sv;m[i]=xv+sv;}}
+    std::vector<double> hn(N*D),mu(N),rs(N),q(N*HD,0),k(B*M*HD,0),v(B*M*HD,0),o(N*HD,0),P(B*H*T*M,0),y(N*D,0);
+    for(int n=0;n<N;++n){double s=0,s2=0;for(int d=0;d<D;++d){s+=x[n*D+d];s2+=x[n*D+d]*x[n*D+d];}
+        mu[n]=s/D;rs[n]=1/sqrt(s2/D-mu[n]*mu[n]+1e-5);for(int d=0;d<D;++d)hn[n*D+d]=(x[n*D+d]-mu[n])*rs[n]*gamma[d]+beta[d];}
+    for(int n=0;n<N;++n)for(int a=0;a<HD;++a)for(int d=0;d<D;++d)q[n*HD+a]+=hn[n*D+d]*wq[a*D+d];
+    for(int r=0;r<B*M;++r)for(int a=0;a<HD;++a)for(int d=0;d<D;++d){k[r*HD+a]+=m[r*D+d]*wk[a*D+d];v[r*HD+a]+=m[r*D+d]*wv[a*D+d];}
+    double sc=1/sqrt((double)F);
+    for(int b=0;b<B;++b)for(int h=0;h<H;++h)for(int t=0;t<T;++t){double mx=-1e300,sum=0;int n=b*T+t;double* p=&P[((b*H+h)*T+t)*M];
+        for(int j=0;j<M;++j){if(ids[b*M+j]<0)continue;double s=0;for(int d=0;d<F;++d)s+=q[n*HD+h*F+d]*k[(b*M+j)*HD+h*F+d];p[j]=s*sc;mx=std::max(mx,p[j]);}
+        for(int j=0;j<M;++j){if(ids[b*M+j]<0){p[j]=0;continue;}p[j]=exp(p[j]-mx);sum+=p[j];}
+        for(int j=0;j<M;++j){p[j]=sum>0?p[j]/sum:0;for(int d=0;d<F;++d)o[n*HD+h*F+d]+=p[j]*v[(b*M+j)*HD+h*F+d];}}
+    for(int n=0;n<N;++n)for(int d=0;d<D;++d){for(int a=0;a<HD;++a)y[n*D+d]+=o[n*HD+a]*wo[d*HD+a];}
+    std::vector<double> rgO(D*HD,0),dO(N*HD,0),dP(B*H*T*M,0),dS(B*H*T*M,0),dq(N*HD,0),dk(B*M*HD,0),dv(B*M*HD,0);
+    for(int n=0;n<N;++n)for(int d=0;d<D;++d)for(int a=0;a<HD;++a){rgO[d*HD+a]+=gy[n*D+d]*o[n*HD+a];dO[n*HD+a]+=gy[n*D+d]*wo[d*HD+a];}
+    for(int b=0;b<B;++b)for(int h=0;h<H;++h)for(int t=0;t<T;++t){int n=b*T+t;int base=((b*H+h)*T+t)*M;double dot=0;
+        for(int j=0;j<M;++j){double s=0;for(int d=0;d<F;++d)s+=dO[n*HD+h*F+d]*v[(b*M+j)*HD+h*F+d];dP[base+j]=s;dot+=P[base+j]*s;}
+        for(int j=0;j<M;++j){dS[base+j]=P[base+j]*(dP[base+j]-dot);
+            for(int d=0;d<F;++d){dq[n*HD+h*F+d]+=sc*dS[base+j]*k[(b*M+j)*HD+h*F+d];dk[(b*M+j)*HD+h*F+d]+=sc*dS[base+j]*q[n*HD+h*F+d];
+                dv[(b*M+j)*HD+h*F+d]+=P[base+j]*dO[n*HD+h*F+d];}}}
+    std::vector<double> rgQ(HD*D,0),rgK(HD*D,0),rgV(HD*D,0),dhn(N*D,0),dm(B*M*D,0);
+    for(int n=0;n<N;++n)for(int a=0;a<HD;++a)for(int d=0;d<D;++d){rgQ[a*D+d]+=dq[n*HD+a]*hn[n*D+d];dhn[n*D+d]+=dq[n*HD+a]*wq[a*D+d];}
+    for(int r=0;r<B*M;++r)for(int a=0;a<HD;++a)for(int d=0;d<D;++d){rgK[a*D+d]+=dk[r*HD+a]*m[r*D+d];rgV[a*D+d]+=dv[r*HD+a]*m[r*D+d];
+        dm[r*D+d]+=dk[r*HD+a]*wk[a*D+d]+dv[r*HD+a]*wv[a*D+d];}
+    std::vector<double> rgG(D,0),rgB(D,0),dx(N*D,0);
+    for(int n=0;n<N;++n){double s1=0,s2=0;for(int d=0;d<D;++d){double xh=(x[n*D+d]-mu[n])*rs[n];rgG[d]+=dhn[n*D+d]*xh;rgB[d]+=dhn[n*D+d];
+            double g=dhn[n*D+d]*gamma[d];s1+=g;s2+=g*xh;}
+        for(int d=0;d<D;++d){double xh=(x[n*D+d]-mu[n])*rs[n];dx[n*D+d]=gy[n*D+d]+rs[n]*(dhn[n*D+d]*gamma[d]-s1/D-xh*s2/D);}}
+    std::vector<double> rgDec(D,0),rgGat(D,0),de(dm);
+    for(int b=0;b<B;++b)for(int d=0;d<D;++d){double fut=0;for(int j=M-1;j>=0;--j){int i=(b*M+j)*D+d;double xv=e0[i];
+        double a=1/(1+exp(-edec[d]-egate[d]*xv));double tot=dm[i]+fut;double prev=j?st[i-D]:0;double loc=(prev-xv)*a*(1-a);
+        rgDec[d]+=tot*loc;rgGat[d]+=tot*loc*xv;de[i]+=tot*(1-a)+tot*loc*egate[d];fut=tot*a;}}
+    std::vector<double> rgE(256*D,0),rgEp(256*D,0),rgP(M*D,0);
+    for(int b=0;b<B;++b)for(int j=0;j<M;++j){int id=ids[b*M+j];if(id<0)continue;int pv=j?ids[b*M+j-1]:-1;
+        for(int d=0;d<D;++d){double g=de[(b*M+j)*D+d];rgE[id*D+d]+=g;rgP[j*D+d]+=g;if(pv>=0)rgEp[pv*D+d]+=g;}}
+    auto check=[&](const std::vector<float>& got,const std::vector<double>& ref,const char* what){double e2=0,n2=0;
+        for(size_t i=0;i<ref.size();++i){e2+=pow(got[i]-ref[i],2);n2+=ref[i]*ref[i];}
+        require(n2>0,"memory reference gradient is zero");near(sqrt(e2),0,1e-4+.03*sqrt(n2),0,what);};
+    auto tof=[](const std::vector<bf16>& v){std::vector<float> o(v.size());for(size_t i=0;i<v.size();++i)o[i]=bf2f(v[i]);return o;};
+    std::vector<double> xo(N*D);for(int i=0;i<N*D;++i)xo[i]=x[i]+y[i];
+    check(tof(xout),xo,"memory forward");check(tof(enc),m,"memory encoding");
+    for(int n=T;n<2*T;++n)for(int d=0;d<D;++d)near(bf2f(xout[n*D+d]),x[n*D+d],0,0,"stream without memory must be unchanged");
+    check(tof(read_gpu(dX_,N*D)),dx,"memory input gradient");
+    check(read_gpu(gO,D*HD),rgO,"memory Wo gradient");check(read_gpu(gQ,HD*D),rgQ,"memory Wq gradient");
+    check(read_gpu(gK,HD*D),rgK,"memory Wk gradient");check(read_gpu(gV,HD*D),rgV,"memory Wv gradient");
+    check(read_gpu(gG,D),rgG,"memory LN gamma gradient");check(read_gpu(gB,D),rgB,"memory LN beta gradient");
+    check(read_gpu(gE,256*D),rgE,"memory embedding gradient");check(read_gpu(gEp,256*D),rgEp,"memory previous-byte gradient");
+    check(read_gpu(gP,M*D),rgP,"memory position gradient");
+    check(read_gpu(gDec,D),rgDec,"memory encoder decay gradient");check(read_gpu(gGat,D),rgGat,"memory encoder gate gradient");
+    std::puts("PASS fact memory: untrained memory is an exact no-op; forward and all gradients match FP64 reference");
+}
 static void test_mla_chunks() {
     Model a,b;a.c=small_config();a.c.layers=1;a.c.mla=1;a.c.mla_heads=2;
     a.c.mla_dh=4;a.c.mla_L=4;a.c.mla_R=6;a.c.mla_cache=17;a.c.mla_cc=3;
@@ -383,6 +482,6 @@ static void compare_checkpoints(const std::string& first,const std::string& seco
 }
 int main(int argc,char** argv){try{
     if(argc==4 && std::string(argv[1])=="--compare") {compare_checkpoints(argv[2],argv[3]);return 0;}
-test_cell();test_router();test_moe_backward();test_model(1);test_model(3);test_traces();test_traces(70);test_docsep();test_trace_decay();test_mla_chunks();test_mla_reference();
+test_cell();test_router();test_moe_backward();test_memory();test_model(1);test_model(3);test_traces();test_traces(70);test_docsep();test_trace_decay();test_mla_chunks();test_mla_reference();
     CUDA_CHECK(cudaDeviceSynchronize());std::puts("ALL ARCHITECTURE TESTS PASSED");return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}
