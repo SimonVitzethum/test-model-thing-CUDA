@@ -113,6 +113,9 @@ struct Model {
     long* pos = nullptr;   // (N,) Positionen Device
     std::vector<MemLayer> MEM;  // fact memory (mem=1), same size as L
     MemShared MS;
+    // Optional external gradient on the final representation X (N,D), added to
+    // the loss gradient in backward_window (stage-2 retrieval loss).
+    float* dXext = nullptr;
 };
 
 struct StreamState {
@@ -407,6 +410,11 @@ static void build_model(Model& m) {
         m.memory.allocate(S.dEncB, (long)B * M * D * 2);
         m.memory.allocate(S.dS, (long)B * c.mem_heads * T * M * 4);
         m.memory.allocate(S.dEnc, (long)B * M * D * 4);
+        if (c.mem_rdim > 0) {  // retrieval heads, created after all other parameters
+            float r = sqrtf(1.0f / D);
+            S.rq = m.params.add((long)c.mem_rdim * D); init_u(S.rq, -r, r);
+            S.rk = m.params.add((long)c.mem_rdim * D); init_u(S.rk, -r, r);
+        }
     }
 }
 
@@ -567,6 +575,7 @@ static void backward_window(Model& m, StreamState& state) {
             ? 0.0f
             : -0.5f / sqrtf(hmv[1] + 1e-4f) * c.var,
         ND);
+    if (m.dXext) add_f32_kernel<<<blocksL, TPB>>>(m.dXres, m.dXext, ND);
     // Residual-Stream zurück nach bf16; dEnc neu für State-Pfad
     copy_bf16_kernel<<<blocksL, TPB>>>(m.dXres, m.dXs, ND);
     CUDA_CHECK(cudaMemset(m.dEnc, 0, ND * 4));

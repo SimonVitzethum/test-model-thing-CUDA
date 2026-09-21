@@ -43,4 +43,10 @@ for mode in on off shuffled; do
     grep -q '"examples":2,' "$work/eval-$mode.log"
 done
 ./sample "$work/kg.ckpt" "What is" maxlen=8 > "$work/sample.log"
-echo 'PASS KG: dump parsing (ranks, enwiki filter, escapes, self-references), QA split, kgtrain resume/eval, sampler without memory'
+# Stage 2: retrieval heads, index over all nodes, retrieved memory.
+test "$(wc -l < "$work/qa_nodes.tsv")" -eq 3
+./kgtrain train "$work/qa_train.tsv" "$work/r.ckpt" nodes="$work/qa_nodes.tsv" dim=16 layers=2 batch=2 seqlen=48 mem_len=64 mem_heads=2 mem_dh=4 mem_rdim=8 steps=20 saveevery=0 > "$work/r.log"
+grep -q 'retrieval_loss=' "$work/r.log"
+./kgtrain eval "$work/qa_train.tsv" "$work/r.ckpt" nodes="$work/qa_nodes.tsv" memory=retrieved > "$work/r-eval.log"
+grep -q '"index_nodes":3,' "$work/r-eval.log"
+echo 'PASS KG: dump parsing (ranks, enwiki filter, escapes, self-references), QA split, kgtrain resume/eval, sampler without memory, stage-2 retrieval'

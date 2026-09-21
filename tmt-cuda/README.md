@@ -328,11 +328,42 @@ remaining errors are single-byte copy slips ("Kithuanian litan"). An earlier run
 on only 464 examples memorized instead (`on ≈ shuffled`); more subjects made
 copying the cheaper strategy.
 
-**Next stages.** Stage 2: the model finds the entity itself from its state while
-reading the question and queries an index over all nodes (optionally with
-personalized PageRank for neighboring facts); no oracle retrieval. Stage 3:
-pretraining on plain text, then joint training with the graph for free-form
-questions, ambiguous names, combining facts and using them in sentences.
+### Stage 2: retrieval from the model's own state (`mem_rdim > 0`)
+
+No oracle: the model finds the subject itself.
+
+1. It reads the question (no memory). Its final representation at the last
+   question byte, through a learned head `Wq` (`mem_rdim` x `dim`), is the query.
+2. It reads every node label of the graph, including object-only nodes such
+   as "Paris" as distractors. The representation at the last label byte,
+   through `Wk`, is the node's key. Keys come from the label bytes, not from
+   per-node parameters, so unseen entities get meaningful keys.
+3. The node with the highest cosine similarity wins; its facts
+   (`kgprep qa` writes them to `PREFIX_nodes.tsv`) go into the memory and the
+   model answers as in stage 1.
+
+Training adds an InfoNCE loss (temperature `tau`, default 0.05) between each
+question and the batch's distinct subjects plus `negbatches` batches of random
+nodes; its gradient flows through both reading passes into the model
+(`Model::dXext`, an external gradient on the final representation). The answer
+pass keeps the true facts. Tests: head gradients against finite differences, and
+an external gradient equal to the CE gradient reproduces the CE backward.
+
+```sh
+./kgprep qa graph.tsv kg                      # also writes kg_nodes.tsv
+./kgtrain train kg_train.tsv s2.ckpt nodes=kg_nodes.tsv mem_rdim=128 dim=256 layers=4 batch=32 steps=10000
+./kgtrain eval kg_test.tsv s2.ckpt nodes=kg_nodes.tsv memory=retrieved
+```
+
+`memory=retrieved` reports retrieval top-1/top-5 over the whole index (exact
+node; `top1_label` also accepts a different node with the same label) and the
+end-to-end exact match. The index is scored exhaustively on the host, which is
+fine for tens of thousands of nodes; the full Wikidata graph needs an ANN index.
+
+**Stage 3 (next):** pretraining on plain text, then joint training with the
+graph for free-form questions, ambiguous names, combining facts and using them
+in sentences. Personalized PageRank over the retrieved node's neighborhood fits
+there, when questions need more than one entity.
 
 ## Checkpoints and reproducibility
 

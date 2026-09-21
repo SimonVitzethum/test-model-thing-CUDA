@@ -308,6 +308,7 @@ static int cmd_qa(const std::string& graph, const std::string& prefix, size_t me
     std::mt19937 rng(seed);
     std::vector<std::vector<std::string>> rows[2];  // train, test
     std::set<std::string> subjects[2];
+    std::unordered_map<std::string, std::string> memories;  // subject -> rendered memory
     for (auto& s : order) {
         auto& sf = by_subject[s];
         if (!labels.count(s)) continue;
@@ -319,6 +320,7 @@ static int cmd_qa(const std::string& graph, const std::string& prefix, size_t me
             if (memory.size() + item.size() + 2 > mem_len) break;
             memory += item + "; ";
         }
+        memories[s] = memory;
         std::map<int, std::set<std::string>> values;
         for (auto& [p, o] : sf) if (labels.count(o)) values[p].insert(o);
         int split = (double)(fnv(s) >> 11) / (double)(1ull << 53) < test_frac;
@@ -340,6 +342,18 @@ static int cmd_qa(const std::string& graph, const std::string& prefix, size_t me
         for (auto& r : rows[k]) out << r[0] << '\t' << r[1] << '\t' << r[2] << '\t' << r[3] << '\n';
         std::fprintf(stderr, "wrote %s: %zu examples, %zu subjects\n", path.c_str(), rows[k].size(), subjects[k].size());
     }
+    // Retrieval index for stage 2: every labeled node with the memory it would
+    // load (subjects: the same text as in the QA rows; other nodes: label only).
+    std::vector<std::string> ids;
+    for (auto& [q, l] : labels) ids.push_back(q);
+    std::sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) {
+        return a.size() != b.size() ? a.size() < b.size() : a < b; });
+    std::ofstream nodes(prefix + "_nodes.tsv");
+    for (auto& q : ids) {
+        auto it = memories.find(q);
+        nodes << q << '\t' << labels[q] << '\t' << (it != memories.end() ? it->second : labels[q] + ": ") << '\n';
+    }
+    std::fprintf(stderr, "wrote %s_nodes.tsv: %zu nodes\n", prefix.c_str(), ids.size());
     return 0;
 }
 

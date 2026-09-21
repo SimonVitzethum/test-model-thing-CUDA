@@ -17,7 +17,7 @@
     F(float, ce, 1.f) F(float, var, 0.f) F(float, stop, 0.f) \
     F(float, stopposw, 20.f) F(float, ematau, .99f) F(float, gradclip, 1.f) \
     F(int, maxcarry, 0) F(int, seed, 1234) F(int, traces, 0) F(float, trace_decay, 1.f) F(int, docsep, -1) \
-    F(int, mem, 0) F(int, mem_len, 256) F(int, mem_heads, 4) F(int, mem_dh, 32) F(int, mem_every, 2) \
+    F(int, mem, 0) F(int, mem_len, 256) F(int, mem_heads, 4) F(int, mem_dh, 32) F(int, mem_every, 2) F(int, mem_rdim, 0) \
     F(int, mla, 0) F(int, mla_heads, 4) F(int, mla_dh, 32) \
     F(int, mla_L, 32) F(int, mla_R, 16) F(int, mla_cache, 4096) \
     F(int, mla_every, 2) F(int, mla_cc, 256) F(float, mla_theta, 10000.f)
@@ -69,7 +69,8 @@ static void validate_cfg(const Cfg& c) {
     require(c.mem == 0 || c.mem == 1, "mem must be 0 or 1");
     if (c.mem) {
         require(c.mem_len > 0 && c.mem_len <= 4096 && c.mem_heads > 0 && c.mem_dh > 0 &&
-                c.mem_every >= 1 && c.mem_every <= c.layers, "invalid memory configuration");
+                c.mem_every >= 1 && c.mem_every <= c.layers && c.mem_rdim >= 0 && c.mem_rdim <= 1024,
+                "invalid memory configuration");
         require((long)c.batch * c.mem_len * c.dim <= INT_MAX &&
                 (long)c.batch * c.mem_heads * c.seqlen * c.mem_len <= INT_MAX &&
                 (long)c.mem_heads * c.mem_dh * c.dim <= INT_MAX, "memory exceeds supported index range");

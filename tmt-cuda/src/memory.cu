@@ -31,6 +31,7 @@ struct MemLayer {
 struct MemShared {
     size_t eprev, pos;          // parameter indices (256,D), (M,D)
     size_t decay, gate;         // parameter indices (D), (D): encoder recurrence
+    size_t rq = 0, rk = 0;      // stage-2 retrieval heads (mem_rdim, D); gradients from the host
     int* ids = nullptr;         // (B,M) memory bytes, -1 = padding (device)
     bf16* enc0 = nullptr;       // (B*M,D) e: byte/prev-byte/position encoding
     float* state = nullptr;     // (B*M,D) s: recurrence over the memory bytes

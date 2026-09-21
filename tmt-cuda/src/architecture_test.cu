@@ -1,5 +1,6 @@
 // Native CUDA regression tests; no Python/PyTorch dependency.
 #include "checkpoint.h"
+#include "retrieval.h"
 #include <functional>
 #include <numeric>
 #include <random>
@@ -360,6 +361,43 @@ static void test_memory() {
     check(read_gpu(gDec,D),rgDec,"memory encoder decay gradient");check(read_gpu(gGat,D),rgGat,"memory encoder gate gradient");
     std::puts("PASS fact memory: untrained memory is an exact no-op; forward and all gradients match FP64 reference");
 }
+// Stage 2: (1) retrieval-head gradients by finite differences (host math);
+// (2) an external gradient on X equal to the CE gradient reproduces the CE
+// backward for every parameter below the decoder.
+static void test_retrieval() {
+    RetrievalBatch rb;rb.B=3;rb.C=5;rb.D=6;rb.R=4;rb.tau=.2f;
+    std::mt19937 rng(5);std::uniform_real_distribution<float> U(-1,1);
+    auto rnd=[&](size_t n){std::vector<float> v(n);for(auto& e:v)e=U(rng);return v;};
+    auto x=rnd(rb.B*rb.D),y=rnd(rb.C*rb.D),Wq=rnd(rb.R*rb.D),Wk=rnd(rb.R*rb.D);std::vector<int> pos{2,0,4};
+    std::vector<float> dx,dy;std::vector<double> dWq,dWk;
+    retrieval_loss(rb,x,y,pos,Wq,Wk,dx,dy,dWq,dWk);
+    auto L=[&](){RetrievalBatch r=rb;std::vector<float> a,b;std::vector<double> c,d;retrieval_loss(r,x,y,pos,Wq,Wk,a,b,c,d);return r.loss;};
+    auto fd=[&](std::vector<float>& v,size_t i){float old=v[i],e=1e-3f;v[i]=old+e;double hi=L();v[i]=old-e;double lo=L();v[i]=old;return(hi-lo)/(2*e);};
+    for(size_t i=0;i<x.size();++i)near(dx[i],fd(x,i),1e-4,2e-2,"retrieval query-state gradient");
+    for(size_t i=0;i<y.size();++i)near(dy[i],fd(y,i),1e-4,2e-2,"retrieval key-state gradient");
+    for(size_t i=0;i<Wq.size();++i)near(dWq[i],fd(Wq,i),1e-4,2e-2,"retrieval query-head gradient");
+    for(size_t i=0;i<Wk.size();++i)near(dWk[i],fd(Wk,i),1e-4,2e-2,"retrieval key-head gradient");
+    // External gradient hook.
+    Cfg c=small_config();Model m;m.c=c;build_model(m);StreamState st;build_state(st,m);inputs(m);
+    const int N=c.batch*c.seqlen,D=c.dim;float loss,ce;
+    forward_window(m,st,loss,ce);backward_window(m,st);
+    std::vector<std::vector<float>> ref;for(auto& p:m.params.values)ref.push_back(read_gpu(p.grad,p.n));
+    auto logits=read_gpu(m.logits,(size_t)N*256);auto dec=read_gpu(m.params.at(m.dec).work,(size_t)256*D);
+    std::vector<int> tgt(N);CUDA_CHECK(cudaMemcpy(tgt.data(),m.nxt,N*4,cudaMemcpyDeviceToHost));
+    std::vector<float> g((size_t)N*D,0.f);
+    for(int n=0;n<N;++n){double mx=-1e30,sum=0;for(int k=0;k<256;++k)mx=std::max(mx,(double)bf2f(logits[(size_t)n*256+k]));
+        for(int k=0;k<256;++k)sum+=exp(bf2f(logits[(size_t)n*256+k])-mx);
+        for(int k=0;k<256;++k){double dl=(exp(bf2f(logits[(size_t)n*256+k])-mx)/sum-(k==tgt[n]))/N;
+            for(int d=0;d<D;++d)g[(size_t)n*D+d]+=(float)(dl*bf2f(dec[(size_t)k*D+d]));}}
+    DeviceMemory mem;float* ext=upload(mem,g);
+    std::vector<int> none(N,-1);CUDA_CHECK(cudaMemcpy(m.nxt,none.data(),N*4,cudaMemcpyHostToDevice));
+    reset_state(st,c);forward_window(m,st,loss,ce);m.dXext=ext;backward_window(m,st);m.dXext=nullptr;
+    for(size_t j=0;j<m.params.values.size();++j){if(j==m.dec||j==m.stop||j==m.tgt)continue;
+        auto got=read_gpu(m.params.at(j).grad,m.params.at(j).n);double e=0,n2=0;
+        for(size_t i=0;i<got.size();++i){e+=pow(got[i]-ref[j][i],2);n2+=pow(ref[j][i],2);}
+        near(sqrt(e),0,1e-6+.03*sqrt(n2),0,"external X gradient differs from CE backward");}
+    std::puts("PASS stage-2 retrieval: head gradients match finite differences; external X gradient reproduces CE backward");
+}
 static void test_mla_chunks() {
     Model a,b;a.c=small_config();a.c.layers=1;a.c.mla=1;a.c.mla_heads=2;
     a.c.mla_dh=4;a.c.mla_L=4;a.c.mla_R=6;a.c.mla_cache=17;a.c.mla_cc=3;
@@ -482,6 +520,6 @@ static void compare_checkpoints(const std::string& first,const std::string& seco
 }
 int main(int argc,char** argv){try{
     if(argc==4 && std::string(argv[1])=="--compare") {compare_checkpoints(argv[2],argv[3]);return 0;}
-test_cell();test_router();test_moe_backward();test_memory();test_model(1);test_model(3);test_traces();test_traces(70);test_docsep();test_trace_decay();test_mla_chunks();test_mla_reference();
+test_cell();test_router();test_moe_backward();test_memory();test_retrieval();test_model(1);test_model(3);test_traces();test_traces(70);test_docsep();test_trace_decay();test_mla_chunks();test_mla_reference();
     CUDA_CHECK(cudaDeviceSynchronize());std::puts("ALL ARCHITECTURE TESTS PASSED");return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}
