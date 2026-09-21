@@ -97,9 +97,32 @@ static Cfg checkpoint_config(const std::string& path) {
     verify_checkpoint(path);
     Checkpoint io(path, false); Cfg cfg; checkpoint_header(io, cfg); return cfg;
 }
+// Architektur-Keys: alles, was Gewichtsformen/State-Layout bestimmt.
+// Laufzeit-Keys (batch/seqlen/lr/schedule/loss/steps/...) dürfen beim Laden
+// abweichen (Sampler, Eval, Fortsetzen mit neuem Schedule).
+static bool is_model_key(const std::string& k) {
+    return k == "dim" || k == "layers" || k == "experts" || k == "topk" ||
+           k == "gated" || k == "half_min" || k == "half_max" || k == "mla" ||
+           k == "mla_heads" || k == "mla_dh" || k == "mla_L" || k == "mla_R" ||
+           k == "mla_cache" || k == "mla_every" || k == "mla_cc" ||
+           k == "mla_theta";
+}
+static void require_same_model(const Cfg& a, const Cfg& b) {
+    if (config_text(a).size() == 0 || config_text(b).size() == 0)
+        throw std::runtime_error("empty configuration");
+    // Vergleiche nur Modell-Keys Feld für Feld.
+    if (a.dim != b.dim || a.layers != b.layers || a.experts != b.experts ||
+        a.topk != b.topk || a.gated != b.gated || a.half_min != b.half_min ||
+        a.half_max != b.half_max || a.mla != b.mla ||
+        a.mla_heads != b.mla_heads || a.mla_dh != b.mla_dh ||
+        a.mla_L != b.mla_L || a.mla_R != b.mla_R ||
+        a.mla_cache != b.mla_cache || a.mla_every != b.mla_every ||
+        a.mla_cc != b.mla_cc || a.mla_theta != b.mla_theta)
+        throw std::runtime_error("checkpoint architecture differs; use a new path for a new experiment");
+}
 static void checkpoint_payload(Checkpoint& io, Model& m, StreamState& state, Progress& progress) {
     Cfg stored = m.c; checkpoint_header(io, stored);
-    if (config_text(stored) != config_text(m.c)) throw std::runtime_error("checkpoint configuration differs; use a new path for a new experiment");
+    require_same_model(stored, m.c);
     io.scalar(progress.step); io.scalar(progress.cursor); io.scalar(progress.epoch);
     io.scalar(progress.carried); io.scalar(progress.data_size); io.scalar(progress.data_hash);
     if (progress.step >= INT_MAX || progress.cursor >= progress.data_size || progress.carried > LONG_MAX)
