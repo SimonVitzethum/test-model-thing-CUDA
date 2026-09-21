@@ -51,4 +51,12 @@ grep -q '^state:' "$work/doc.log"
 ./train "$work/heldout" "$work/doc" mode=eval > "$work/doc-eval.log"
 ./gradcheck "$work/data" "$work/doc" len=28 window=7 seqs=2 > "$work/gradcheck.log"
 grep -q '^decay' "$work/gradcheck.log"
-echo 'PASS CLI: dense resume within FP32 tolerance, evaluation tails, unchanged checkpoints, invalid input rejection, MLA resume, trace resume, document resets and gradcheck'
+# Original trace rule: per-byte training, exact resume, eval with a longer window.
+./train "$work/data" "$work/orig" dim=16 layers=2 batch=2 seqlen=1 origtrace=1 steps=6 saveevery=0 > "$work/orig.log"
+./train "$work/data" "$work/orig" steps=6 saveevery=0 >> "$work/orig.log"
+./train "$work/data" "$work/orig-whole" dim=16 layers=2 batch=2 seqlen=1 origtrace=1 steps=12 saveevery=0 > "$work/orig-whole.log"
+./architecture_test --compare "$work/orig" "$work/orig-whole"
+./train "$work/heldout" "$work/orig" mode=eval seqlen=7 > "$work/orig-eval.log"
+grep '"bytes":29,' "$work/orig-eval.log"
+./sample "$work/orig" "AB" maxlen=8 > "$work/orig-sample.log"
+echo 'PASS CLI: dense resume within FP32 tolerance, evaluation tails, unchanged checkpoints, invalid input rejection, MLA resume, trace resume, document resets, gradcheck and original trace rule'

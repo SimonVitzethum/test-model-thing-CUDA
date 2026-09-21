@@ -97,7 +97,7 @@ static void checkpoint_header(Checkpoint& io, Cfg& cfg) {
         while (std::getline(canonical, line)) {
             std::string key = line.substr(0, line.find('='));
             if (stored_keys.find(" " + key + " ") != std::string::npos) expected += line + "\n";
-            else if (key != "traces" && key != "trace_decay" && key != "docsep")
+            else if (key != "traces" && key != "origtrace" && key != "trace_decay" && key != "docsep")
                 throw std::runtime_error("checkpoint configuration schema mismatch");
         }
         if (expected != text) throw std::runtime_error("checkpoint configuration schema mismatch");
@@ -162,10 +162,10 @@ static void checkpoint_payload(Checkpoint& io, Model& m, StreamState& state, Pro
             io.device(cache.kr + (long)b * cache.Cmax * cache.R, cache.head * cache.R * 2);
         }
     }
-    if (m.c.traces) {  // absent for traces=0, so older V3 files load unchanged
+    if (uses_traces(m.c)) {  // absent without traces, so older V3 files load unchanged
         long bd = (long)m.c.batch * m.c.dim * 4;
         for (int l = 0; l < m.c.layers; ++l) { io.device(state.tdec[l], bd); io.device(state.tgate[l], bd); }
-        io.device(state.temb, 256 * bd);
+        io.device(state.temb, 256 * bd * emb_trace_layers(m.c));
     }
     io.finish();
 }
@@ -236,9 +236,9 @@ static void load_weights_only(const std::string& path, Model& m,
             }
         }
     }
-    if (file_cfg.traces) {  // Traces: nur Trainingszustand, überspringen
+    if (uses_traces(file_cfg)) {  // Traces: nur Trainingszustand, überspringen
         long bd = (long)fB * fD * 4;
-        if (fseek(io.file, (2L * file_cfg.layers + 256) * bd, SEEK_CUR))
+        if (fseek(io.file, (2L * file_cfg.layers + 256L * emb_trace_layers(file_cfg)) * bd, SEEK_CUR))
             throw std::runtime_error("checkpoint skip failed");
     }
     // Positionsbeweis: exakt 8 Checksummen-Bytes müssen übrig sein.

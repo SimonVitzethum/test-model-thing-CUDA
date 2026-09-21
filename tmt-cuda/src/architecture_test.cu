@@ -261,6 +261,54 @@ static void test_moe_backward() {
         "embedding gradient through MoE differs from dense");
     std::puts("PASS MoE backward: identical experts reproduce dense expert and input gradients");
 }
+// Original trace rule (origtrace=1, seqlen=1): per byte a 1-step gradient
+// plus decay/gate/embedding traces. With one layer this is exact RTRL, so the
+// per-byte gradients summed over 2T bytes equal 2T x the full BPTT gradient of
+// one 2T window. With two layers, the extra embedding trace of layer 1 must
+// change the embedding gradient relative to traces=1.
+static void test_original_rule() {
+    const int T=5,W=2*T;
+    std::vector<int> seq(2*(W+1));
+    for(size_t i=0;i<seq.size();++i)seq[i]=65+(i*5+i/3)%9;
+    auto config=[&](int layers,int seqlen,int traces,int orig){Cfg c=small_config();c.layers=layers;c.seqlen=seqlen;
+        c.traces=traces;c.origtrace=orig;c.aux=0;c.zloss=0;return c;};
+    auto feed=[&](Model& m,int offset){int B=m.c.batch,L=m.c.seqlen,n=B*L;std::vector<int> x(n),y(n),e(n,0);
+        for(int b=0;b<B;++b)for(int t=0;t<L;++t){x[b*L+t]=seq[b*(W+1)+offset+t];y[b*L+t]=seq[b*(W+1)+offset+t+1];}
+        CUDA_CHECK(cudaMemcpy(m.ids,x.data(),n*4,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.nxt,y.data(),n*4,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.end,e.data(),n*4,cudaMemcpyHostToDevice));};
+    auto nonzero_gate=[](Model& m){for(auto& Ly:m.L){auto& g=m.params.at(Ly.gate);std::vector<float> h(g.n);
+        for(long d=0;d<g.n;++d)h[d]=.8f*sinf(d*1.3f+.4f);
+        CUDA_CHECK(cudaMemcpy(g.master,h.data(),g.n*4,cudaMemcpyHostToDevice));copy_bf16_kernel<<<1,256>>>(g.master,g.work,g.n);}};
+    auto per_byte=[&](Cfg c){Model m;m.c=c;build_model(m);nonzero_gate(m);StreamState st;build_state(st,m);
+        std::vector<std::vector<float>> sum;float loss,ce;
+        for(int t=0;t<W;++t){feed(m,t);forward_window(m,st,loss,ce);backward_window(m,st);
+            for(size_t j=0;j<m.params.values.size();++j){auto g=read_gpu(m.params.at(j).grad,m.params.at(j).n);
+                if(sum.size()<=j)sum.push_back(g);else for(size_t i=0;i<g.size();++i)sum[j][i]+=g[i];}}
+        return sum;};
+    Model full;full.c=config(1,W,0,0);build_model(full);nonzero_gate(full);StreamState fs;build_state(fs,full);
+    float loss,ce;feed(full,0);forward_window(full,fs,loss,ce);backward_window(full,fs);
+    auto orig=per_byte(config(1,1,0,1));
+    double worst=0;
+    for(size_t j=0;j<orig.size();++j){if(j==full.tgt||j==full.stop)continue;
+        auto ref=read_gpu(full.params.at(j).grad,full.params.at(j).n);double e=0,n=0;
+        for(size_t i=0;i<ref.size();++i){double r=W*ref[i];e+=pow(orig[j][i]-r,2);n+=r*r;}
+        near(sqrt(e),0,1e-5+.03*sqrt(n),0,"original trace rule vs full BPTT (1 layer)");
+        if(n>0)worst=std::max(worst,sqrt(e/n));}
+    auto plain=per_byte(config(1,1,0,0));double plain_error=1e30;
+    for(size_t j:{full.L[0].decay,full.L[0].gate,full.emb}){
+        auto ref=read_gpu(full.params.at(j).grad,full.params.at(j).n);double e=0,n=0;
+        for(size_t i=0;i<ref.size();++i){double r=W*ref[i];e+=pow(plain[j][i]-r,2);n+=r*r;}
+        plain_error=std::min(plain_error,sqrt(e/n));}
+    require(plain_error>10*worst,"1-step gradient without traces already matches BPTT");
+    auto hybrid2=per_byte(config(2,1,1,0)),orig2=per_byte(config(2,1,0,1));
+    Model shape;shape.c=config(2,1,0,1);build_model(shape);
+    double diff=0,norm=0;for(size_t i=0;i<orig2[shape.emb].size();++i){
+        diff+=pow(orig2[shape.emb][i]-hybrid2[shape.emb][i],2);norm+=pow(orig2[shape.emb][i],2);}
+    require(diff>1e-6*norm,"per-layer embedding traces have no effect");
+    std::printf("PASS original trace rule (seqlen=1): exact RTRL for 1 layer (rel. error %.1e vs >= %.2f "
+                "without traces), per-layer embedding traces active\n",worst,plain_error);
+}
 static void test_mla_chunks() {
     Model a,b;a.c=small_config();a.c.layers=1;a.c.mla=1;a.c.mla_heads=2;
     a.c.mla_dh=4;a.c.mla_L=4;a.c.mla_R=6;a.c.mla_cache=17;a.c.mla_cc=3;
@@ -369,7 +417,7 @@ static void compare_checkpoints(const std::string& first,const std::string& seco
         for(long i=0;i<n;++i)near(av[i],bv[i],1e-7,1e-5,"resumed checkpoint values");};
     for(size_t j=0;j<a.params.values.size();++j){auto& x=a.params.at(j);auto& y=b.params.at(j);
         compare(x.master,y.master,x.n);compare(x.m,y.m,x.n);compare(x.v,y.v,x.n);}
-    if(a.c.traces){long bd=(long)a.c.batch*a.c.dim;compare(sa.temb,sb.temb,256*bd);
+    if(uses_traces(a.c)){long bd=(long)a.c.batch*a.c.dim;compare(sa.temb,sb.temb,256*bd*emb_trace_layers(a.c));
         for(int l=0;l<a.c.layers;++l){compare(sa.tdec[l],sb.tdec[l],bd);compare(sa.tgate[l],sb.tgate[l],bd);}}
     for(int l=0;l<a.c.layers;++l){compare(sa.carry[l],sb.carry[l],(long)a.c.batch*a.c.dim);
         if(!a.ML[l].use)continue;
@@ -383,6 +431,6 @@ static void compare_checkpoints(const std::string& first,const std::string& seco
 }
 int main(int argc,char** argv){try{
     if(argc==4 && std::string(argv[1])=="--compare") {compare_checkpoints(argv[2],argv[3]);return 0;}
-test_cell();test_router();test_moe_backward();test_model(1);test_model(3);test_traces();test_traces(70);test_docsep();test_trace_decay();test_mla_chunks();test_mla_reference();
+test_cell();test_router();test_moe_backward();test_model(1);test_model(3);test_traces();test_traces(70);test_docsep();test_trace_decay();test_original_rule();test_mla_chunks();test_mla_reference();
     CUDA_CHECK(cudaDeviceSynchronize());std::puts("ALL ARCHITECTURE TESTS PASSED");return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}

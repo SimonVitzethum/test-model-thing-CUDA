@@ -162,6 +162,7 @@ Important options:
 | `gradclip`, `ematau`, `seed` | `1`, `0.99`, `1234` |
 | `maxcarry` | `0`: no periodic reset; positive values: reset between windows |
 | `traces` | `0`; `1` enables hybrid traces across window boundaries (see below) |
+| `origtrace` | `0`; `1` enables the original per-layer trace rule (use with `seqlen=1`, see below) |
 | `trace_decay` | `1`; per-byte trace decay γ (`e_t = γ·a_t·e_(t-1) + …`), independent of `seqlen` |
 | `docsep` | `-1`; byte value that starts a new document (state and traces reset there) |
 
@@ -254,6 +255,46 @@ It trains nothing and is much cheaper and less noisy than training runs. On the
 With half-lives up to 512 bytes, TBPTT is already close to exact and the hybrid
 mainly helps the gate. Checkpoints trained with long half-lives are the real
 test.
+
+## Original trace rule (`origtrace=1`)
+
+`origtrace=1` ports the learning rule of the original MLX `main.py` (last
+version by the original author, commit `f0d537e`): after every byte, a 1-step
+gradient plus eligibility traces for the decay and the embedding. It replaces
+truncated BPTT when used with `seqlen=1`:
+
+```sh
+./train train.bin orig.ckpt seqlen=1 origtrace=1 batch=16 steps=100000
+# evaluation may use a longer window, it does not train
+./train held.bin orig.ckpt mode=eval seqlen=128
+```
+
+How the original rule maps onto the CUDA model:
+
+| Original `main.py` | CUDA with `seqlen=1 origtrace=1` |
+|---|---|
+| 1-step gradient per byte, state detached | TBPTT with a 1-byte window (carry detached) |
+| `decaytrace = a·trace + a(1−a)·state_old`, `grad = dlds·decaytrace` | identical; the local term becomes `a(1−a)·(state_old − x)` for the normalized recurrence |
+| `embedtrace = a·trace + onehot(c)`, `grad += dlds·a·trace_old` | identical, scaled by `∂s/∂x = (1−a) + …` instead of 1 |
+| one embedding trace per layer (every layer reads `enc`) | one embedding trace per layer, through the identity path of the residual stream |
+| — (no gate) | the gate gets the same kind of trace; use `gated=0` for the closest match |
+
+`make check` verifies that for one layer, the per-byte gradients summed over a
+sequence equal the full BPTT gradient of that sequence (exact RTRL), and that
+the per-layer embedding traces are active for two layers.
+
+What stays different from the original: the architecture (hierarchical
+normalized recurrence, MoE, LayerNorm placement), the losses (CE by default;
+`latent=1 ematau=0 var=1` approximates the original JEPA/variance terms, the
+stop loss is BCE instead of MSE), and the optimizer schedule (`warmup=0 minlr=1
+gradclip=0` gives constant-lr AdamW like the original). Multiple streams
+(`batch>1`) average the per-byte gradient; the original used one stream.
+
+Cost: one update per byte means one host synchronization per byte. Measured on
+an RTX 5070 Laptop (dim=512, layers=16, 8 experts): about 1.1k bytes/s at
+`batch=16` and 4.0k at `batch=64`, versus about 83k bytes/s with `seqlen=128`.
+Comparisons with TBPTT should therefore be made at equal bytes *and* at equal
+wall-clock time.
 
 ## Checkpoints and reproducibility
 

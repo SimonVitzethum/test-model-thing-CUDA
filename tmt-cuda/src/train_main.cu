@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
             } else {
                 if (!std::isfinite(loss)) throw std::runtime_error("non-finite loss; update refused");
                 bool diagnostics = (progress.step + 1) % 100 == 0;
-                m.log_traces = cfg.traces && diagnostics;
+                m.log_traces = uses_traces(cfg) && diagnostics;
                 backward_window(m, state);
                 if (m.log_traces) print_trace_stats(m);
                 if (diagnostics) print_state_buckets(m, state);

@@ -120,8 +120,16 @@ struct StreamState {
     long position = 0;
     // Hybrid traces (traces=1): ds_(t0-1)/dθ carried across windows.
     std::vector<float*> tdec, tgate;  // per layer (B,D)
-    float* temb = nullptr;            // (B,256,D), layer 0 only
+    float* temb = nullptr;            // (B,256,D) layer 0; origtrace: (L,B,256,D)
 };
+
+// Original TMT trace rule (origtrace=1): like the original main.py, every
+// layer keeps its own embedding trace. The embedding reaches layer l through
+// the identity path of the residual stream, the counterpart of the original
+// "every layer reads enc" wiring. With seqlen=1 this is the original learning
+// rule: 1-step gradient per byte plus decay/embedding traces.
+static bool uses_traces(const Cfg& c) { return c.traces || c.origtrace; }
+static int emb_trace_layers(const Cfg& c) { return c.origtrace ? c.layers : (c.traces ? 1 : 0); }
 
 static void reset_state(StreamState& state, const Cfg& c) {
     for (auto* carry : state.carry)
@@ -130,7 +138,7 @@ static void reset_state(StreamState& state, const Cfg& c) {
     long bd = (long)c.batch * c.dim * sizeof(float);
     for (auto* t : state.tdec) CUDA_CHECK(cudaMemset(t, 0, bd));
     for (auto* t : state.tgate) CUDA_CHECK(cudaMemset(t, 0, bd));
-    if (state.temb) CUDA_CHECK(cudaMemset(state.temb, 0, 256 * bd));
+    if (state.temb) CUDA_CHECK(cudaMemset(state.temb, 0, 256 * bd * emb_trace_layers(c)));
     state.position = 0;
 }
 
@@ -138,13 +146,13 @@ static void build_state(StreamState& state, const Model& m) {
     const Cfg& c = m.c;
     state.carry.resize(c.layers);
     state.cache.resize(c.layers);
-    if (c.traces) {
+    if (uses_traces(c)) {
         state.tdec.resize(c.layers); state.tgate.resize(c.layers);
         for (int l = 0; l < c.layers; ++l) {
             state.memory.allocate(state.tdec[l], (long)c.batch * c.dim * 4);
             state.memory.allocate(state.tgate[l], (long)c.batch * c.dim * 4);
         }
-        state.memory.allocate(state.temb, 256L * c.batch * c.dim * 4);
+        state.memory.allocate(state.temb, 256L * c.batch * c.dim * 4 * emb_trace_layers(c));
     }
     for (int l = 0; l < c.layers; ++l) {
         state.memory.allocate(state.carry[l], (long)c.batch * c.dim * 4);
@@ -258,7 +266,7 @@ static void build_model(Model& m) {
     m.memory.allocate(m.dDec, (size_t)D * 4);
     m.memory.allocate(m.lam, (long)B * D * 4);
     m.memory.allocate(m.prod, (long)B * D * 4);
-    if (c.traces) m.memory.allocate(m.trlog, (2L * L + 256) * D * 4);
+    if (uses_traces(c)) m.memory.allocate(m.trlog, (2L * L + 256) * D * 4);
     m.memory.allocate(m.ids, N * 4);
     m.memory.allocate(m.nxt, N * 4);
     m.memory.allocate(m.end, N * 4);
@@ -536,9 +544,10 @@ static void backward_window(Model& m, StreamState& state) {
                       m.dSnorm, m.params.at(Ly.gamma).grad, m.params.at(Ly.beta).grad, N, D);
         const float* gate = c.gated ? m.params.at(Ly.gate).master : nullptr;
         CellOpt opt; opt.ids = m.ids; opt.docsep = c.docsep; opt.gamma = c.trace_decay;
-        if (c.traces) {
+        bool et = l < emb_trace_layers(c);
+        if (uses_traces(c)) {
             opt.trDec = state.tdec[l]; opt.trGate = state.tgate[l];
-            if (l == 0) { opt.lam = m.lam; opt.prod = m.prod; }
+            if (et) { opt.lam = m.lam; opt.prod = m.prod; }
             if (logging) {
                 opt.logDec = m.trlog + (long)l * D; opt.logGate = m.trlog + (long)(c.layers + l) * D;
                 opt.logEmb = m.trlog + 2L * c.layers * D;
@@ -547,9 +556,9 @@ static void backward_window(Model& m, StreamState& state) {
         cell_backward(m.dSnorm, Ly.S, m.params.at(Ly.decay).master, m.dEncTmp,
                       m.params.at(Ly.decay).grad, B, T, D, Ly.input, Ly.initial,
                       gate, m.params.at(Ly.gate).grad, opt);
-        if (c.traces && l == 0)
+        if (et)
             emb_trace(Ly.input, Ly.S, Ly.initial, m.params.at(Ly.decay).master, gate,
-                      state.temb, m.params.at(m.emb).grad, B, T, D, opt);
+                      state.temb + (long)l * B * 256 * D, m.params.at(m.emb).grad, B, T, D, opt);
         // Chain through the previous layer, including residual passthrough.
         cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dEncTmp, ND);
         copy_bf16_kernel<<<blocksL, TPB>>>(m.dEncTmp, m.dXs, ND);
