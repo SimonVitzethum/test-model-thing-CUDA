@@ -3,7 +3,7 @@ NVCC ?= nvcc
 ARCH = -gencode arch=compute_120a,code=sm_120a
 OPTS = -O3 -std=c++17 -Xcompiler -Wall --use_fast_math
 
-all: bench train architecture_test profile roofline
+all: bench train architecture_test sample profile roofline
 
 bench: src/bench.cu src/cell.cu src/common.h Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o bench src/bench.cu src/cell.cu
@@ -14,6 +14,9 @@ train: src/model.cu src/checkpoint.h src/config.h src/train_main.cu src/train.cu
 
 architecture_test: src/architecture_test.cu $(wildcard src/*.h src/*.cu) Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/architecture_test.cu -lcublas
+
+sample: src/sample.cu $(wildcard src/*.h src/*.cu) Makefile
+	$(NVCC) $(ARCH) $(OPTS) -o $@ src/sample.cu -lcublas
 
 profile: src/profile.cu src/util.h src/linalg.cu src/moe.cu Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/profile.cu -lcublas
@@ -26,6 +29,6 @@ check: architecture_test train
 	sh tests/cli.sh
 
 clean:
-	rm -f bench train selftest architecture_test profile roofline
+	rm -f bench train selftest architecture_test sample profile roofline
 
 .PHONY: all check clean
