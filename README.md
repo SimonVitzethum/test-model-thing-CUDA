@@ -38,6 +38,12 @@ Selected measurements of the CUDA version (bits per byte, lower is better):
 | 8h laptop run | 34M, `aux=0.1`, RTX 5070 Laptop | 2.46B tokens, held-out BPC 3.15 → **2.50**, router balanced throughout |
 | Throughput | same scale, CUDA vs. PyTorch port | **216×** (106k vs. 0.49k tok/s) |
 
+**Caveat for the 8h run:** it was trained with a MoE backward bug (introduced
+in `f052b67`, fixed since) that gave the expert weights zero gradient and cut
+the gradient path through the experts. The experts stayed at their random
+initialization, so this number understates what the architecture can do. run2
+predates the bug.
+
 More numbers (kernel efficiency, roofline) are in [CHANGES.md](CHANGES.md).
 
 ## Training your own model

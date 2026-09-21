@@ -141,10 +141,10 @@ static void test_model(int experts) {
 // boundary, and it depends only on decay, gate and embedding. Two T-windows with
 // traces must therefore reproduce the full BPTT gradient of one 2T-window for
 // ALL parameters; without traces they must not.
-static void test_traces() {
+static void test_traces(int docsep=-1) {
     const int T=6;
     auto config=[&](int seqlen,int traces){Cfg c=small_config();c.layers=1;c.seqlen=seqlen;c.traces=traces;
-        c.aux=0;c.zloss=0;return c;};
+        c.aux=0;c.zloss=0;c.docsep=docsep;return c;};
     std::vector<int> seq(2*(2*T+1));
     for(size_t i=0;i<seq.size();++i)seq[i]=65+(i*7+i/5)%11;
     auto feed=[&](Model& m,int offset){int B=m.c.batch,L=m.c.seqlen,n=B*L;std::vector<int> x(n),y(n),e(n,0);
@@ -173,6 +173,7 @@ static void test_traces() {
     Model shape;shape.c=config(T,1);build_model(shape);
     for(size_t j=0;j<ref.size();++j){if(j==shape.tgt||j==shape.stop)continue;
         auto [e,n]=error(hybrid,j);near(e,0,1e-5+.02*n,0,"hybrid trace gradient vs full BPTT");}
+    if(docsep>=0){std::printf("PASS hybrid traces stay exact with document resets (docsep=%d)\n",docsep);return;}
     double worst_hybrid=0,best_plain=1e30;
     for(size_t j:{shape.L[0].decay,shape.L[0].gate,shape.emb}){
         auto [eh,n]=error(hybrid,j);auto [ep,n2]=error(plain,j);(void)n2;
@@ -180,6 +181,85 @@ static void test_traces() {
         worst_hybrid=std::max(worst_hybrid,eh/n);best_plain=std::min(best_plain,ep/n);}
     std::printf("PASS hybrid traces reproduce full BPTT across a window boundary (1 layer, all parameters; "
                 "decay/gate/emb rel. error %.1e with traces vs >= %.2f without)\n",worst_hybrid,best_plain);
+}
+// Document reset: after a separator byte, outputs no longer depend on the
+// previous document (a_t = 0 cuts carry and traces through the recurrence).
+static void test_docsep() {
+    Cfg c=small_config();c.traces=1;c.docsep=88;c.seqlen=9;
+    Model m;m.c=c;build_model(m);StreamState st;build_state(st,m);
+    const int B=c.batch,T=c.seqlen,sep=4;
+    auto run=[&](int variant){std::vector<int> x(B*T),y(B*T),e(B*T,0);
+        for(int b=0;b<B;++b)for(int t=0;t<T;++t){int v=t<sep?65+(t*3+variant*5+b)%7:(t==sep?88:66+(t+b)%5);
+            x[b*T+t]=v;y[b*T+t]=66+(t+1)%5;}
+        CUDA_CHECK(cudaMemcpy(m.ids,x.data(),B*T*4,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.nxt,y.data(),B*T*4,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.end,e.data(),B*T*4,cudaMemcpyHostToDevice));
+        reset_state(st,m.c);
+        // A nonzero incoming carry from an earlier "document" must not leak either.
+        std::vector<float> carry(B*c.dim);for(size_t i=0;i<carry.size();++i)carry[i]=sinf(i+variant*3.f);
+        for(int l=0;l<c.layers;++l)CUDA_CHECK(cudaMemcpy(st.carry[l],carry.data(),carry.size()*4,cudaMemcpyHostToDevice));
+        float loss,ce;forward_window(m,st,loss,ce);auto out=read_gpu(m.logits,B*T*256);release_window(m);return out;};
+    auto a=run(0),b=run(1);double before=0;
+    for(int bb=0;bb<B;++bb)for(int t=0;t<T;++t)for(int k=0;k<256;++k){size_t i=((size_t)bb*T+t)*256+k;
+        if(t>=sep)near(bf2f(a[i]),bf2f(b[i]),0,0,"output after separator depends on previous document");
+        else before+=fabs(bf2f(a[i])-bf2f(b[i]));}
+    require(before>0,"test inputs do not differ before the separator");
+    std::puts("PASS document reset: outputs after a separator are independent of the previous document");
+}
+// trace_decay is defined per byte: after 2T bytes the traces must be the same
+// whether they were advanced in windows of T bytes or of one byte.
+static void test_trace_decay() {
+    const int T=6;
+    auto traces=[&](int seqlen){Cfg c=small_config();c.traces=1;c.trace_decay=.9f;c.seqlen=seqlen;c.aux=0;c.zloss=0;
+        Model m;m.c=c;build_model(m);StreamState st;build_state(st,m);
+        for(int w=0;w<2*T/seqlen;++w){int B=c.batch,n=B*seqlen;std::vector<int> x(n),y(n),e(n,0);
+            for(int b=0;b<B;++b)for(int t=0;t<seqlen;++t){int p=w*seqlen+t;x[b*seqlen+t]=65+(p*7+b)%9;y[b*seqlen+t]=65+(p*7+b+7)%9;}
+            CUDA_CHECK(cudaMemcpy(m.ids,x.data(),n*4,cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(m.nxt,y.data(),n*4,cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(m.end,e.data(),n*4,cudaMemcpyHostToDevice));
+            float loss,ce;forward_window(m,st,loss,ce);backward_window(m,st);release_window(m);}
+        long bd=(long)c.batch*c.dim;std::vector<float> all=read_gpu(st.temb,256*bd);
+        for(int l=0;l<c.layers;++l){auto d=read_gpu(st.tdec[l],bd),g=read_gpu(st.tgate[l],bd);
+            all.insert(all.end(),d.begin(),d.end());all.insert(all.end(),g.begin(),g.end());}
+        return all;};
+    auto a=traces(T),b=traces(1);double e=0,n=0;
+    for(size_t i=0;i<a.size();++i){e+=pow(a[i]-b[i],2);n+=b[i]*b[i];}
+    near(sqrt(e),0,1e-6+2e-3*sqrt(n),0,"trace_decay depends on the window length");
+    std::puts("PASS trace_decay is per byte: traces after 2T bytes match for windows of T and of 1 byte");
+}
+// MoE backward against the dense path: two experts with identical weights,
+// both selected (normalized top-k weights sum to 1), compute exactly the dense
+// layer. The summed expert gradients and all other gradients must match.
+static void test_moe_backward() {
+    Cfg dense=small_config(1),moe=small_config(2);moe.topk=2;dense.aux=moe.aux=0;dense.zloss=moe.zloss=0;
+    Model a,b;a.c=dense;b.c=moe;build_model(a);build_model(b);
+    for(int l=0;l<dense.layers;++l){auto& w=a.params.at(a.L[l].exp[0]);
+        for(int e=0;e<2;++e){auto& v=b.params.at(b.L[l].exp[e]);
+            CUDA_CHECK(cudaMemcpy(v.master,w.master,w.n*4,cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(v.work,w.work,w.n*2,cudaMemcpyDeviceToDevice));}}
+    // Parameters before the experts must be identical too (init order differs by expert count).
+    auto copy=[&](size_t from,size_t to){auto& x=a.params.at(from);auto& y=b.params.at(to);
+        CUDA_CHECK(cudaMemcpy(y.master,x.master,x.n*4,cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(y.work,x.work,x.n*2,cudaMemcpyDeviceToDevice));};
+    copy(a.emb,b.emb);copy(a.dec,b.dec);copy(a.stop,b.stop);copy(a.tgt,b.tgt);
+    for(int l=0;l<dense.layers;++l){copy(a.L[l].decay,b.L[l].decay);copy(a.L[l].gate,b.L[l].gate);
+        copy(a.L[l].gamma,b.L[l].gamma);copy(a.L[l].beta,b.L[l].beta);}
+    StreamState sa,sb;build_state(sa,a);build_state(sb,b);inputs(a);inputs(b);
+    float la,ca,lb,cb;forward_window(a,sa,la,ca);forward_window(b,sb,lb,cb);
+    near(cb,ca,1e-3,1e-3,"MoE with identical experts differs from dense forward");
+    backward_window(a,sa);backward_window(b,sb);
+    auto rel=[&](std::vector<float> x,std::vector<float> y,const char* what){double e=0,n=0;
+        for(size_t i=0;i<x.size();++i){e+=pow(x[i]-y[i],2);n+=y[i]*y[i];}
+        require(n>0,"reference gradient is zero");near(sqrt(e),0,1e-6+.03*sqrt(n),0,what);};
+    for(int l=dense.layers-1;l>=0;--l){auto ref=read_gpu(a.params.at(a.L[l].exp[0]).grad,a.params.at(a.L[l].exp[0]).n);
+        auto g0=read_gpu(b.params.at(b.L[l].exp[0]).grad,ref.size()),g1=read_gpu(b.params.at(b.L[l].exp[1]).grad,ref.size());
+        for(size_t i=0;i<ref.size();++i)g0[i]+=g1[i];
+        rel(g0,ref,"summed MoE expert gradients differ from dense");
+        rel(read_gpu(b.params.at(b.L[l].decay).grad,dense.dim),read_gpu(a.params.at(a.L[l].decay).grad,dense.dim),
+            "gradient below MoE layer differs from dense");}
+    rel(read_gpu(b.params.at(b.emb).grad,256*dense.dim),read_gpu(a.params.at(a.emb).grad,256*dense.dim),
+        "embedding gradient through MoE differs from dense");
+    std::puts("PASS MoE backward: identical experts reproduce dense expert and input gradients");
 }
 static void test_mla_chunks() {
     Model a,b;a.c=small_config();a.c.layers=1;a.c.mla=1;a.c.mla_heads=2;
@@ -303,6 +383,6 @@ static void compare_checkpoints(const std::string& first,const std::string& seco
 }
 int main(int argc,char** argv){try{
     if(argc==4 && std::string(argv[1])=="--compare") {compare_checkpoints(argv[2],argv[3]);return 0;}
-test_cell();test_router();test_model(1);test_model(3);test_traces();test_mla_chunks();test_mla_reference();
+test_cell();test_router();test_moe_backward();test_model(1);test_model(3);test_traces();test_traces(70);test_docsep();test_trace_decay();test_mla_chunks();test_mla_reference();
     CUDA_CHECK(cudaDeviceSynchronize());std::puts("ALL ARCHITECTURE TESTS PASSED");return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}

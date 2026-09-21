@@ -105,6 +105,10 @@ struct Model {
     bf16 *logits, *dlogits, *stoplog, *dstop, *tgtX;
     float *dXres, *dEnc, *dEncTmp, *probs, *losstmp, *mv, *dDec;
     float *lam, *prod;     // (B,D) boundary adjoint / decay product, layer 0
+    // Trace diagnostics: when log_traces is set, backward also accumulates the
+    // trace part of the decay (L,D), gate (L,D) and embedding (256,D) gradients.
+    bool log_traces = false;
+    float* trlog = nullptr;
     int *ids, *nxt, *end;
     long* pos = nullptr;   // (N,) Positionen Device
 };
@@ -254,6 +258,7 @@ static void build_model(Model& m) {
     m.memory.allocate(m.dDec, (size_t)D * 4);
     m.memory.allocate(m.lam, (long)B * D * 4);
     m.memory.allocate(m.prod, (long)B * D * 4);
+    if (c.traces) m.memory.allocate(m.trlog, (2L * L + 256) * D * 4);
     m.memory.allocate(m.ids, N * 4);
     m.memory.allocate(m.nxt, N * 4);
     m.memory.allocate(m.end, N * 4);
@@ -394,8 +399,9 @@ static void forward_window(Model& m, StreamState& state, float& tot, float& ce_o
         CUDA_CHECK(cudaMemcpy(Ly.input, m.X, ND * 2, cudaMemcpyDeviceToDevice));
         CUDA_CHECK(cudaMemcpy(Ly.initial, state.carry[l], (long)B * D * 4,
                               cudaMemcpyDeviceToDevice));
+        CellOpt opt; opt.ids = m.ids; opt.docsep = c.docsep;
         state_forward(Ly.input, Ly.S, m.params.at(Ly.decay).master, Ly.initial,
-                      B, T, D, c.gated ? m.params.at(Ly.gate).master : nullptr);
+                      B, T, D, c.gated ? m.params.at(Ly.gate).master : nullptr, opt);
         copy_bf16_kernel<<<blocksL, TPB>>>(Ly.S, m.Sb, ND);
         layernorm_fwd(m.Sb, m.params.at(Ly.gamma).master, m.params.at(Ly.beta).master, m.H,
                       Ly.mean, Ly.rstd, N, D);
@@ -466,6 +472,8 @@ static void backward_window(Model& m, StreamState& state) {
     int blocks = (N + TPB - 1) / TPB;
     bf16* Wx[16];
     for (auto& p : m.params.values) CUDA_CHECK(cudaMemset(p.grad, 0, p.n * 4));
+    bool logging = m.log_traces && m.trlog;
+    if (logging) CUDA_CHECK(cudaMemset(m.trlog, 0, (2L * c.layers + 256) * D * 4));
     // Reconstruct loss auxiliaries from the shared forward activations.
     float hmv[2];
     meanvar_kernel<<<1, 256>>>(m.X, m.mv, ND);
@@ -527,15 +535,21 @@ static void backward_window(Model& m, StreamState& state) {
         layernorm_bwd(m.Sb, m.dH, m.params.at(Ly.gamma).master, Ly.mean, Ly.rstd,
                       m.dSnorm, m.params.at(Ly.gamma).grad, m.params.at(Ly.beta).grad, N, D);
         const float* gate = c.gated ? m.params.at(Ly.gate).master : nullptr;
-        bool tr = c.traces != 0;
+        CellOpt opt; opt.ids = m.ids; opt.docsep = c.docsep; opt.gamma = c.trace_decay;
+        if (c.traces) {
+            opt.trDec = state.tdec[l]; opt.trGate = state.tgate[l];
+            if (l == 0) { opt.lam = m.lam; opt.prod = m.prod; }
+            if (logging) {
+                opt.logDec = m.trlog + (long)l * D; opt.logGate = m.trlog + (long)(c.layers + l) * D;
+                opt.logEmb = m.trlog + 2L * c.layers * D;
+            }
+        }
         cell_backward(m.dSnorm, Ly.S, m.params.at(Ly.decay).master, m.dEncTmp,
                       m.params.at(Ly.decay).grad, B, T, D, Ly.input, Ly.initial,
-                      gate, m.params.at(Ly.gate).grad,
-                      tr ? state.tdec[l] : nullptr, tr ? state.tgate[l] : nullptr,
-                      tr && l == 0 ? m.lam : nullptr, tr && l == 0 ? m.prod : nullptr);
-        if (tr && l == 0)
+                      gate, m.params.at(Ly.gate).grad, opt);
+        if (c.traces && l == 0)
             emb_trace(Ly.input, Ly.S, Ly.initial, m.params.at(Ly.decay).master, gate,
-                      m.ids, m.lam, m.prod, state.temb, m.params.at(m.emb).grad, B, T, D);
+                      state.temb, m.params.at(m.emb).grad, B, T, D, opt);
         // Chain through the previous layer, including residual passthrough.
         cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dEncTmp, ND);
         copy_bf16_kernel<<<blocksL, TPB>>>(m.dEncTmp, m.dXs, ND);

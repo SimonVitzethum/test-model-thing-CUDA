@@ -42,4 +42,11 @@ cmp "$work/mla" "$work/mla-saved"
 ./train "$work/data" "$work/tr-whole" dim=16 layers=2 batch=2 seqlen=7 traces=1 steps=4 saveevery=0 > "$work/tr-whole.log"
 ./architecture_test --compare "$work/tr" "$work/tr-whole"
 ./sample "$work/tr" "AB" maxlen=8 > "$work/tr-sample.log"
-echo 'PASS CLI: dense resume within FP32 tolerance, evaluation tails, unchanged checkpoints, invalid input rejection, MLA resume and trace resume'
+# Document resets, trace decay and diagnostics; gradient comparison tool.
+./train "$work/data" "$work/doc" dim=16 layers=2 batch=2 seqlen=7 traces=1 trace_decay=0.99 docsep=65 steps=100 saveevery=0 > "$work/doc.log"
+grep -q '^traces: decay' "$work/doc.log"
+grep -q '^state:' "$work/doc.log"
+./train "$work/heldout" "$work/doc" mode=eval > "$work/doc-eval.log"
+./gradcheck "$work/data" "$work/doc" len=28 window=7 seqs=2 > "$work/gradcheck.log"
+grep -q '^decay' "$work/gradcheck.log"
+echo 'PASS CLI: dense resume within FP32 tolerance, evaluation tails, unchanged checkpoints, invalid input rejection, MLA resume, trace resume, document resets and gradcheck'

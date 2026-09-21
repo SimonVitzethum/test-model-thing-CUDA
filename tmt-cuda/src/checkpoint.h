@@ -97,7 +97,8 @@ static void checkpoint_header(Checkpoint& io, Cfg& cfg) {
         while (std::getline(canonical, line)) {
             std::string key = line.substr(0, line.find('='));
             if (stored_keys.find(" " + key + " ") != std::string::npos) expected += line + "\n";
-            else if (key != "traces") throw std::runtime_error("checkpoint configuration schema mismatch");
+            else if (key != "traces" && key != "trace_decay" && key != "docsep")
+                throw std::runtime_error("checkpoint configuration schema mismatch");
         }
         if (expected != text) throw std::runtime_error("checkpoint configuration schema mismatch");
         cfg = decoded;
@@ -178,4 +179,72 @@ static void save_checkpoint(const std::string& path, Model& m, StreamState& stat
 static void load_checkpoint(const std::string& path, Model& m, StreamState& state, Progress& progress) {
     verify_checkpoint(path); // before any model/state mutation
     Checkpoint io(path, false); checkpoint_payload(io, m, state, progress);
+}
+
+// Gewichte-only Loader: volle Integritätsprüfung (verify_checkpoint) plus
+// Positionsbeweis (Dateiende exakt erreicht). Optimizer/Momente und
+// Stream-State werden übersprungen (fseek), Master direkt per DMA.
+static void load_weights_only(const std::string& path, Model& m,
+                              const Cfg& file_cfg) {
+    verify_checkpoint(path);
+    Checkpoint io(path, false);
+    Cfg stored;
+    checkpoint_header(io, stored);
+    require_same_model(stored, m.c);
+    Progress pr;
+    io.scalar(pr.step); io.scalar(pr.cursor); io.scalar(pr.epoch);
+    io.scalar(pr.carried); io.scalar(pr.data_size); io.scalar(pr.data_hash);
+    uint64_t count = 0;
+    io.scalar(count);
+    if (count != m.params.values.size())
+        throw std::runtime_error("parameter count mismatch");
+    for (auto& p : m.params.values) {
+        uint64_t n = 0;
+        io.scalar(n);
+        if (n != (uint64_t)p.n) throw std::runtime_error("parameter shape mismatch");
+        io.device(p.master, n * 4);
+        if (fseek(io.file, (long)(n * 4), SEEK_CUR) ||
+            fseek(io.file, (long)(n * 4), SEEK_CUR))
+            throw std::runtime_error("checkpoint skip failed");
+        copy_bf16_kernel<<<(n + 255) / 256, 256>>>(p.master, p.work, n);
+    }
+    long spos = 0;
+    io.scalar(spos);  // state.position (wird frisch aufgebaut, ignoriert)
+    (void)spos;
+    int fB = file_cfg.batch, fD = file_cfg.dim;
+    for (int l = 0; l < file_cfg.layers; ++l) {
+        if (fseek(io.file, (long)fB * fD * 4, SEEK_CUR))
+            throw std::runtime_error("checkpoint skip failed");
+        if (l < m.c.layers && m.ML[l].use) {
+            long head = 0, base0 = 0;
+            io.scalar(head); io.scalar(base0);
+            int Lr = file_cfg.mla_L, R = file_cfg.mla_R, Cm = file_cfg.mla_cache;
+            for (int b = 0; b < fB; ++b) {
+                if (fseek(io.file, head * Lr * 2, SEEK_CUR) ||
+                    fseek(io.file, head * R * 2, SEEK_CUR))
+                    throw std::runtime_error("checkpoint skip failed");
+            }
+            (void)Cm;
+        } else if (file_cfg.mla && l % file_cfg.mla_every == 0) {
+            long head = 0, base0 = 0;
+            io.scalar(head); io.scalar(base0);
+            int Lr = file_cfg.mla_L, R = file_cfg.mla_R;
+            for (int b = 0; b < fB; ++b) {
+                if (fseek(io.file, head * Lr * 2, SEEK_CUR) ||
+                    fseek(io.file, head * R * 2, SEEK_CUR))
+                    throw std::runtime_error("checkpoint skip failed");
+            }
+        }
+    }
+    if (file_cfg.traces) {  // Traces: nur Trainingszustand, überspringen
+        long bd = (long)fB * fD * 4;
+        if (fseek(io.file, (2L * file_cfg.layers + 256) * bd, SEEK_CUR))
+            throw std::runtime_error("checkpoint skip failed");
+    }
+    // Positionsbeweis: exakt 8 Checksummen-Bytes müssen übrig sein.
+    long pos = ftell(io.file);
+    if (fseek(io.file, 0, SEEK_END)) throw std::runtime_error("seek failed");
+    long end = ftell(io.file);
+    if (end - pos != 8) throw std::runtime_error("checkpoint layout mismatch");
+    CUDA_CHECK(cudaDeviceSynchronize());
 }

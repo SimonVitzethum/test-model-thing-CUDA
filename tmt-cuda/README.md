@@ -162,6 +162,8 @@ Important options:
 | `gradclip`, `ematau`, `seed` | `1`, `0.99`, `1234` |
 | `maxcarry` | `0`: no periodic reset; positive values: reset between windows |
 | `traces` | `0`; `1` enables hybrid traces across window boundaries (see below) |
+| `trace_decay` | `1`; per-byte trace decay γ (`e_t = γ·a_t·e_(t-1) + …`), independent of `seqlen` |
+| `docsep` | `-1`; byte value that starts a new document (state and traces reset there) |
 
 The file is split into `batch` contiguous streams. Each stream
 starts with empty state. Training processes complete windows; at the
@@ -205,6 +207,53 @@ floats (about 11 MB for dim=512, layers=16, batch=16); measured throughput cost
 is below 1 %. Traces advance only during training and reset with the state.
 `make check` verifies that, for one layer, two windows with traces reproduce the
 full BPTT gradient of one double-length window for all parameters.
+
+### Document resets, trace decay and diagnostics
+
+`docsep=B` resets the recurrence at every input byte equal to `B` by forcing
+`a_t = 0` there, so `s_t = x_t`. Carry, gradient flow and traces are cut by the
+same recurrence; no separate code path exists. It applies in training,
+evaluation and sampling alike, so the context table measures what training
+saw. The MLA cache is not reset. enwik8 has no single-byte separator; insert one
+before each article, e.g. `perl -pe 's/<page>/\x1e<page>/g'` and `docsep=30`.
+
+`trace_decay=γ` damps old trace contributions per byte. Because it is defined
+per byte, the traces after a given number of bytes do not depend on `seqlen`
+(tested). `γ=1` keeps exact traces.
+
+Every 100 training steps the log shows:
+
+- `traces:` (with `traces=1`) the norm ratio and cosine between the trace part
+  and the in-window part of the decay, gate and embedding gradients. A cosine
+  near −1 or wild fluctuations mean the traces fight the window gradient.
+- `state:` the mean |state| per half-life bucket (from the decay alone; the
+  gate makes the effective half-life input-dependent). It shows whether long
+  channels store anything. With `s = a·s + (1−a)·x`, a channel with a 65k
+  half-life takes each byte in with weight ~1e-5: it holds a slow average unless
+  the gate lowers `a` for selected inputs.
+
+### Gradient comparison (`gradcheck`)
+
+```sh
+./gradcheck held.bin model.ckpt len=4096 window=128 seqs=4 [trace_decay=… docsep=…]
+```
+
+Using the trained weights, `gradcheck` computes the exact BPTT gradient of
+`seqs` sequences of `len` bytes and reports, per parameter type, the cosine
+similarity of truncated BPTT (`traces=0`) and the hybrid (`traces=1`) to it.
+It trains nothing and is much cheaper and less noisy than training runs. On the
+8h checkpoint (half_max=512, experts untrained, see CHANGES.md) at `len=4096`:
+
+| params | cos TBPTT | cos hybrid |
+|---|---|---|
+| decay | 0.9950 | 0.9956 |
+| gate | 0.9791 | 0.9951 |
+| embedding | 0.9946 | 0.9942 |
+| experts | 0.9941 | 0.9938 |
+
+With half-lives up to 512 bytes, TBPTT is already close to exact and the hybrid
+mainly helps the gate. Checkpoints trained with long half-lives are the real
+test.
 
 ## Checkpoints and reproducibility
 

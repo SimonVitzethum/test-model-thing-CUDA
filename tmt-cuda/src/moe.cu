@@ -479,9 +479,13 @@ inline void moe_backward(const bf16* dY, bf16** Wexp,
     // Xg-Recompute aus Keep.H (Pads nullen für saubere dW)
     {
         CUDA_CHECK(cudaMemset(w.Xg, 0, (size_t)(k.Ptk > 0 ? k.Ptk : 1) * D * 2));
-        int gblocks = (N * K + TPB - 1) / TPB;
+        // gather_slot_kernel is elementwise over N*K*D (as in the forward).
+        long gblocks = ((long)N * K * D + TPB - 1) / TPB;
         gather_slot_kernel<<<gblocks, TPB>>>(k.H, k.slot_of, w.Xg, N, K, D);
     }
+    // Zero the padded expert-output gradient BEFORE combine_bwd fills the valid
+    // slots (zeroing it afterwards discarded every expert gradient).
+    CUDA_CHECK(cudaMemset(w.dYg, 0, (size_t)(k.Ptk > 0 ? k.Ptk : 1) * D * 2));
     {
         long n = (long)N * K * D;
         combine_bwd_kernel<<<(n + TPB - 1) / TPB, TPB>>>(
@@ -509,7 +513,6 @@ inline void moe_backward(const bf16* dY, bf16** Wexp,
         if (s2 != CUBLAS_STATUS_SUCCESS) { std::printf("router dX FAIL\n"); exit(1); }
     }
     // Experten pro Gruppe (gepaddete Formen -> stabile cuBLAS-Kernels)
-    CUDA_CHECK(cudaMemset(w.dYg, 0, (size_t)(k.Ptk > 0 ? k.Ptk : 1) * D * 2));
     for (int e = 0; e < E; ++e) {
         int pm = (k.hcnt[e] + 127) / 128 * 128;
         if (pm == 0) continue;

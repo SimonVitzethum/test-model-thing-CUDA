@@ -9,13 +9,30 @@
 // stats, out) statt ~T*L*10.
 #include "common.h"
 
+// Options shared by the recurrence kernels (passed by value).
+// Document reset: at a position whose input byte equals docsep, a_t = 0, so
+// s_t = x_t. Carry, gradient flow and traces are cut by the same recurrence.
+struct CellOpt {
+    const int* ids = nullptr;  // (B,T) input bytes, needed for docsep
+    int docsep = -1;           // -1: no document reset
+    float gamma = 1.f;         // trace decay per byte (1: exact traces)
+    float *trDec = nullptr, *trGate = nullptr;  // (B,D) traces, in/out
+    float *lam = nullptr, *prod = nullptr;      // (B,D) outputs for emb_trace
+    float *logDec = nullptr, *logGate = nullptr, *logEmb = nullptr;  // trace part of the gradient
+};
+__device__ __forceinline__ float cell_a(const CellOpt& o, float decay, const float* gate,
+                                        int d, float x, int b, int T, int t) {
+    if (o.docsep >= 0 && o.ids[b * T + t] == o.docsep) return 0.f;
+    return sigmoid_f(decay + (gate ? gate[d] * x : 0.f));
+}
+
 // Pass 1: Zeit-Loop, schreibt States (fp32) für die Norm.
 // carry (B,D) oder nullptr (= Nullstart).
 __global__ void state_pass_kernel(const bf16* __restrict__ X,
                                   float* __restrict__ S,
                                   const float* __restrict__ decay,
                                   const float* __restrict__ carry,
-                                  int B, int T, int D, const float* gate) {
+                                  int B, int T, int D, const float* gate, CellOpt o) {
     int b = blockIdx.x;
     int d = blockIdx.y * blockDim.x + threadIdx.x;
     if (b >= B || d >= D) return;
@@ -23,7 +40,7 @@ __global__ void state_pass_kernel(const bf16* __restrict__ X,
     for (int t = 0; t < T; ++t) {
         int idx = (b * T + t) * D + d;
         float x = bf2f(X[idx]);
-        float dec = sigmoid_f(decay[d] + (gate ? gate[d] * x : 0.f));
+        float dec = cell_a(o, decay[d], gate, d, x, b, T, t);
         state = dec * state + (1.f - dec) * x;
         S[idx] = state;
     }
@@ -87,10 +104,10 @@ __global__ void out_pass_kernel(const bf16* __restrict__ X,
 // carry (B,D) fp32 oder nullptr.
 inline void state_forward(const bf16* X, float* S, const float* decay,
                           const float* carry, int B, int T, int D,
-                          const float* gate = nullptr) {
+                          const float* gate = nullptr, CellOpt o = CellOpt()) {
     const int TPB = 256;
     dim3 grid(B, (D + TPB - 1) / TPB);
-    state_pass_kernel<<<grid, TPB>>>(X, S, decay, carry, B, T, D, gate);
+    state_pass_kernel<<<grid, TPB>>>(X, S, decay, carry, B, T, D, gate, o);
 }
 
 void cell_forward(const bf16* X, float* S, const float* decay,
@@ -99,7 +116,7 @@ void cell_forward(const bf16* X, float* S, const float* decay,
     const int TPB = 256;
     dim3 grid1(B, (D + TPB - 1) / TPB);
     state_pass_kernel<<<grid1, TPB, 0, stream>>>(X, S, decay, nullptr, B, T,
-                                                 D, nullptr);
+                                                 D, nullptr, CellOpt());
     stats_kernel<<<B * T, TPB, 0, stream>>>(S, mean, rstd, B, T, D);
     out_pass_kernel<<<grid1, TPB, 0, stream>>>(X, S, mean, rstd, Y, B, T, D);
     cudaError_t le = cudaGetLastError();
@@ -113,17 +130,17 @@ void cell_forward(const bf16* X, float* S, const float* decay,
 // Exact within-window derivative. The incoming carry is constant for TBPTT,
 // but contributes to the decay/gate derivatives at the first position.
 //
-// Hybrid traces (optional, trDec/trGate != nullptr): e = ds_(t0-1)/dθ for the
+// Hybrid traces (optional, o.trDec/o.trGate): e = ds_(t0-1)/dθ for the
 // per-channel parameters is carried across windows. After the backward loop,
 // `future` is exactly λ = dL/ds_(t0-1), so λ·e_in adds the credit of all bytes
 // before the window. The trace is then advanced in closed form:
-//   e_out = P·e_in + Σ_t (Π_{k>t} a_k)·local_t,   P = Π_t a_t
-// which is the same suffix product the backward loop already walks.
+//   e_out = P·e_in + Σ_t (Π_{k>t} γa_k)·local_t,   P = Π_t γa_t
+// i.e. e_t = γ·a_t·e_(t-1) + local_t per byte, independent of the window length.
 __global__ void state_bwd_kernel(const bf16* dS, const float* S,
                                  const float* decay, float* dX, float* dDec,
                                  int B, int T, int D, const bf16* X,
                                  const float* initial, const float* gate, float* dGate,
-                                 float* trDec, float* trGate, float* lamOut, float* prodOut) {
+                                 CellOpt o) {
     int b = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
     if (b >= B || d >= D) return;
     float future = 0, gd = 0, gg = 0;
@@ -131,7 +148,7 @@ __global__ void state_bwd_kernel(const bf16* dS, const float* S,
     for (int t = T - 1; t >= 0; --t) {
         long idx = ((long)b * T + t) * D + d;
         float x = bf2f(X[idx]);
-        float a = sigmoid_f(decay[d] + (gate ? gate[d] * x : 0.f));
+        float a = cell_a(o, decay[d], gate, d, x, b, T, t);
         float total = bf2f(dS[idx]) + future;
         float prev = t ? S[idx - D] : (initial ? initial[(long)b * D + d] : 0.f);
         float local = (prev - x) * a * (1.f - a);
@@ -140,20 +157,22 @@ __global__ void state_bwd_kernel(const bf16* dS, const float* S,
         gd += gz; gg += gz * x;
         future = total * a;
         ld += suffix * local; lg += suffix * local * x;
-        suffix *= a;
+        suffix *= o.gamma * a;
     }
     long bd = (long)b * D + d;
-    if (trDec) {
-        float e = trDec[bd];
-        gd += future * e;
-        trDec[bd] = suffix * e + ld;
+    if (o.trDec) {
+        float e = o.trDec[bd], part = future * e;
+        gd += part;
+        if (o.logDec) atomicAdd(&o.logDec[d], part);
+        o.trDec[bd] = suffix * e + ld;
     }
-    if (trGate && gate) {
-        float e = trGate[bd];
-        gg += future * e;
-        trGate[bd] = suffix * e + lg;
+    if (o.trGate && gate) {
+        float e = o.trGate[bd], part = future * e;
+        gg += part;
+        if (o.logGate) atomicAdd(&o.logGate[d], part);
+        o.trGate[bd] = suffix * e + lg;
     }
-    if (lamOut) { lamOut[bd] = future; prodOut[bd] = suffix; }
+    if (o.lam) { o.lam[bd] = future; o.prod[bd] = suffix; }
     atomicAdd(&dDec[d], gd);
     if (dGate && gate) atomicAdd(&dGate[d], gg);
 }
@@ -162,50 +181,48 @@ inline void cell_backward(const bf16* dS, const float* S,
                           const float* decay, float* dX, float* dDec,
                           int B, int T, int D, const bf16* X,
                           const float* initial, const float* gate, float* dGate,
-                          float* trDec = nullptr, float* trGate = nullptr,
-                          float* lamOut = nullptr, float* prodOut = nullptr) {
+                          CellOpt o = CellOpt()) {
     dim3 grid(B, (D + 255) / 256);
     CUDA_CHECK(cudaMemset(dDec, 0, (size_t)D * 4));
     if (dGate) CUDA_CHECK(cudaMemset(dGate, 0, (size_t)D * 4));
     state_bwd_kernel<<<grid, 256>>>(dS, S, decay, dX, dDec, B, T, D,
-                                   X, initial, gate, dGate,
-                                   trDec, trGate, lamOut, prodOut);
+                                   X, initial, gate, dGate, o);
 }
 
-// Embedding trace for the first layer, whose input is the embedding row of
-// each byte: e[b][r][d] = ds_d/dEmb[r][d]. Uses λ and P from state_bwd_kernel.
+// Embedding trace, e[b][r][d] = ds_d/dEmb[r][d], for a layer whose input
+// contains the embedding row of each byte. Uses λ and P from state_bwd_kernel.
 // One thread owns column d of stream b, so trace updates need no atomics.
 __global__ void emb_trace_kernel(const bf16* X, const float* S, const float* initial,
-                                 const float* decay, const float* gate, const int* ids,
-                                 const float* lam, const float* prod, float* trEmb,
-                                 float* dEmb, int B, int T, int D) {
+                                 const float* decay, const float* gate, float* trEmb,
+                                 float* dEmb, int B, int T, int D, CellOpt o) {
     int b = blockIdx.x, d = blockIdx.y * blockDim.x + threadIdx.x;
     if (b >= B || d >= D) return;
     long bd = (long)b * D + d;
-    float l = lam[bd], P = prod[bd];
+    float l = o.lam[bd], P = o.prod[bd];
     float* e = trEmb + (long)b * 256 * D + d;
     for (int r = 0; r < 256; ++r) {
         float v = e[(long)r * D];
-        if (v != 0.f) atomicAdd(&dEmb[(long)r * D + d], l * v);
+        if (v != 0.f) {
+            atomicAdd(&dEmb[(long)r * D + d], l * v);
+            if (o.logEmb) atomicAdd(&o.logEmb[(long)r * D + d], l * v);
+        }
         e[(long)r * D] = P * v;
     }
     float suffix = 1;
     for (int t = T - 1; t >= 0; --t) {
         long idx = ((long)b * T + t) * D + d;
         float x = bf2f(X[idx]);
-        float a = sigmoid_f(decay[d] + (gate ? gate[d] * x : 0.f));
+        float a = cell_a(o, decay[d], gate, d, x, b, T, t);
         float prev = t ? S[idx - D] : initial[bd];
         float k = (1.f - a) + (gate ? (prev - x) * a * (1.f - a) * gate[d] : 0.f);
-        e[(long)ids[b * T + t] * D] += suffix * k;
-        suffix *= a;
+        e[(long)o.ids[b * T + t] * D] += suffix * k;
+        suffix *= o.gamma * a;
     }
 }
 
 inline void emb_trace(const bf16* X, const float* S, const float* initial,
-                      const float* decay, const float* gate, const int* ids,
-                      const float* lam, const float* prod, float* trEmb,
-                      float* dEmb, int B, int T, int D) {
+                      const float* decay, const float* gate, float* trEmb,
+                      float* dEmb, int B, int T, int D, CellOpt o) {
     dim3 grid(B, (D + 255) / 256);
-    emb_trace_kernel<<<grid, 256>>>(X, S, initial, decay, gate, ids, lam, prod,
-                                    trEmb, dEmb, B, T, D);
+    emb_trace_kernel<<<grid, 256>>>(X, S, initial, decay, gate, trEmb, dEmb, B, T, D, o);
 }

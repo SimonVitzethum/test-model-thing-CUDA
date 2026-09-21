@@ -45,7 +45,8 @@ BPC 1.31 (run2) and 2.50 (8h laptop run), reproducibly checkpointed.
 - S1 cell: ~1000 GB/s (bandwidth roof), 3 instead of ~2560 launches.
 - MoE op: 9 % → **~50 % of BF16 peak performance** (arena, 128-padding, fusion, router occupancy).
 - run2 (420M total / 106M active, 5080, enwik8): **BPC 5.11 → 1.31** in 15.6M tokens, then router collapse (trigger for aux fix).
-- 8h laptop run (34M, aux 0.1): 2.46B tokens, **held-out BPC 3.15 → 2.50**, router balanced throughout.
+- 8h laptop run (34M, aux 0.1): 2.46B tokens, **held-out BPC 3.15 → 2.50**, router balanced throughout. *Trained with the MoE backward bug below: experts never learned.*
+- **MoE backward bug (introduced in `f052b67`, fixed):** the expert-output gradient was zeroed after it was computed, and the expert-input recompute launched 1/D of the needed threads. Expert weights got zero gradient and no gradient flowed through the experts (only residual and router paths). Affects all MoE runs after 2026-09-20 22:35, including run3local and the 8h run; run2 predates it. A new test compares a two-expert MoE with identical experts against the dense path; the small MoE smoke test now reaches CE 0.82 instead of 3.36.
 - CUDA vs. torch port: **216× throughput** (106k vs. 0.49k tok/s same scale).
 
 ## 5. Discarded/removed

@@ -33,6 +33,60 @@ static int integer_option(const std::string& value) {
     if (!(in >> n) || !(in >> std::ws).eof() || n < 0) throw std::runtime_error("invalid nonnegative integer");
     return n;
 }
+static std::vector<float> host_copy(const float* p, long n) {
+    std::vector<float> v(n); CUDA_CHECK(cudaMemcpy(v.data(), p, n * 4, cudaMemcpyDeviceToHost)); return v;
+}
+// Trace part vs in-window part of the gradient, per parameter type. A cosine
+// near -1 or strongly fluctuating means traces fight the window gradient.
+static void print_trace_stats(Model& m) {
+    const Cfg& c = m.c; int L = c.layers, D = c.dim;
+    auto log = host_copy(m.trlog, (2L * L + 256) * D);
+    auto report = [&](const char* name, std::vector<std::pair<size_t, long>> groups) {
+        double pp = 0, ww = 0, pw = 0;
+        for (auto [param, logoff] : groups) {
+            auto g = host_copy(m.params.at(param).grad, m.params.at(param).n);
+            for (size_t i = 0; i < g.size(); ++i) {
+                double p = log[logoff + i], w = g[i] - p;
+                pp += p * p; ww += w * w; pw += p * w;
+            }
+        }
+        std::printf(" %s |tr|/|win|=%.3g cos=%.3f", name, sqrt(pp / std::max(ww, 1e-30)),
+                    pw / std::max(sqrt(pp * ww), 1e-30));
+    };
+    std::vector<std::pair<size_t, long>> dec, gate;
+    for (int l = 0; l < L; ++l) {
+        dec.push_back({m.L[l].decay, (long)l * D});
+        gate.push_back({m.L[l].gate, (long)(L + l) * D});
+    }
+    std::printf("traces:");
+    report("decay", dec);
+    if (c.gated) report("gate", gate);
+    report("emb", {{m.emb, 2L * L * D}});
+    std::printf("\n");
+}
+// Mean |state| per half-life bucket (from decay alone; the gate makes the
+// effective half-life input-dependent). Shows whether long channels store anything.
+static void print_state_buckets(Model& m, StreamState& state) {
+    const Cfg& c = m.c; int D = c.dim, B = c.batch;
+    const double edges[] = {16, 128, 1024, 8192, 1e300};
+    const char* names[] = {"<16", "<128", "<1k", "<8k", ">=8k"};
+    double sum[5] = {}; long count[5] = {};
+    for (int l = 0; l < c.layers; ++l) {
+        auto decay = host_copy(m.params.at(m.L[l].decay).master, D);
+        auto carry = host_copy(state.carry[l], (long)B * D);
+        for (int d = 0; d < D; ++d) {
+            double a = 1 / (1 + exp(-(double)decay[d]));
+            double half = a >= 1 ? 1e300 : log(0.5) / log(a);
+            int k = 0; while (half >= edges[k]) ++k;
+            for (int b = 0; b < B; ++b) sum[k] += fabs(carry[(long)b * D + d]);
+            count[k] += B;
+        }
+    }
+    std::printf("state:");
+    for (int k = 0; k < 5; ++k)
+        if (count[k]) std::printf(" h%s n=%ld |s|=%.3g", names[k], count[k] / B, sum[k] / count[k]);
+    std::printf("\n");
+}
 int main(int argc, char** argv) {
     try {
         if (argc < 3) {
@@ -130,7 +184,12 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < N; ++i) if (valid[i]) ce_sum += losses[i];
             } else {
                 if (!std::isfinite(loss)) throw std::runtime_error("non-finite loss; update refused");
-                backward_window(m, state); optimizer_step(m, progress.step);
+                bool diagnostics = (progress.step + 1) % 100 == 0;
+                m.log_traces = cfg.traces && diagnostics;
+                backward_window(m, state);
+                if (m.log_traces) print_trace_stats(m);
+                if (diagnostics) print_state_buckets(m, state);
+                optimizer_step(m, progress.step);
                 ce_sum += ce * count;
             }
             release_window(m);
