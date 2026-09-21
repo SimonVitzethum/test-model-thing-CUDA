@@ -7,3 +7,4 @@
 *.pipe
 *.DS_Store
 *.safetensors
+/ISSUE_DRAFT.md

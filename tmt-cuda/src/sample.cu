@@ -144,15 +144,20 @@ int main(int argc, char** argv) {
             }
             return {pick, 1.0f / (1.0f + expf(-sstop))};
         };
+        // Stop-Head ohne Training (stop=0) liefert Zufallslogits -> ignorieren.
+        const bool use_stop = file_cfg.stop > 0;
+        // Jedes Byte genau einmal einspeisen: die Vorhersage nach dem letzten
+        // Prompt-Byte liefert direkt das erste Ausgabe-Byte.
+        std::pair<int, float> next{0, 0.f};
         for (size_t i = 0; i < prompt.size(); ++i)
-            step_byte((unsigned char)prompt[i]);
+            next = step_byte((unsigned char)prompt[i]);
         for (int i = 0; i < maxlen; ++i) {
-            int prev = out.empty() ? (unsigned char)prompt.back() : out.back();
-            auto [b, s] = step_byte(prev);
-            if (s > stop_thr) break;
+            auto [b, s] = next;
+            if (use_stop && s > stop_thr) break;
             out.push_back((unsigned char)b);
             fwrite(&out.back(), 1, 1, stdout);
             fflush(stdout);
+            if (i + 1 < maxlen) next = step_byte(b);
         }
         std::printf("\n");
         return 0;
