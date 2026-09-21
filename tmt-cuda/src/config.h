@@ -16,7 +16,7 @@
     F(float, aux, .01f) F(float, zloss, .001f) F(float, latent, 0.f) \
     F(float, ce, 1.f) F(float, var, 0.f) F(float, stop, 0.f) \
     F(float, stopposw, 20.f) F(float, ematau, .99f) F(float, gradclip, 1.f) \
-    F(int, maxcarry, 0) F(int, seed, 1234) \
+    F(int, maxcarry, 0) F(int, seed, 1234) F(int, traces, 0) \
     F(int, mla, 0) F(int, mla_heads, 4) F(int, mla_dh, 32) \
     F(int, mla_L, 32) F(int, mla_R, 16) F(int, mla_cache, 4096) \
     F(int, mla_every, 2) F(int, mla_cc, 256) F(float, mla_theta, 10000.f)
@@ -62,6 +62,7 @@ static void validate_cfg(const Cfg& c) {
             "loss weights must be nonnegative, ce must be positive");
     require(c.stopposw > 0 && c.ematau >= 0 && c.ematau < 1 && c.gradclip >= 0 && c.maxcarry >= 0,
             "invalid optimizer/state configuration");
+    require(c.traces == 0 || c.traces == 1, "traces must be 0 or 1");
     require(c.mla == 0 || c.mla == 1, "mla must be 0 or 1");
     if (c.mla) {
         require(c.mla_heads > 0 && c.mla_dh > 0 && c.mla_L > 0 && c.mla_R > 0 && c.mla_R % 2 == 0,

@@ -104,6 +104,7 @@ struct Model {
     MoeWs moeW;  // shared MoE-Arena (kein malloc pro Fenster)
     bf16 *logits, *dlogits, *stoplog, *dstop, *tgtX;
     float *dXres, *dEnc, *dEncTmp, *probs, *losstmp, *mv, *dDec;
+    float *lam, *prod;     // (B,D) boundary adjoint / decay product, layer 0
     int *ids, *nxt, *end;
     long* pos = nullptr;   // (N,) Positionen Device
 };
@@ -113,12 +114,19 @@ struct StreamState {
     std::vector<float*> carry;
     std::vector<MlaC> cache;
     long position = 0;
+    // Hybrid traces (traces=1): ds_(t0-1)/dθ carried across windows.
+    std::vector<float*> tdec, tgate;  // per layer (B,D)
+    float* temb = nullptr;            // (B,256,D), layer 0 only
 };
 
 static void reset_state(StreamState& state, const Cfg& c) {
     for (auto* carry : state.carry)
         CUDA_CHECK(cudaMemset(carry, 0, (long)c.batch * c.dim * sizeof(float)));
     for (auto& cache : state.cache) { cache.head = 0; cache.base0 = 0; }
+    long bd = (long)c.batch * c.dim * sizeof(float);
+    for (auto* t : state.tdec) CUDA_CHECK(cudaMemset(t, 0, bd));
+    for (auto* t : state.tgate) CUDA_CHECK(cudaMemset(t, 0, bd));
+    if (state.temb) CUDA_CHECK(cudaMemset(state.temb, 0, 256 * bd));
     state.position = 0;
 }
 
@@ -126,6 +134,14 @@ static void build_state(StreamState& state, const Model& m) {
     const Cfg& c = m.c;
     state.carry.resize(c.layers);
     state.cache.resize(c.layers);
+    if (c.traces) {
+        state.tdec.resize(c.layers); state.tgate.resize(c.layers);
+        for (int l = 0; l < c.layers; ++l) {
+            state.memory.allocate(state.tdec[l], (long)c.batch * c.dim * 4);
+            state.memory.allocate(state.tgate[l], (long)c.batch * c.dim * 4);
+        }
+        state.memory.allocate(state.temb, 256L * c.batch * c.dim * 4);
+    }
     for (int l = 0; l < c.layers; ++l) {
         state.memory.allocate(state.carry[l], (long)c.batch * c.dim * 4);
         if (m.ML[l].use) {
@@ -236,6 +252,8 @@ static void build_model(Model& m) {
     m.memory.allocate(m.dEnc, ND * 4);
     m.memory.allocate(m.dEncTmp, ND * 4);
     m.memory.allocate(m.dDec, (size_t)D * 4);
+    m.memory.allocate(m.lam, (long)B * D * 4);
+    m.memory.allocate(m.prod, (long)B * D * 4);
     m.memory.allocate(m.ids, N * 4);
     m.memory.allocate(m.nxt, N * 4);
     m.memory.allocate(m.end, N * 4);
@@ -438,7 +456,8 @@ static void forward_window(Model& m, StreamState& state, float& tot, float& ce_o
 }
 
 // Forward must immediately precede backward on this model's workspace.
-static void backward_window(Model& m, const StreamState& state) {
+// With traces=1, backward also advances the stream's traces (training only).
+static void backward_window(Model& m, StreamState& state) {
     const Cfg& c = m.c;
     int B = c.batch, T = c.seqlen, D = c.dim, N = B * T;
     long ND = (long)N * D;
@@ -507,10 +526,16 @@ static void backward_window(Model& m, const StreamState& state) {
         copy_bf16_kernel<<<blocksL, TPB>>>(Ly.S, m.Sb, ND);
         layernorm_bwd(m.Sb, m.dH, m.params.at(Ly.gamma).master, Ly.mean, Ly.rstd,
                       m.dSnorm, m.params.at(Ly.gamma).grad, m.params.at(Ly.beta).grad, N, D);
+        const float* gate = c.gated ? m.params.at(Ly.gate).master : nullptr;
+        bool tr = c.traces != 0;
         cell_backward(m.dSnorm, Ly.S, m.params.at(Ly.decay).master, m.dEncTmp,
                       m.params.at(Ly.decay).grad, B, T, D, Ly.input, Ly.initial,
-                      c.gated ? m.params.at(Ly.gate).master : nullptr,
-                      m.params.at(Ly.gate).grad);
+                      gate, m.params.at(Ly.gate).grad,
+                      tr ? state.tdec[l] : nullptr, tr ? state.tgate[l] : nullptr,
+                      tr && l == 0 ? m.lam : nullptr, tr && l == 0 ? m.prod : nullptr);
+        if (tr && l == 0)
+            emb_trace(Ly.input, Ly.S, Ly.initial, m.params.at(Ly.decay).master, gate,
+                      m.ids, m.lam, m.prod, state.temb, m.params.at(m.emb).grad, B, T, D);
         // Chain through the previous layer, including residual passthrough.
         cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dEncTmp, ND);
         copy_bf16_kernel<<<blocksL, TPB>>>(m.dEncTmp, m.dXs, ND);

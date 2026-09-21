@@ -24,7 +24,7 @@ profile: src/profile.cu src/util.h src/linalg.cu src/moe.cu Makefile
 roofline: src/roofline.cu src/common.h Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/roofline.cu -lcublas
 
-check: architecture_test train
+check: architecture_test train sample
 	./architecture_test
 	sh tests/cli.sh
 

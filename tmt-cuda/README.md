@@ -161,6 +161,7 @@ Important options:
 | `aux`, `zloss` | `0.01`, `0.001`; MoE only |
 | `gradclip`, `ematau`, `seed` | `1`, `0.99`, `1234` |
 | `maxcarry` | `0`: no periodic reset; positive values: reset between windows |
+| `traces` | `0`; `1` enables hybrid traces across window boundaries (see below) |
 
 The file is split into `batch` contiguous streams. Each stream
 starts with empty state. Training processes complete windows; at the
@@ -176,12 +177,42 @@ backward, updates, and periodic checkpoints where applicable; initialization and
 final checkpoint are outside the timing. Evaluation includes forward and
 scoring. A run with `steps>0 mode=eval` scores only a prefix.
 
+## Hybrid traces (optional)
+
+Truncated BPTT cuts the gradient at the window boundary, even though the state
+itself is carried on indefinitely. `traces=1` restores gradient credit from
+before the window for the per-channel parameters, in the spirit of the original
+TMT trace system:
+
+```sh
+./train train.bin traced.ckpt traces=1 half_max=65536 steps=1000
+```
+
+Because the recurrence is diagonal, `e = ds_(t0-1)/dθ` is exact and cheap for
+the decay and gate of every layer and for the embedding feeding layer 0. The
+backward pass already computes `λ = dL/ds_(t0-1)` at the window start, so
+`λ·e` is added to the gradient, and the trace is advanced in closed form
+(`e_out = P·e_in + Σ_t (Π_{k>t} a_k)·local_t`) within the same kernel.
+Within a layer these parameters thus get an unbounded, exponentially decaying
+gradient horizon. The window length becomes a knob: `seqlen=1` is a pure online
+trace system, larger windows add exact lookback and GPU efficiency.
+
+Limits: paths that cross both a layer and the window boundary (layer l changing
+layer l+1's carried state) are not traced, and neither are router, expert, and
+MLA weights; those keep the window horizon. Traces are computed with the
+parameters of earlier windows. Extra state is `(2·layers + 256)·batch·dim`
+floats (about 11 MB for dim=512, layers=16, batch=16); measured throughput cost
+is below 1 %. Traces advance only during training and reset with the state.
+`make check` verifies that, for one layer, two windows with traces reproduce the
+full BPTT gradient of one double-length window for all parameters.
+
 ## Checkpoints and reproducibility
 
 Format V3 stores the full configuration, FP32 master weights,
 Adam moments, EMA encoder, global optimizer step, data position/epoch,
-dataset fingerprint, recurrent states, and the valid MLA cache including
-absolute positions. BF16 working weights are reconstructed from these.
+dataset fingerprint, recurrent states, the valid MLA cache including
+absolute positions, and the traces when `traces=1`. Files written before
+`traces` existed load unchanged. BF16 working weights are reconstructed from these.
 
 Files are replaced via a temporary file with flush and atomic rename.
 A content checksum is verified before restore. Old V2, MLX, and

@@ -82,14 +82,24 @@ static void checkpoint_header(Checkpoint& io, Cfg& cfg) {
     text.resize(length); io.bytes(text.data(), length);
     if (!io.writing) {
         Cfg decoded;
-        std::istringstream lines(text); std::string line;
+        std::istringstream lines(text); std::string line, stored_keys;
         while (std::getline(lines, line)) {
             size_t eq = line.find('=');
             if (eq == std::string::npos) throw std::runtime_error("invalid checkpoint configuration");
             set_cfg(decoded, line.substr(0, eq), line.substr(eq + 1));
+            stored_keys += " " + line.substr(0, eq) + " ";
         }
         validate_cfg(decoded);
-        if (config_text(decoded) != text) throw std::runtime_error("checkpoint configuration schema mismatch");
+        // Keys added later with a behavior-preserving default may be absent
+        // in older V3 files; every other key must round-trip exactly.
+        std::string expected;
+        std::istringstream canonical(config_text(decoded));
+        while (std::getline(canonical, line)) {
+            std::string key = line.substr(0, line.find('='));
+            if (stored_keys.find(" " + key + " ") != std::string::npos) expected += line + "\n";
+            else if (key != "traces") throw std::runtime_error("checkpoint configuration schema mismatch");
+        }
+        if (expected != text) throw std::runtime_error("checkpoint configuration schema mismatch");
         cfg = decoded;
     }
 }
@@ -150,6 +160,11 @@ static void checkpoint_payload(Checkpoint& io, Model& m, StreamState& state, Pro
             io.device(cache.lat + (long)b * cache.Cmax * cache.L, cache.head * cache.L * 2);
             io.device(cache.kr + (long)b * cache.Cmax * cache.R, cache.head * cache.R * 2);
         }
+    }
+    if (m.c.traces) {  // absent for traces=0, so older V3 files load unchanged
+        long bd = (long)m.c.batch * m.c.dim * 4;
+        for (int l = 0; l < m.c.layers; ++l) { io.device(state.tdec[l], bd); io.device(state.tgate[l], bd); }
+        io.device(state.temb, 256 * bd);
     }
     io.finish();
 }

@@ -8,7 +8,7 @@ while reworking the architecture, training, and infrastructure:
 
 * Byte input/output (no tokenizer)
 * Gated hierarchical recurrence with geometrically staggered half-lives
-* Exact truncated backpropagation through time (TBPTT) instead of 1-step traces
+* Exact truncated backpropagation through time (TBPTT), optionally combined with exact traces across window boundaries (`traces=1`)
 * Optional Mixture-of-Experts feedforward with top-k token dispatch and router balancing
 * Optional MLA long-range cache (DeepSeek-style compressed KV latents, up to 128k bytes)
 * Optional latent-space prediction with an EMA target encoder
@@ -105,7 +105,7 @@ x_out = x_t + FFN(LayerNorm(s_t))
 |---|---|---|
 | Layer structure | all recurrent layers fed directly from the byte embedding | each layer receives the residual stream of the previous layer (hierarchical) |
 | Recurrence | `state = decay·state + enc`, unbounded, single timescale (half-life ~1 byte) | gated and normalized (bounded), half-lives staggered from 2 to 512 bytes, input-dependent gate |
-| Time credit | 1-step gradient + hand-built traces (embedding/decay only) | exact TBPTT window (default 128 bytes) including the incoming carry |
+| Time credit | 1-step gradient + hand-built traces (embedding/decay only) | exact TBPTT window (default 128 bytes); optional exact decay/gate/embedding traces across windows |
 | Feedforward | one dense linear per layer | dense or MoE top-k with token dispatch, SiLU, load-balancing + z-loss |
 | Long range | effectively dozens of bytes | optional MLA cache with RoPE, up to 128k bytes |
 | Objective | JEPA latent loss + CE on the same vector | next-byte CE by default; latent loss against an EMA target encoder optional |

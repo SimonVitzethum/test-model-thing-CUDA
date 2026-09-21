@@ -61,6 +61,11 @@ static void load_weights_only(const std::string& path, Model& m,
             }
         }
     }
+    if (file_cfg.traces) {  // Traces: nur Trainingszustand, überspringen
+        long bd = (long)fB * fD * 4;
+        if (fseek(io.file, (2L * file_cfg.layers + 256) * bd, SEEK_CUR))
+            throw std::runtime_error("checkpoint skip failed");
+    }
     // Positionsbeweis: exakt 8 Checksummen-Bytes müssen übrig sein.
     long pos = ftell(io.file);
     if (fseek(io.file, 0, SEEK_END)) throw std::runtime_error("seek failed");

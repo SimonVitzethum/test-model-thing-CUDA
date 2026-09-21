@@ -137,6 +137,50 @@ static void test_model(int experts) {
     unlink(path.c_str());require(rejected,"corrupted checkpoint accepted");
     std::puts("PASS separate streams, checkpoint resume and corruption rejection");
 }
+// Hybrid traces: with one layer only layer 0's carry crosses the window
+// boundary, and it depends only on decay, gate and embedding. Two T-windows with
+// traces must therefore reproduce the full BPTT gradient of one 2T-window for
+// ALL parameters; without traces they must not.
+static void test_traces() {
+    const int T=6;
+    auto config=[&](int seqlen,int traces){Cfg c=small_config();c.layers=1;c.seqlen=seqlen;c.traces=traces;
+        c.aux=0;c.zloss=0;return c;};
+    std::vector<int> seq(2*(2*T+1));
+    for(size_t i=0;i<seq.size();++i)seq[i]=65+(i*7+i/5)%11;
+    auto feed=[&](Model& m,int offset){int B=m.c.batch,L=m.c.seqlen,n=B*L;std::vector<int> x(n),y(n),e(n,0);
+        for(int b=0;b<B;++b)for(int t=0;t<L;++t){x[b*L+t]=seq[b*(2*T+1)+offset+t];y[b*L+t]=seq[b*(2*T+1)+offset+t+1];}
+        CUDA_CHECK(cudaMemcpy(m.ids,x.data(),n*4,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.nxt,y.data(),n*4,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.end,e.data(),n*4,cudaMemcpyHostToDevice));};
+    auto nonzero_gate=[](Model& m){auto& g=m.params.at(m.L[0].gate);std::vector<float> h(g.n);
+        for(long d=0;d<g.n;++d)h[d]=.8f*sinf(d*1.3f+.4f);
+        CUDA_CHECK(cudaMemcpy(g.master,h.data(),g.n*4,cudaMemcpyHostToDevice));
+        copy_bf16_kernel<<<1,256>>>(g.master,g.work,g.n);};
+    auto grads=[](Model& m){std::vector<std::vector<float>> g;for(auto& p:m.params.values)g.push_back(read_gpu(p.grad,p.n));return g;};
+    float loss,ce;
+    Model full;full.c=config(2*T,0);build_model(full);nonzero_gate(full);StreamState fs;build_state(fs,full);
+    feed(full,0);forward_window(full,fs,loss,ce);backward_window(full,fs);auto ref=grads(full);
+    auto two_windows=[&](int traces){Model m;m.c=config(T,traces);build_model(m);nonzero_gate(m);
+        StreamState st;build_state(st,m);
+        feed(m,0);forward_window(m,st,loss,ce);backward_window(m,st);auto g=grads(m);
+        feed(m,T);forward_window(m,st,loss,ce);backward_window(m,st);auto h=grads(m);
+        for(size_t j=0;j<g.size();++j)for(size_t i=0;i<g[j].size();++i)g[j][i]+=h[j][i];
+        return g;};
+    auto error=[&](const std::vector<std::vector<float>>& g,size_t j){double e=0,n=0;
+        for(size_t i=0;i<g[j].size();++i){double r=2*ref[j][i];e+=pow(g[j][i]-r,2);n+=r*r;}
+        return std::make_pair(sqrt(e),sqrt(n));};
+    auto hybrid=two_windows(1),plain=two_windows(0);
+    Model shape;shape.c=config(T,1);build_model(shape);
+    for(size_t j=0;j<ref.size();++j){if(j==shape.tgt||j==shape.stop)continue;
+        auto [e,n]=error(hybrid,j);near(e,0,1e-5+.02*n,0,"hybrid trace gradient vs full BPTT");}
+    double worst_hybrid=0,best_plain=1e30;
+    for(size_t j:{shape.L[0].decay,shape.L[0].gate,shape.emb}){
+        auto [eh,n]=error(hybrid,j);auto [ep,n2]=error(plain,j);(void)n2;
+        require(ep>.05*n&&ep>10*eh,"traces do not change the cross-window gradient");
+        worst_hybrid=std::max(worst_hybrid,eh/n);best_plain=std::min(best_plain,ep/n);}
+    std::printf("PASS hybrid traces reproduce full BPTT across a window boundary (1 layer, all parameters; "
+                "decay/gate/emb rel. error %.1e with traces vs >= %.2f without)\n",worst_hybrid,best_plain);
+}
 static void test_mla_chunks() {
     Model a,b;a.c=small_config();a.c.layers=1;a.c.mla=1;a.c.mla_heads=2;
     a.c.mla_dh=4;a.c.mla_L=4;a.c.mla_R=6;a.c.mla_cache=17;a.c.mla_cc=3;
@@ -245,6 +289,8 @@ static void compare_checkpoints(const std::string& first,const std::string& seco
         for(long i=0;i<n;++i)near(av[i],bv[i],1e-7,1e-5,"resumed checkpoint values");};
     for(size_t j=0;j<a.params.values.size();++j){auto& x=a.params.at(j);auto& y=b.params.at(j);
         compare(x.master,y.master,x.n);compare(x.m,y.m,x.n);compare(x.v,y.v,x.n);}
+    if(a.c.traces){long bd=(long)a.c.batch*a.c.dim;compare(sa.temb,sb.temb,256*bd);
+        for(int l=0;l<a.c.layers;++l){compare(sa.tdec[l],sb.tdec[l],bd);compare(sa.tgate[l],sb.tgate[l],bd);}}
     for(int l=0;l<a.c.layers;++l){compare(sa.carry[l],sb.carry[l],(long)a.c.batch*a.c.dim);
         if(!a.ML[l].use)continue;
         auto& x=sa.cache[l];auto& y=sb.cache[l];require(x.head==y.head&&x.base0==y.base0,"cache metadata differs");
@@ -257,6 +303,6 @@ static void compare_checkpoints(const std::string& first,const std::string& seco
 }
 int main(int argc,char** argv){try{
     if(argc==4 && std::string(argv[1])=="--compare") {compare_checkpoints(argv[2],argv[3]);return 0;}
-test_cell();test_router();test_model(1);test_model(3);test_mla_chunks();test_mla_reference();
+test_cell();test_router();test_model(1);test_model(3);test_traces();test_mla_chunks();test_mla_reference();
     CUDA_CHECK(cudaDeviceSynchronize());std::puts("ALL ARCHITECTURE TESTS PASSED");return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}
