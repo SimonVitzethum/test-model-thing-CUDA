@@ -46,6 +46,10 @@ pub const Cfg = extern struct {
     trace_decay: f32 = 1,
     docsep: i32 = -1,
     dialog: i32 = 0,
+    muon: i32 = 0,
+    muon_lr: f32 = 0.02,
+    mtp: i32 = 0,
+    mtp_weight: f32 = 0.3,
     mem: i32 = 0,
     mem_len: i32 = 256,
     mem_heads: i32 = 4,
@@ -156,6 +160,9 @@ pub fn validate(c: Cfg) Error!void {
     try require(c.trace_decay > 0 and c.trace_decay <= 1, "require 0 < trace_decay <= 1");
     try require(c.docsep >= -1 and c.docsep <= 255, "docsep must be -1 (off) or a byte value");
     try require(c.dialog == 0 or c.dialog == 1, "dialog must be 0 or 1");
+    try require((c.muon == 0 or c.muon == 1) and c.muon_lr > 0, "muon must be 0 or 1 with muon_lr > 0");
+    try require(c.mtp >= 0 and c.mtp <= 7 and c.mtp_weight >= 0,
+        "require 0 <= mtp <= 7 and mtp_weight >= 0");
     try require(c.mem == 0 or c.mem == 1, "mem must be 0 or 1");
     if (c.mem != 0) {
         try require(c.mem_len > 0 and c.mem_len <= 4096 and c.mem_heads > 0 and c.mem_dh > 0 and

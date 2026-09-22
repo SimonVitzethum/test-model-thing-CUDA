@@ -164,7 +164,8 @@ fn header(f: *File, cfg: *cfgmod.Cfg) !void {
             try expected.append(f.gpa, '\n');
         } else if (!std.mem.eql(u8, key, "traces") and !std.mem.eql(u8, key, "trace_decay") and
             !std.mem.eql(u8, key, "docsep") and !std.mem.eql(u8, key, "dialog") and
-            !std.mem.startsWith(u8, key, "mem"))
+            !std.mem.startsWith(u8, key, "mem") and !std.mem.startsWith(u8, key, "mtp") and
+            !std.mem.startsWith(u8, key, "muon"))
         {
             return fail("checkpoint configuration schema mismatch", .{});
         }
@@ -192,7 +193,7 @@ fn requireSameModel(a: cfgmod.Cfg, b: cfgmod.Cfg) !void {
         a.half_max == b.half_max and a.mla == b.mla and a.mla_heads == b.mla_heads and
         a.mla_dh == b.mla_dh and a.mla_L == b.mla_L and a.mla_R == b.mla_R and
         a.mla_cache == b.mla_cache and a.mla_every == b.mla_every and a.mla_cc == b.mla_cc and
-        a.mla_theta == b.mla_theta and a.mem == b.mem and
+        a.mla_theta == b.mla_theta and a.mtp == b.mtp and a.mem == b.mem and
         (a.mem == 0 or (a.mem_len == b.mem_len and a.mem_heads == b.mem_heads and
             a.mem_dh == b.mem_dh and a.mem_every == b.mem_every and a.mem_rdim == b.mem_rdim));
     if (!same) return fail("checkpoint architecture differs; use a new path for a new experiment", .{});

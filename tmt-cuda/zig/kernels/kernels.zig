@@ -1366,3 +1366,73 @@ export fn mse_mean(a: cuda.ConstGlobal(f32), b: cuda.ConstGlobal(f32), out: cuda
     }
     if (t == 0) out[0] = cuda.fdiv(ln_buf[0], @floatFromInt(n));
 }
+
+// ---- Muon: orthogonalized momentum for the two-dimensional weights ----
+// The update direction is the momentum passed through a Newton-Schulz
+// iteration, which pushes its singular values towards one. Everything runs in
+// fp32 on the master weights; only the matrix products go through cuBLAS.
+
+/// m = beta*m + g, and the Newton-Schulz input g + beta*m (Nesterov).
+export fn muon_momentum(m: cuda.Global(f32), g: cuda.ConstGlobal(f32), x: cuda.Global(f32),
+                        beta: f32, n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= n) return;
+    const u: usize = @intCast(i);
+    const nm = beta * m[u] + g[u];
+    m[u] = nm;
+    x[u] = g[u] + beta * nm;
+}
+
+/// Sum of squares of a matrix, accumulated per block.
+export fn muon_sumsq(x: cuda.ConstGlobal(f32), out: cuda.Global(f32), n: i64) callconv(.nvptx_kernel) void {
+    const t = cuda.threadIdxX();
+    var s: f32 = 0;
+    var i: i64 = @as(i64, cuda.blockIdxX()) * 256 + @as(i64, t);
+    const stride: i64 = @as(i64, cuda.gridDimX()) * 256;
+    while (i < n) : (i += stride) s += x[@intCast(i)] * x[@intCast(i)];
+    ln_buf[t] = s;
+    cuda.syncThreads();
+    var half: u32 = 128;
+    while (half > 0) : (half >>= 1) {
+        if (t < half) ln_buf[t] += ln_buf[t + half];
+        cuda.syncThreads();
+    }
+    if (t == 0 and ln_buf[0] != 0) cuda.atomicAddF32(&out[0], ln_buf[0]);
+}
+
+/// The Newton-Schulz iteration starts from a matrix of unit Frobenius norm,
+/// and runs in bf16 because its matrix products go over the tensor cores.
+export fn muon_start(x: cuda.ConstGlobal(f32), sumsq: cuda.ConstGlobal(f32), xb: cuda.Global(bf16),
+                     n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= n) return;
+    xb[@intCast(i)] = cuda.f2bf(x[@intCast(i)] * cuda.frsqrt(sumsq[0] + 1e-12));
+}
+
+/// out = b*A + c*(A@A), the polynomial of one Newton-Schulz step.
+export fn muon_poly(A: cuda.ConstGlobal(bf16), AA: cuda.ConstGlobal(bf16), out: cuda.Global(bf16),
+                    b: f32, c: f32, n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= n) return;
+    out[@intCast(i)] = cuda.f2bf(b * cuda.bf2f(A[@intCast(i)]) + c * cuda.bf2f(AA[@intCast(i)]));
+}
+
+/// x = a*x + t, the other half of a Newton-Schulz step.
+export fn muon_blend(x: cuda.Global(bf16), t: cuda.ConstGlobal(bf16), a: f32, n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= n) return;
+    x[@intCast(i)] = cuda.f2bf(a * cuda.bf2f(x[@intCast(i)]) + cuda.bf2f(t[@intCast(i)]));
+}
+
+/// The weight step, with decoupled weight decay, plus the bf16 working copy.
+export fn muon_update(master: cuda.Global(f32), x: cuda.ConstGlobal(bf16), work: cuda.Global(bf16),
+                      lr: f32, scale: f32, wd: f32, n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= n) return;
+    const u: usize = @intCast(i);
+    const w = master[u] - lr * (scale * cuda.bf2f(x[u]) + wd * master[u]);
+    master[u] = w;
+    work[u] = cuda.f2bf(w);
+}
+
+// The fp32 -> bf16 conversion the Newton-Schulz products need is copy_bf16.

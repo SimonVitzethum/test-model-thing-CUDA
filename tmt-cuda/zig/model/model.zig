@@ -7,6 +7,7 @@ const params = @import("params.zig");
 const moe = @import("moe.zig");
 const mla = @import("mla.zig");
 const memory = @import("memory.zig");
+const muon = @import("muon.zig");
 
 pub const bf16 = u16;
 pub const Cfg = cfgmod.Cfg;
@@ -61,6 +62,11 @@ pub const Model = struct {
     tgt: usize = 0,
     dec: usize = 0,
     stop: usize = 0,
+    /// Multi-token prediction: one more decoder per extra byte of lookahead.
+    dec_mtp: []usize = &.{},
+    logits_mtp: [*]bf16 = undefined,
+    probs_mtp: [*]f32 = undefined,
+    nxt_mtp: [*]i32 = undefined,
     L: []Layer = &.{},
     ML: []MlaLayer = &.{},
     MW: mla.Ws = .{},
@@ -102,6 +108,10 @@ pub const Model = struct {
     /// Optional external gradient on the final representation (retrieval loss).
     dXext: ?[*]f32 = null,
     opt: MTParams = .{},
+    /// The weights Muon updates instead of AdamW, with its scratch.
+    muon_params: []usize = &.{},
+    muon_ws: muon.Ws = .{},
+    muon_x: [*]f32 = undefined,
 
     pub fn deinit(m: *Model) void {
         m.store.deinit();
@@ -109,6 +119,8 @@ pub const Model = struct {
         if (m.L.len != 0) m.gpa.free(m.L);
         if (m.ML.len != 0) m.gpa.free(m.ML);
         if (m.MEM.len != 0) m.gpa.free(m.MEM);
+        if (m.dec_mtp.len != 0) m.gpa.free(m.dec_mtp);
+        if (m.muon_params.len != 0) m.gpa.free(m.muon_params);
     }
 };
 
@@ -160,6 +172,14 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
     }
     m.stop = try m.store.add(@intCast(D));
     try initU(&m, &host, gpa, m.stop, -0.01, 0.01, &seed);
+    if (c.mtp > 0) { // the extra decoders start like the main one
+        m.dec_mtp = try gpa.alloc(usize, @intCast(c.mtp));
+        const a = params.sqrtf(1.0 / @as(f32, @floatFromInt(D)));
+        for (m.dec_mtp) |*p| {
+            p.* = try m.store.add(256 * @as(i64, c.dim));
+            try initU(&m, &host, gpa, p.*, -a, a, &seed);
+        }
+    }
 
     m.L = try gpa.alloc(Layer, nl);
     for (m.L) |*ly| ly.* = .{};
@@ -183,14 +203,14 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
         ly.beta = try m.store.add(@intCast(D));
         try gpu.zero(m.store.at(ly.beta).master, D * 4);
         try gpu.zero(m.store.at(ly.beta).work, D * 2);
-        ly.router = try m.store.add(@intCast(E * D));
+        ly.router = try m.store.add2d(@intCast(E), @intCast(D));
         try host.resize(gpa, E * D);
         params.hostNormal(host.items, 0.02, &seed);
         try gpu.upload(m.store.at(ly.router).master, std.mem.sliceAsBytes(host.items));
         try toWork(&m, ly.router);
         const a = params.sqrtf(1.0 / @as(f32, @floatFromInt(D)));
         for (0..E) |e| {
-            ly.exp[e] = try m.store.add(@intCast(D * D));
+            ly.exp[e] = try m.store.add2d(@intCast(D), @intCast(D));
             try initU(&m, &host, gpa, ly.exp[e], -a, a, &seed);
         }
         ly.S = try m.mem.allocT(f32, ND);
@@ -233,6 +253,12 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
     m.stoplog = try m.mem.allocT(bf16, N);
     m.dstop = try m.mem.allocT(bf16, N);
     m.probs = try m.mem.allocT(f32, N * 256);
+    if (c.mtp > 0) {
+        const heads: usize = @intCast(c.mtp);
+        m.logits_mtp = try m.mem.allocT(bf16, heads * N * 256);
+        m.probs_mtp = try m.mem.allocT(f32, heads * N * 256);
+        m.nxt_mtp = try m.mem.allocT(i32, heads * N);
+    }
     m.losstmp = try m.mem.allocT(f32, N);
     m.tgtX = try m.mem.allocT(bf16, ND);
     m.mv = try m.mem.allocT(f32, 2);
@@ -250,19 +276,19 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
         for (m.ML, 0..) |*ml, l| {
             ml.use = @rem(@as(i32, @intCast(l)), c.mla_every) == 0;
             if (!ml.use) continue;
-            ml.p.q = try m.store.add(@intCast(D * H * (dh + R)));
+            ml.p.q = try m.store.add2d(@intCast(H * (dh + R)), @intCast(D));
             try initU(&m, &host, gpa, ml.p.q, -a, a, &seed);
-            ml.p.dkv = try m.store.add(@intCast(D * Lr));
+            ml.p.dkv = try m.store.add2d(@intCast(Lr), @intCast(D));
             try initU(&m, &host, gpa, ml.p.dkv, -a, a, &seed);
-            ml.p.kr = try m.store.add(@intCast(D * R));
+            ml.p.kr = try m.store.add2d(@intCast(R), @intCast(D));
             try initU(&m, &host, gpa, ml.p.kr, -a, a, &seed);
             const b = params.sqrtf(1.0 / @as(f32, @floatFromInt(Lr)));
-            ml.p.uk = try m.store.add(@intCast(Lr * H * dh));
+            ml.p.uk = try m.store.add2d(@intCast(H * dh), @intCast(Lr));
             try initU(&m, &host, gpa, ml.p.uk, -b, b, &seed);
-            ml.p.uv = try m.store.add(@intCast(Lr * H * dh));
+            ml.p.uv = try m.store.add2d(@intCast(H * dh), @intCast(Lr));
             try initU(&m, &host, gpa, ml.p.uv, -b, b, &seed);
             const b2 = params.sqrtf(1.0 / @as(f32, @floatFromInt(H * dh)));
-            ml.p.o = try m.store.add(@intCast(H * dh * D));
+            ml.p.o = try m.store.add2d(@intCast(D), @intCast(H * dh));
             try initU(&m, &host, gpa, ml.p.o, -b2, b2, &seed);
             ml.p.gamma = try m.store.add(@intCast(D));
             try host.resize(gpa, D);
@@ -316,13 +342,13 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
             try gpu.upload(m.store.at(me.gamma).master, std.mem.sliceAsBytes(host.items));
             try toWork(&m, me.gamma);
             me.beta = try m.store.add(@intCast(D));
-            me.wq = try m.store.add(@intCast(HD * D));
+            me.wq = try m.store.add2d(@intCast(HD), @intCast(D));
             try initU(&m, &host, gpa, me.wq, -a, a, &seed);
-            me.wk = try m.store.add(@intCast(HD * D));
+            me.wk = try m.store.add2d(@intCast(HD), @intCast(D));
             try initU(&m, &host, gpa, me.wk, -a, a, &seed);
-            me.wv = try m.store.add(@intCast(HD * D));
+            me.wv = try m.store.add2d(@intCast(HD), @intCast(D));
             try initU(&m, &host, gpa, me.wv, -a, a, &seed);
-            me.wo = try m.store.add(@intCast(D * HD));
+            me.wo = try m.store.add2d(@intCast(D), @intCast(HD));
             for ([_]usize{ me.beta, me.wo }) |p| {
                 const n: usize = @intCast(m.store.at(p).n);
                 try gpu.zero(m.store.at(p).master, n * 4);
@@ -361,6 +387,7 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
             try initU(&m, &host, gpa, m.MS.rk, -r, r, &seed);
         }
     }
+    if (c.muon != 0) try collectMuon(&m);
     try buildOptTable(&m);
     try gpu.checkLaunch();
     return m;
@@ -377,6 +404,36 @@ extern fn cudaMemset(p: ?*anyopaque, value: c_int, n: usize) c_int;
 fn fill(m: *Model, p: *anyopaque, value: u8, bytes: usize) !void {
     _ = m;
     if (cudaMemset(p, value, bytes) != 0) return error.Cuda;
+}
+
+/// Muon orthogonalizes the hidden weight matrices; the embedding, the output
+/// head and every vector keep AdamW, as the published recipe prescribes.
+fn isMuonParam(m: *const Model, j: usize) bool {
+    if (m.c.muon == 0) return false;
+    if (j == m.emb or j == m.tgt or j == m.dec or j == m.stop) return false;
+    for (m.dec_mtp) |p| if (j == p) return false;
+    const p = m.store.at(j);
+    return p.rows > 1 and p.cols > 1;
+}
+
+fn collectMuon(m: *Model) !void {
+    var list: std.ArrayList(usize) = .empty;
+    errdefer list.deinit(m.gpa);
+    var rows: usize = 0;
+    var cols: usize = 0;
+    var widest: usize = 0;
+    for (0..m.store.values.items.len) |j| {
+        if (!isMuonParam(m, j)) continue;
+        try list.append(m.gpa, j);
+        const p = m.store.at(j);
+        rows = @max(rows, @as(usize, @intCast(p.rows)));
+        cols = @max(cols, @as(usize, @intCast(p.cols)));
+        widest = @max(widest, @as(usize, @intCast(p.n)));
+    }
+    m.muon_params = try list.toOwnedSlice(m.gpa);
+    if (m.muon_params.len == 0) return;
+    try m.muon_ws.alloc(&m.mem, rows, cols);
+    m.muon_x = try m.mem.allocT(f32, widest);
 }
 
 /// One chunk table over all parameters for the multi-tensor kernels. The norm
@@ -403,7 +460,9 @@ fn buildOptTable(m: *Model) !void {
         work[i] = @intFromPtr(p.work);
         const frozen = i == m.tgt;
         const unused_stop = i == m.stop and m.c.stop == 0;
-        flags[i] = (if (frozen) @as(u8, 0) else 1) | (if (frozen or unused_stop) @as(u8, 0) else 2);
+        // Muon weights still count towards the gradient norm, but AdamW skips them.
+        const adam = !frozen and !unused_stop and !isMuonParam(m, i);
+        flags[i] = (if (frozen) @as(u8, 0) else 1) | (if (adam) @as(u8, 2) else 0);
         var s: i64 = 0;
         while (s < p.n) : (s += MT_CHUNK) {
             try chunks.append(gpa, .{ .param = @intCast(i), .len = @intCast(@min(MT_CHUNK, p.n - s)), .start = s });
@@ -596,6 +655,19 @@ pub fn forwardWindow(m: *Model, s: *StreamState) !Losses {
     try (try k.get("ce_fwd")).launch(blocks(N), 256, .{ m.logits, m.nxt, m.probs, m.losstmp, @as(i32, @intCast(N)) });
     const ce_out = try hostSum(m.gpa, m.losstmp, N) / @as(f32, @floatFromInt(N));
 
+    // Multi-token prediction: the same representation predicts the bytes
+    // further ahead, which is extra signal per byte for a data-limited model.
+    var mtp_ce: f32 = 0;
+    for (m.dec_mtp, 0..) |p, head| {
+        const logits = m.logits_mtp + head * N * 256;
+        const probs = m.probs_mtp + head * N * 256;
+        const targets = m.nxt_mtp + head * N;
+        try linalg.linearFwd(@intCast(N), 256, c.dim, m.X, m.store.at(p).work, logits);
+        try (try k.get("ce_fwd")).launch(blocks(N), 256, .{ logits, targets, probs, m.losstmp, @as(i32, @intCast(N)) });
+        mtp_ce += try hostSum(m.gpa, m.losstmp, N) / @as(f32, @floatFromInt(N));
+    }
+    if (m.dec_mtp.len > 0) mtp_ce /= @floatFromInt(m.dec_mtp.len);
+
     // The optional terms each cost one host synchronization and only run when enabled.
     var stop_mean: f32 = 0;
     var var_loss: f32 = 0;
@@ -619,7 +691,7 @@ pub fn forwardWindow(m: *Model, s: *StreamState) !Losses {
         var_loss = @max(0.0, 1.0 - params.sqrtf(hmv[1] + 1e-4));
     }
     const total = c.@"var" * var_loss + c.latent * mse + c.ce * ce_out + c.stop * stop_mean +
-        (c.aux * aux_acc + c.zloss * z_acc) / @as(f32, @floatFromInt(m.L.len));
+        c.mtp_weight * mtp_ce + (c.aux * aux_acc + c.zloss * z_acc) / @as(f32, @floatFromInt(m.L.len));
     try gpu.checkLaunch();
     return .{ .total = total, .ce = ce_out };
 }
@@ -653,6 +725,16 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
     try linalg.linearDW(@intCast(N), 256, c.dim, m.dlogits, m.X, m.store.at(m.dec).grad, 0);
     try linalg.linearDX(@intCast(N), 256, c.dim, m.dlogits, m.store.at(m.dec).work, m.dXs, 0);
     try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dXres, nd_i64 });
+    for (m.dec_mtp, 0..) |p, head| {
+        const probs = m.probs_mtp + head * N * 256;
+        const targets = m.nxt_mtp + head * N;
+        const dlogits = m.logits_mtp + head * N * 256; // reused as the head's gradient
+        try (try k.get("ce_bwd")).launch(blocks(N), 256,
+            .{ probs, targets, dlogits, c.ce * c.mtp_weight, @as(i32, @intCast(N)) });
+        try linalg.linearDW(@intCast(N), 256, c.dim, dlogits, m.X, m.store.at(p).grad, 0);
+        try linalg.linearDX(@intCast(N), 256, c.dim, dlogits, m.store.at(p).work, m.dXs, 0);
+        try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dXres, nd_i64 });
+    }
     if (m.dXext) |ext| try (try k.get("add_f32")).launch(blocks(ND), 256, .{ m.dXres, ext, nd_i64 });
     if (c.stop > 0) {
         try (try k.get("stop_bwd")).launch(blocks(N), 256,
@@ -763,6 +845,10 @@ pub fn optimizerStep(m: *Model, step: i32) !void {
         m.opt, c.gradclip, lrAt(c, step), b1, b2, @as(f32, 1e-8), @as(f32, 0.01),
         1.0 - params.powf(b1, @floatFromInt(step + 1)), 1.0 - params.powf(b2, @floatFromInt(step + 1)),
     });
+    for (m.muon_params) |j| { // the same schedule shape, Muon's own size
+        const lr = c.muon_lr * lrAt(c, step) / c.lr;
+        try muon.step(k, &m.muon_ws, m.store.at(j), m.muon_x, lr, 0.01);
+    }
     const tgt = m.store.at(m.tgt);
     const n = blocks(@intCast(tgt.n));
     try (try k.get("ema")).launch(n, 256, .{ tgt.master, m.store.at(m.emb).master, c.ematau, tgt.n });

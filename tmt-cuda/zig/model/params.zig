@@ -15,6 +15,9 @@ pub const Par = struct {
     grad: [*]f32,
     work: [*]bf16,
     n: i64,
+    /// Shape as the weight is stored, (out, in); 1 x n for the vectors.
+    rows: i64 = 1,
+    cols: i64 = 0,
 };
 
 pub const Store = struct {
@@ -32,6 +35,13 @@ pub const Store = struct {
     pub fn at(s: *const Store, i: usize) Par {
         return s.values.items[i];
     }
+    /// A two-dimensional weight, which the Muon path can orthogonalize.
+    pub fn add2d(s: *Store, rows: i64, cols: i64) !usize {
+        const i = try s.add(rows * cols);
+        s.values.items[i].rows = rows;
+        s.values.items[i].cols = cols;
+        return i;
+    }
     /// A new parameter of n elements; moments and gradient start at zero.
     pub fn add(s: *Store, n: i64) !usize {
         if (n <= 0 or n > 2147483647) return error.ParameterTooLarge;
@@ -43,6 +53,7 @@ pub const Store = struct {
             .grad = try s.memory.callocT(f32, un),
             .work = try s.memory.allocT(bf16, un),
             .n = n,
+            .cols = n,
         };
         try s.values.append(s.gpa, p);
         return s.values.items.len - 1;

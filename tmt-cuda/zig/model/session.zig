@@ -49,6 +49,13 @@ pub const Session = struct {
         try model.reset(&s.state, s.m.c);
     }
 
+    /// Targets for the multi-token heads: `mtp * N` bytes, head k holding the
+    /// byte k+1 positions further ahead (negative where there is none).
+    pub fn setMtpTargets(s: *Session, targets: []const i32) !void {
+        if (s.m.c.mtp == 0) return;
+        try gpu.upload(s.m.nxt_mtp, std.mem.sliceAsBytes(targets));
+    }
+
     /// One window: ids, targets (negative ones are not scored) and the
     /// end-of-line flags for the stop head.
     pub fn forward(s: *Session, ids: []const i32, targets: []const i32, ends: []const i32) !model.Losses {

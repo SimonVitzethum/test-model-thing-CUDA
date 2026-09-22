@@ -172,10 +172,13 @@ fn run(init: std.process.Init, out: Out) !void {
     const per = size / B;
     if (!evaluation and (progress.cursor % T != 0 or progress.cursor > ((per - 1) / T) * T))
         return fail("invalid checkpoint dataset cursor", .{});
+    const mtp: usize = @intCast(cfgInt(text, "mtp"));
     const ids = try arena.alloc(c_int, N);
     const targets = try arena.alloc(c_int, N);
     const ends = try arena.alloc(c_int, N);
     const valid = try arena.alloc(bool, N);
+    // One target row per extra prediction head, k bytes further ahead.
+    const mtp_targets = try arena.alloc(c_int, mtp * N);
     const losses = try arena.alloc(f32, N);
     const use_acc = try arena.alloc(i64, @max(1, layers * experts)); // router balance (MoE collapse)
     @memset(use_acc, 0);
@@ -239,9 +242,15 @@ fn run(init: std.process.Init, out: Out) !void {
                     }
                 }
                 ends[i] = @intFromBool(targets[i] == 10);
+                for (0..mtp) |h| {
+                    const ahead = offset + 2 + h;
+                    const scored = valid[i] and ahead < end and targets[i] >= 0;
+                    mtp_targets[h * N + i] = if (scored) data.bytes[ahead] else -1;
+                }
                 count += @intFromBool(valid[i]);
             }
         }
+        sess.setMtpTargets(mtp_targets) catch return gpuFail();
         const window = sess.forward(ids, targets, ends) catch return gpuFail();
         const loss = window.total;
         const ce = window.ce;
