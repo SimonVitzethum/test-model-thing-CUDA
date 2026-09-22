@@ -294,6 +294,32 @@ int tmt_model_logits(tmt_model* h, float* out) {
         for (size_t i = 0; i < v.size(); ++i) out[i] = bf2f(v[i]);
     });
 }
+int tmt_dev_alloc(void** p, unsigned long n) { return guard([&] { CUDA_CHECK(cudaMalloc(p, n)); }); }
+int tmt_dev_free(void* p) { return guard([&] { CUDA_CHECK(cudaFree(p)); }); }
+int tmt_dev_upload(void* dst, const void* src, unsigned long n) {
+    return guard([&] { CUDA_CHECK(cudaMemcpy(dst, src, n, cudaMemcpyHostToDevice)); });
+}
+int tmt_dev_download(void* dst, const void* src, unsigned long n) {
+    return guard([&] { CUDA_CHECK(cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost)); });
+}
+int tmt_ref_emb_forward(const void* W, const int* ids, void* out, int N, int D) {
+    return guard([&] { emb_forward((const bf16*)W, ids, (bf16*)out, N, D); CUDA_CHECK(cudaDeviceSynchronize()); });
+}
+int tmt_ref_emb_backward(const float* dOut, const int* ids, float* dW, int N, int D) {
+    return guard([&] { emb_backward(dOut, ids, dW, N, D); CUDA_CHECK(cudaDeviceSynchronize()); });
+}
+int tmt_ref_add_f32(float* acc, const float* x, long n) {
+    return guard([&] {
+        add_f32_kernel<<<(n + 255) / 256, 256>>>(acc, x, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_copy_bf16(const float* src, void* dst, long n) {
+    return guard([&] {
+        copy_bf16_kernel<<<(n + 255) / 256, 256>>>(src, (bf16*)dst, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
 int tmt_synchronize(void) { return guard([&] { CUDA_CHECK(cudaDeviceSynchronize()); }); }
 
 static volatile sig_atomic_t stop_flag = 0;

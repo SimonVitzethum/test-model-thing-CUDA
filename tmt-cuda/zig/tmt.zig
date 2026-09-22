@@ -139,6 +139,14 @@ pub extern fn tmt_model_forward_mem(m: *Model, ids: [*]const c_int, targets: [*]
 pub extern fn tmt_model_backward_ext(m: *Model, dX: ?[*]const f32) c_int;
 pub extern fn tmt_model_read_rows(m: *Model, last: [*]const c_int, out: [*]f32) c_int;
 pub extern fn tmt_model_logits(m: *Model, out: [*]f32) c_int;
+pub extern fn tmt_dev_alloc(p: *?*anyopaque, n: c_ulong) c_int;
+pub extern fn tmt_dev_free(p: *anyopaque) c_int;
+pub extern fn tmt_dev_upload(dst: *anyopaque, src: *const anyopaque, n: c_ulong) c_int;
+pub extern fn tmt_dev_download(dst: *anyopaque, src: *const anyopaque, n: c_ulong) c_int;
+pub extern fn tmt_ref_emb_forward(W: *const anyopaque, ids: [*]const c_int, out: *anyopaque, N: c_int, D: c_int) c_int;
+pub extern fn tmt_ref_emb_backward(dOut: [*]const f32, ids: [*]const c_int, dW: [*]f32, N: c_int, D: c_int) c_int;
+pub extern fn tmt_ref_add_f32(acc: [*]f32, x: [*]const f32, n: c_long) c_int;
+pub extern fn tmt_ref_copy_bf16(src: [*]const f32, dst: *anyopaque, n: c_long) c_int;
 pub extern fn tmt_synchronize() c_int;
 pub extern fn tmt_install_stop_handler() void;
 pub extern fn tmt_stop_requested() c_int;

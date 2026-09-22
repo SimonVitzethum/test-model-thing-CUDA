@@ -48,6 +48,7 @@ check: architecture_test train sample chat gradcheck dialogprep kgtrain kgprep
 check-zig: all
 	zig build
 	zig build test
+	./zig-out/bin/ktest
 	sh tests/zig.sh
 
 clean:

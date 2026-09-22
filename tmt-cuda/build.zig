@@ -28,6 +28,38 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "capi.cu", "capi.h", "generate.h", "checkpoint.h", "model.cu", "train.cu", "config.h", "cell.cu", "moe.cu", "mla.cu", "memory.cu", "norm.cu", "linalg.cu", "emb.cu", "loss.cu", "adam.cu", "util.h", "common.h" }) |f|
         nvcc.addFileInput(b.path(b.pathJoin(&.{ "src", f })));
 
+    // The kernels in Zig: nvptx64 IR -> patch -> link libdevice -> PTX.
+    // The host loads the PTX through the CUDA driver API (see zig/ptx.zig).
+    const irpatch = b.addExecutable(.{ .name = "irpatch", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tools/irpatch.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    const emit_ir = b.addSystemCommand(&.{ b.graph.zig_exe, "build-obj", "-target", "nvptx64-cuda", "-mcpu", arch, "-OReleaseFast", "-fstrip", "-fno-emit-bin" });
+    const raw_ir = emit_ir.addPrefixedOutputFileArg("-femit-llvm-ir=", "kernels.ll");
+    emit_ir.addFileArg(b.path("zig/kernels/kernels.zig"));
+    emit_ir.addFileInput(b.path("zig/kernels/cuda.zig"));
+    const patch = b.addRunArtifact(irpatch);
+    patch.addFileArg(raw_ir);
+    const patched_ir = patch.addOutputFileArg("kernels-patched.ll");
+    const kernel_names = patch.addOutputFileArg("kernels.txt");
+    patch.addArg("--ftz"); // nvcc builds the C++ kernels with --use_fast_math
+    const link = b.addSystemCommand(&.{"llvm-link"});
+    link.addFileArg(patched_ir);
+    link.addFileArg(.{ .cwd_relative = b.pathJoin(&.{ cuda, "nvvm", "libdevice", "libdevice.10.bc" }) });
+    link.addArg("-o");
+    const linked = link.addOutputFileArg("kernels-linked.bc");
+    const optimize_bc = b.addSystemCommand(&.{ "opt", "-passes=nvvm-reflect,internalize,globaldce,default<O3>" });
+    optimize_bc.addPrefixedFileArg("-internalize-public-api-file=", kernel_names);
+    optimize_bc.addFileArg(linked);
+    optimize_bc.addArg("-o");
+    const optimized = optimize_bc.addOutputFileArg("kernels-opt.bc");
+    const llc = b.addSystemCommand(&.{ "llc", "-march=nvptx64", b.fmt("-mcpu={s}", .{arch}) });
+    llc.addFileArg(optimized);
+    llc.addArg("-o");
+    const ptx = llc.addOutputFileArg("kernels.ptx");
+    b.getInstallStep().dependOn(&b.addInstallFile(ptx, "kernels.ptx").step);
+
     const Tool = struct { name: []const u8, cuda: bool };
     const tools = [_]Tool{
         .{ .name = "dialogprep", .cuda = false },
@@ -37,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "train", .cuda = true },
         .{ .name = "gradcheck", .cuda = true },
         .{ .name = "kgtrain", .cuda = true },
+        .{ .name = "ktest", .cuda = true },
     };
     for (tools) |t| {
         const mod = b.createModule(.{
@@ -53,6 +86,10 @@ pub fn build(b: *std.Build) void {
             mod.linkSystemLibrary("cublas", .{});
             mod.addObjectFile(.{ .cwd_relative = libstdcxx });
             mod.addObjectFile(.{ .cwd_relative = libgcc });
+        }
+        if (std.mem.eql(u8, t.name, "ktest")) {
+            mod.addAnonymousImport("kernels.ptx", .{ .root_source_file = ptx });
+            mod.linkSystemLibrary("cuda", .{});
         }
         const exe = b.addExecutable(.{ .name = t.name, .root_module = mod });
         b.installArtifact(exe);

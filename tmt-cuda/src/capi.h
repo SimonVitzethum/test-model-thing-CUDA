@@ -79,6 +79,15 @@ int tmt_model_backward_ext(tmt_model* m, const float* dX);
 int tmt_model_read_rows(tmt_model* m, const int* last, float* out /* batch*dim */);
 /* Logits of the last forward as float (batch*seqlen*256). */
 int tmt_model_logits(tmt_model* m, float* out);
+/* ---- device memory and reference kernels, for the Zig kernel tests ---- */
+int tmt_dev_alloc(void** p, unsigned long n);
+int tmt_dev_free(void* p);
+int tmt_dev_upload(void* dst, const void* src, unsigned long n);
+int tmt_dev_download(void* dst, const void* src, unsigned long n);
+int tmt_ref_emb_forward(const void* W, const int* ids, void* out, int N, int D);
+int tmt_ref_emb_backward(const float* dOut, const int* ids, float* dW, int N, int D);
+int tmt_ref_add_f32(float* acc, const float* x, long n);
+int tmt_ref_copy_bf16(const float* src, void* dst, long n);
 int tmt_synchronize(void);
 
 /* SIGINT/SIGTERM set a flag instead of terminating. */
