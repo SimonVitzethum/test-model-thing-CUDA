@@ -10,3 +10,5 @@
 /dialogprep
 /kgprep
 /kgtrain
+/zig-out/
+/.zig-cache/
