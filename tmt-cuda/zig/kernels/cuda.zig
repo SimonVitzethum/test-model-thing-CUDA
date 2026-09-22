@@ -61,6 +61,10 @@ pub inline fn f2bf(x: f32) bf16 {
 // ---- math (libdevice, the same functions nvcc calls for expf and friends) ----
 pub extern fn __nv_expf(x: f32) f32;
 pub extern fn __nv_logf(x: f32) f32;
+/// What nvcc's --use_fast_math turns expf/logf into: a multiply plus
+/// ex2.approx.ftz / lg2.approx.ftz.
+pub extern fn __nv_fast_expf(x: f32) f32;
+pub extern fn __nv_fast_logf(x: f32) f32;
 pub extern fn __nv_powf(x: f32, y: f32) f32;
 pub extern fn __nv_rsqrtf(x: f32) f32;
 pub extern fn __nv_fmaxf(x: f32, y: f32) f32;
@@ -68,8 +72,28 @@ pub extern fn __nv_fminf(x: f32, y: f32) f32;
 pub extern fn __nv_fabsf(x: f32) f32;
 pub extern fn __nv_tanhf(x: f32) f32;
 
+// nvcc builds the C++ kernels with --use_fast_math, which turns every float
+// division, sqrt and rsqrt into the approximate flush-to-zero instruction.
+// Zig's `/` and `@sqrt` are correctly rounded, so the kernels use these
+// helpers wherever the C++ source writes `/`, `sqrtf` or `rsqrtf`.
+pub inline fn fdiv(a: f32, b: f32) f32 {
+    return asm ("div.approx.ftz.f32 %[r], %[x], %[y];"
+        : [r] "=f" (-> f32),
+        : [x] "f" (a), [y] "f" (b));
+}
+pub inline fn fsqrt(a: f32) f32 {
+    return asm ("sqrt.approx.ftz.f32 %[r], %[x];"
+        : [r] "=f" (-> f32),
+        : [x] "f" (a));
+}
+pub inline fn frsqrt(a: f32) f32 {
+    return asm ("rsqrt.approx.ftz.f32 %[r], %[x];"
+        : [r] "=f" (-> f32),
+        : [x] "f" (a));
+}
+
 pub inline fn sigmoid(x: f32) f32 {
-    return 1.0 / (1.0 + __nv_expf(-x));
+    return fdiv(1.0, 1.0 + __nv_fast_expf(-x));
 }
 pub inline fn silu(x: f32) f32 {
     return x * sigmoid(x);
@@ -94,3 +118,5 @@ pub inline fn atomicAddF32(p: *addrspace(.global) f32, v: f32) void {
 pub inline fn atomicAddI32(p: *addrspace(.global) i32, v: i32) i32 {
     return @atomicRmw(i32, p, .Add, v, .monotonic);
 }
+
+pub extern fn __nv_log1pf(x: f32) f32;

@@ -314,6 +314,51 @@ int tmt_ref_add_f32(float* acc, const float* x, long n) {
         CUDA_CHECK(cudaDeviceSynchronize());
     });
 }
+int tmt_ref_ln_fwd(const void* X, const float* gamma, const float* beta, void* Y,
+                   float* mean, float* rstd, int N, int D) {
+    return guard([&] {
+        ln_fwd_kernel<<<N, 256>>>((const bf16*)X, gamma, beta, (bf16*)Y, mean, rstd, N, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_ln_bwd(const void* X, const void* dY, const float* gamma, const float* mean,
+                   const float* rstd, void* dX, float* dGamma, float* dBeta, int N, int D) {
+    return guard([&] {
+        ln_bwd_kernel<<<N, 256>>>((const bf16*)X, (const bf16*)dY, gamma, mean, rstd,
+                                  (bf16*)dX, dGamma, dBeta, N, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_ce_fwd(const void* logits, const int* tgt, float* probs, float* loss, int N) {
+    return guard([&] {
+        ce_fwd_kernel<<<(N + 255) / 256, 256>>>((const bf16*)logits, tgt, probs, loss, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_ce_bwd(const float* probs, const int* tgt, void* dLogits, float w, int N) {
+    return guard([&] {
+        ce_bwd_kernel<<<(N + 255) / 256, 256>>>(probs, tgt, (bf16*)dLogits, w, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_stop_fwd(const void* s, const int* end, float* loss, float pos_w, int N) {
+    return guard([&] {
+        stop_fwd_kernel<<<(N + 255) / 256, 256>>>((const bf16*)s, end, loss, pos_w, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_stop_bwd(const void* s, const int* end, void* ds, float pos_w, float w, int N) {
+    return guard([&] {
+        stop_bwd_kernel<<<(N + 255) / 256, 256>>>((const bf16*)s, end, (bf16*)ds, pos_w, w, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_cast_add(const void* s, float* d, long n) {
+    return guard([&] {
+        cast_add_kernel<<<(n + 255) / 256, 256>>>((const bf16*)s, d, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
 int tmt_ref_copy_bf16(const float* src, void* dst, long n) {
     return guard([&] {
         copy_bf16_kernel<<<(n + 255) / 256, 256>>>(src, (bf16*)dst, n);

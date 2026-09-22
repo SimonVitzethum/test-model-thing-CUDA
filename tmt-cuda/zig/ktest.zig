@@ -161,6 +161,165 @@ pub fn main(init: std.process.Init) !u8 {
         report("emb_scatter", cross <= @max(self_diff * 4, 1e-6), detail);
     }
 
+    // ---- cross entropy (the first kernels with expf and division) ----
+    {
+        const R = 512; // positions
+        const d_log = try Dev.alloc(R * 256 * 2);
+        const d_probs = try Dev.alloc(R * 256 * 4);
+        const d_loss = try Dev.alloc(R * 4);
+        const d_dlog = try Dev.alloc(R * 256 * 2);
+        const logits = try gpa.alloc(f32, R * 256);
+        fill(logits, 31);
+        for (logits) |*v| v.* *= 8; // a realistic logit range
+        const d_logf32 = try Dev.alloc(R * 256 * 4);
+        try Dev.up(d_logf32, bytesOf(f32, logits));
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_logf32)), d_log, R * 256) != 0) return error.Ref;
+        const tgt = try gpa.alloc(i32, R);
+        fillIds(tgt, 37, -1, 256); // -1 occurs and must be ignored
+        const d_tgt = try Dev.alloc(R * 4);
+        try Dev.up(d_tgt, bytesOf(i32, tgt));
+
+        const ref_p = try gpa.alloc(f32, R * 256);
+        const ref_l = try gpa.alloc(f32, R);
+        if (tmt.tmt_ref_ce_fwd(d_log, @ptrCast(@alignCast(d_tgt)), @ptrCast(@alignCast(d_probs)), @ptrCast(@alignCast(d_loss)), R) != 0) return error.Ref;
+        try Dev.down(bytesOf(f32, ref_p), d_probs);
+        try Dev.down(bytesOf(f32, ref_l), d_loss);
+        const kf = try mod.get("ce_fwd");
+        try kf.launch((R + 255) / 256, 256, .{ d_log, d_tgt, d_probs, d_loss, @as(i32, R) });
+        const my_p = try gpa.alloc(f32, R * 256);
+        const my_l = try gpa.alloc(f32, R);
+        try Dev.down(bytesOf(f32, my_p), d_probs);
+        try Dev.down(bytesOf(f32, my_l), d_loss);
+        var pdiff: f32 = 0;
+        var ldiff: f32 = 0;
+        var npdiff: usize = 0;
+        for (ref_p, my_p) |v, w| {
+            if (v != w) npdiff += 1;
+            pdiff = @max(pdiff, @abs(v - w));
+        }
+        for (ref_l, my_l) |v, w| ldiff = @max(ldiff, @abs(v - w));
+        // The probabilities carry the gradient and must be identical; the
+        // reported loss is a scalar and ends up one unit in the last place
+        // apart, because nvcc computes log(se) + mx in a different register
+        // order than LLVM does.
+        var cbuf: [160]u8 = undefined;
+        const cdetail = std.fmt.bufPrint(&cbuf, "probs identical, loss within {e:.1} (1 ulp)", .{ldiff}) catch "";
+        report("ce_fwd", npdiff == 0 and pdiff == 0 and ldiff < 1e-5, cdetail);
+
+        const ref_d = try gpa.alloc(u16, R * 256);
+        const my_d = try gpa.alloc(u16, R * 256);
+        if (tmt.tmt_ref_ce_bwd(@ptrCast(@alignCast(d_probs)), @ptrCast(@alignCast(d_tgt)), d_dlog, 1.5, R) != 0) return error.Ref;
+        try Dev.down(bytesOf(u16, ref_d), d_dlog);
+        const kb = try mod.get("ce_bwd");
+        try kb.launch((R + 255) / 256, 256, .{ d_probs, d_tgt, d_dlog, @as(f32, 1.5), @as(i32, R) });
+        try Dev.down(bytesOf(u16, my_d), d_dlog);
+        report("ce_bwd", std.mem.eql(u16, ref_d, my_d), "");
+
+        // stop head: BCE with pos_weight
+        const d_end = try Dev.alloc(R * 4);
+        const ends = try gpa.alloc(i32, R);
+        fillIds(ends, 41, 0, 2);
+        try Dev.up(d_end, bytesOf(i32, ends));
+        const d_sb = try Dev.alloc(R * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_logf32)), d_sb, R) != 0) return error.Ref;
+        if (tmt.tmt_ref_stop_fwd(d_sb, @ptrCast(@alignCast(d_end)), @ptrCast(@alignCast(d_loss)), 20, R) != 0) return error.Ref;
+        try Dev.down(bytesOf(f32, ref_l), d_loss);
+        const ks = try mod.get("stop_fwd");
+        try ks.launch((R + 255) / 256, 256, .{ d_sb, d_end, d_loss, @as(f32, 20), @as(i32, R) });
+        try Dev.down(bytesOf(f32, my_l), d_loss);
+        const d_ds = try Dev.alloc(R * 2);
+        const ref_s = try gpa.alloc(u16, R);
+        const my_s = try gpa.alloc(u16, R);
+        if (tmt.tmt_ref_stop_bwd(d_sb, @ptrCast(@alignCast(d_end)), d_ds, 20, 0.7, R) != 0) return error.Ref;
+        try Dev.down(bytesOf(u16, ref_s), d_ds);
+        const ksb = try mod.get("stop_bwd");
+        try ksb.launch((R + 255) / 256, 256, .{ d_sb, d_end, d_ds, @as(f32, 20), @as(f32, 0.7), @as(i32, R) });
+        try Dev.down(bytesOf(u16, my_s), d_ds);
+        report("stop_fwd/stop_bwd", std.mem.eql(f32, ref_l, my_l) and std.mem.eql(u16, ref_s, my_s), "");
+
+        // bf16 gradient -> fp32 accumulation
+        try Dev.up(d_acc, bytesOf(f32, a));
+        if (tmt.tmt_ref_cast_add(d_log, @ptrCast(@alignCast(d_acc)), R * 256) != 0) return error.Ref;
+        try Dev.down(bytesOf(f32, want[0 .. R * 256]), d_acc);
+        try Dev.up(d_acc, bytesOf(f32, a));
+        const kc = try mod.get("cast_add");
+        try kc.launch((R * 256 + 255) / 256, 256, .{ d_log, d_acc, @as(i64, R * 256) });
+        try Dev.down(bytesOf(f32, got[0 .. R * 256]), d_acc);
+        report("cast_add", std.mem.eql(f32, want[0 .. R * 256], got[0 .. R * 256]), "");
+    }
+
+    // ---- LayerNorm ----
+    {
+        const R = 64; // rows
+        const gamma = try gpa.alloc(f32, D);
+        const beta = try gpa.alloc(f32, D);
+        fill(gamma, 23);
+        fill(beta, 29);
+        for (gamma) |*g| g.* += 1;
+        const d_gamma = try Dev.alloc(D * 4);
+        const d_beta = try Dev.alloc(D * 4);
+        try Dev.up(d_gamma, bytesOf(f32, gamma));
+        try Dev.up(d_beta, bytesOf(f32, beta));
+        // bf16 input, produced by the (already compared) conversion kernel
+        const d_xb = try Dev.alloc(R * D * 2);
+        const d_dyb = try Dev.alloc(R * D * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_xb, R * D) != 0) return error.Ref;
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_acc)), d_dyb, R * D) != 0) return error.Ref;
+        try Dev.up(d_acc, bytesOf(f32, a));
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_acc)), d_dyb, R * D) != 0) return error.Ref;
+        const d_y = try Dev.alloc(R * D * 2);
+        const d_mean = try Dev.alloc(R * 4);
+        const d_rstd = try Dev.alloc(R * 4);
+        const ref_y = try gpa.alloc(u16, R * D);
+        const ref_ms = try gpa.alloc(f32, 2 * R);
+        if (tmt.tmt_ref_ln_fwd(d_xb, @ptrCast(@alignCast(d_gamma)), @ptrCast(@alignCast(d_beta)), d_y,
+                               @ptrCast(@alignCast(d_mean)), @ptrCast(@alignCast(d_rstd)), R, D) != 0) return error.Ref;
+        try Dev.down(bytesOf(u16, ref_y), d_y);
+        try Dev.down(bytesOf(f32, ref_ms[0..R]), d_mean);
+        try Dev.down(bytesOf(f32, ref_ms[R..]), d_rstd);
+        const k = try mod.get("ln_fwd");
+        try k.launch(R, 256, .{ d_xb, d_gamma, d_beta, d_y, d_mean, d_rstd, @as(i32, R), @as(i32, D) });
+        const my_y = try gpa.alloc(u16, R * D);
+        const my_ms = try gpa.alloc(f32, 2 * R);
+        try Dev.down(bytesOf(u16, my_y), d_y);
+        try Dev.down(bytesOf(f32, my_ms[0..R]), d_mean);
+        try Dev.down(bytesOf(f32, my_ms[R..]), d_rstd);
+        report("ln_fwd", std.mem.eql(u16, ref_y, my_y) and std.mem.eql(f32, ref_ms, my_ms), "");
+
+        // backward: dX bit for bit, dGamma/dBeta within the atomic spread
+        const zeroD = try gpa.alloc(f32, D);
+        @memset(zeroD, 0);
+        const d_dx = try Dev.alloc(R * D * 2);
+        const d_dg = try Dev.alloc(D * 4);
+        const d_db = try Dev.alloc(D * 4);
+        const ref_dx = try gpa.alloc(u16, R * D);
+        const ref_g = try gpa.alloc(f32, 2 * D);
+        const my_g = try gpa.alloc(f32, 2 * D);
+        try Dev.up(d_dg, bytesOf(f32, zeroD));
+        try Dev.up(d_db, bytesOf(f32, zeroD));
+        if (tmt.tmt_ref_ln_bwd(d_xb, d_dyb, @ptrCast(@alignCast(d_gamma)), @ptrCast(@alignCast(d_mean)),
+                               @ptrCast(@alignCast(d_rstd)), d_dx, @ptrCast(@alignCast(d_dg)),
+                               @ptrCast(@alignCast(d_db)), R, D) != 0) return error.Ref;
+        try Dev.down(bytesOf(u16, ref_dx), d_dx);
+        try Dev.down(bytesOf(f32, ref_g[0..D]), d_dg);
+        try Dev.down(bytesOf(f32, ref_g[D..]), d_db);
+        try Dev.up(d_dg, bytesOf(f32, zeroD));
+        try Dev.up(d_db, bytesOf(f32, zeroD));
+        const kb = try mod.get("ln_bwd");
+        try kb.launch(R, 256, .{ d_xb, d_dyb, d_gamma, d_mean, d_rstd, d_dx, d_dg, d_db, @as(i32, R), @as(i32, D) });
+        const my_dx = try gpa.alloc(u16, R * D);
+        try Dev.down(bytesOf(u16, my_dx), d_dx);
+        try Dev.down(bytesOf(f32, my_g[0..D]), d_dg);
+        try Dev.down(bytesOf(f32, my_g[D..]), d_db);
+        var scale: f32 = 1e-30;
+        for (ref_g) |v| scale = @max(scale, @abs(v));
+        var worst: f32 = 0;
+        for (ref_g, my_g) |v, w| worst = @max(worst, @abs(v - w) / scale);
+        var buf: [128]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "dGamma/dBeta difference {e:.1} (atomic order)", .{worst}) catch "";
+        report("ln_bwd", std.mem.eql(u16, ref_dx, my_dx) and worst < 1e-5, detail);
+    }
+
     if (failures == 0) say("ALL KERNEL COMPARISONS PASSED\n", .{});
     return if (failures == 0) 0 else 1;
 }

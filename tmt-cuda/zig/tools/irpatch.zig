@@ -68,6 +68,18 @@ pub fn main(init: std.process.Init) !u8 {
             if (std.mem.indexOf(u8, patched, old) != null)
                 patched = try std.mem.replaceOwned(u8, gpa, patched, old, new);
         }
+        // nvcc fuses a multiply and an add into one FMA (-fmad=true, its
+        // default); in LLVM that needs the `contract` flag per instruction.
+        inline for (.{ "fadd", "fsub", "fmul" }) |op| {
+            const needle = " = " ++ op ++ " ";
+            if (std.mem.indexOf(u8, patched, needle) != null)
+                patched = try std.mem.replaceOwned(u8, gpa, patched, needle, " = " ++ op ++ " contract ");
+        }
+        // --use_fast_math also flushes denormals in plain float arithmetic
+        // (add.ftz.f32 instead of add.rn.f32); in LLVM that is a function
+        // attribute, not a module flag.
+        if (ftz and std.mem.startsWith(u8, patched, "attributes #") and std.mem.endsWith(u8, patched, "}"))
+            patched = try std.mem.concat(gpa, u8, &.{ patched[0 .. patched.len - 1], " \"denormal-fp-math-f32\"=\"preserve-sign,preserve-sign\" }" });
         try out.appendSlice(gpa, patched);
     }
     if (ftz) {

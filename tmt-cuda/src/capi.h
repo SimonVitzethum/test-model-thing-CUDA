@@ -86,7 +86,16 @@ int tmt_dev_upload(void* dst, const void* src, unsigned long n);
 int tmt_dev_download(void* dst, const void* src, unsigned long n);
 int tmt_ref_emb_forward(const void* W, const int* ids, void* out, int N, int D);
 int tmt_ref_emb_backward(const float* dOut, const int* ids, float* dW, int N, int D);
+int tmt_ref_ce_fwd(const void* logits, const int* tgt, float* probs, float* loss, int N);
+int tmt_ref_ce_bwd(const float* probs, const int* tgt, void* dLogits, float w, int N);
+int tmt_ref_stop_fwd(const void* s, const int* end, float* loss, float pos_w, int N);
+int tmt_ref_stop_bwd(const void* s, const int* end, void* ds, float pos_w, float w, int N);
+int tmt_ref_cast_add(const void* s, float* d, long n);
 int tmt_ref_add_f32(float* acc, const float* x, long n);
+int tmt_ref_ln_fwd(const void* X, const float* gamma, const float* beta, void* Y,
+                   float* mean, float* rstd, int N, int D);
+int tmt_ref_ln_bwd(const void* X, const void* dY, const float* gamma, const float* mean,
+                   const float* rstd, void* dX, float* dGamma, float* dBeta, int N, int D);
 int tmt_ref_copy_bf16(const float* src, void* dst, long n);
 int tmt_synchronize(void);
 

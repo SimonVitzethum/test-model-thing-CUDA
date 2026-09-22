@@ -63,16 +63,16 @@ pub const Kernel = struct {
     /// Launch with `grid` blocks of `block` threads; `args` is a tuple of the
     /// kernel's arguments, in order.
     pub fn launch(k: Kernel, grid: u32, block: u32, args: anytype) Error!void {
+        // The driver copies each argument by the size in the kernel's
+        // signature, so it gets a pointer to the value itself.
         const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
+        comptime var types: [fields.len]type = undefined;
+        inline for (fields, 0..) |f, i| types[i] = f.type;
+        var copy: std.meta.Tuple(&types) = undefined; // runtime storage, no comptime fields
         var storage: [fields.len]?*anyopaque = undefined;
-        var values: [fields.len]u64 = undefined;
         inline for (fields, 0..) |f, i| {
-            values[i] = switch (@typeInfo(f.type)) {
-                .pointer => @intFromPtr(@field(args, f.name)),
-                .int => @as(u64, @bitCast(@as(i64, @field(args, f.name)))),
-                else => @compileError("kernel argument must be a pointer or an integer"),
-            };
-            storage[i] = @ptrCast(&values[i]);
+            copy[i] = @field(args, f.name);
+            storage[i] = @ptrCast(&copy[i]);
         }
         try check(cuLaunchKernel(k.f, grid, 1, 1, block, 1, 1, 0, null, &storage, null), "cuLaunchKernel");
         try check(cuCtxSynchronize(), "cuCtxSynchronize");

@@ -145,7 +145,14 @@ pub extern fn tmt_dev_upload(dst: *anyopaque, src: *const anyopaque, n: c_ulong)
 pub extern fn tmt_dev_download(dst: *anyopaque, src: *const anyopaque, n: c_ulong) c_int;
 pub extern fn tmt_ref_emb_forward(W: *const anyopaque, ids: [*]const c_int, out: *anyopaque, N: c_int, D: c_int) c_int;
 pub extern fn tmt_ref_emb_backward(dOut: [*]const f32, ids: [*]const c_int, dW: [*]f32, N: c_int, D: c_int) c_int;
+pub extern fn tmt_ref_ce_fwd(logits: *const anyopaque, tgt: [*]const c_int, probs: [*]f32, loss: [*]f32, N: c_int) c_int;
+pub extern fn tmt_ref_ce_bwd(probs: [*]const f32, tgt: [*]const c_int, dLogits: *anyopaque, w: f32, N: c_int) c_int;
+pub extern fn tmt_ref_stop_fwd(s: *const anyopaque, end: [*]const c_int, loss: [*]f32, pos_w: f32, N: c_int) c_int;
+pub extern fn tmt_ref_stop_bwd(s: *const anyopaque, end: [*]const c_int, ds: *anyopaque, pos_w: f32, w: f32, N: c_int) c_int;
+pub extern fn tmt_ref_cast_add(s: *const anyopaque, d: [*]f32, n: c_long) c_int;
 pub extern fn tmt_ref_add_f32(acc: [*]f32, x: [*]const f32, n: c_long) c_int;
+pub extern fn tmt_ref_ln_fwd(X: *const anyopaque, gamma: [*]const f32, beta: [*]const f32, Y: *anyopaque, mean: [*]f32, rstd: [*]f32, N: c_int, D: c_int) c_int;
+pub extern fn tmt_ref_ln_bwd(X: *const anyopaque, dY: *const anyopaque, gamma: [*]const f32, mean: [*]const f32, rstd: [*]const f32, dX: *anyopaque, dGamma: [*]f32, dBeta: [*]f32, N: c_int, D: c_int) c_int;
 pub extern fn tmt_ref_copy_bf16(src: [*]const f32, dst: *anyopaque, n: c_long) c_int;
 pub extern fn tmt_synchronize() c_int;
 pub extern fn tmt_install_stop_handler() void;
