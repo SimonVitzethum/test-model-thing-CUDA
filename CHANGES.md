@@ -58,3 +58,65 @@ MLX original (`main.py`), PyTorch port + MoE (`main_torch_moe.py`), both benchma
 ## 6. Open
 
 Prod memory math (12 GB cache vs. 16 GB VRAM), sampler extensions, FP8 only after measurement, CUTLASS grouped GEMM + CUDA graphs for the last ~20 points, 128k proof in a long run, Wikipedia-10B, Fisch deploy (tunnel flaky: `ki-pc` intermittently silent).
+
+## 7. Apple Silicon: Zig + MLX port (`tmt-mlx/`)
+
+The CUDA project was ported to a second backend that runs on Apple Silicon and
+still needs no Python: **Zig 0.16 against the MLX C API**, with Metal kernels
+for the recurrence. Architecture, CLI, defaults, diagnostics, losses,
+optimizer, checkpoint format and the whole test suite are the same.
+
+- **Shared forward path, MLX autodiff.** The forward pass is one pure function
+  of arrays; training differentiates it with `mlx_value_and_grad`, evaluation
+  and generation call it directly. The hand-written CUDA backward passes for
+  MoE, MLA, LayerNorm and the losses become graph code; what CUDA derived by
+  hand (router aux/z gradients, MLA chunk backward with recompute) is now
+  autodiff, checked by the ported finite-difference and FP64-reference tests.
+- **The recurrence stays hand-written.** A Metal kernel walks the window per
+  (stream, channel) as in CUDA; its exact backward also produces
+  λ = dL/d(carry), which the hybrid traces need, and is attached with
+  `mlx_custom_vjp`. Trace advance and the embedding trace are two more kernels.
+- **Determinism over atomics.** The embedding gradient is a one-hot matmul and
+  MoE dispatch sorts its rows, so both backward paths are segment-based instead
+  of atomic scatter-adds; otherwise two identical runs would disagree and the
+  resume tests could not hold.
+- **No host synchronization for MoE dispatch.** Counts and offsets stay on the
+  device (`gather_mm`), where the CUDA build read the histogram back per layer.
+- **Checkpoints are shared.** V3 is written byte for byte as before. Verified
+  on this machine against the CUDA sources: the configuration header
+  (including `%.9g` formatting) is identical, and weight initialization from a
+  given seed is bit-identical (same LCG, order, and fused multiply-add). A
+  CUDA-written file has not been loaded end to end here (no NVIDIA GPU).
+- **Numerics.** Working precision is bf16 with fp32 masters as before;
+  attention scores are fp32 (MLX has no cuBLAS dtype rule), while weight
+  gradients come out of the matmul VJP in working precision instead of fp32.
+  `TMT_COMPUTE=f32` runs the whole forward in fp32.
+- **Measured (Apple M2, 10-core GPU):** 107k bytes/s for `dim=256 layers=4`,
+  37k for `dim=512 layers=8` (50k at batch 32 × 256), 11k with 8 experts,
+  7k with MLA and a 4096-byte cache. `bench` reports ~77 GB/s and ~2.2 TFLOPS
+  bf16 on the same machine, which is where these numbers come from.
+- **Not ported:** the CUDA-specific `profile` and `roofline` tools (their role
+  is covered by `bench`) and `TMT_CUDA_WAIT`.
+
+### Apple-Silicon tuning (same session)
+
+Measured, then fixed in this order; throughput at `dim=512 layers=8`, batch
+8 × 128 went from 37k to 62k bytes/s, with 8 experts from 11k to 21k, and the
+default `dim=256 layers=4` from 107k to 173k.
+
+- **Compiled window graph.** `mx.compile` over the gradient function (not just
+  the forward, which leaves the backward unfused) is worth ~20% of the step.
+  Compiled plans freeze whatever they capture, so the MLA cache, the traces and
+  the RoPE tables became explicit inputs of the window function.
+- **Compiled AdamW** over all parameters at once: 6.4 → 2.5 ms dense,
+  34 → 10 ms with 8 experts. The CUDA build had hit the same wall (the
+  optimizer was 35% of its step) and solved it with a multi-tensor kernel.
+- **Recurrence scan split over time.** The kernel measured 10 GB/s at 4k chains
+  but 75 GB/s at 256k: short windows starve this GPU. Splitting the scan into
+  time chunks that are coupled through threadgroup memory made the kernel
+  1.5–1.9× faster in isolation; it is enabled by the window shape.
+- **FP32 working copies instead of BF16.** Apple GPUs have no BF16 matmul
+  units (2.10 TFLOPS BF16 vs 2.23 FP32 vs 2.57 FP16 on an M2), so the CUDA
+  working precision is the slow one here. FP32 is now the default and is also
+  the more accurate; `TMT_COMPUTE=bf16` keeps CUDA numerics and half the
+  activation memory.

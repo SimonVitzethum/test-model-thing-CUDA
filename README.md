@@ -1,10 +1,11 @@
-# Test-Model-Thing (TMT) — CUDA
+# Test-Model-Thing (TMT) — CUDA and MLX
 
 [YouTube Video (original MLX proof of concept)](https://youtu.be/9UERVVwpNew)
 
-This is a small byte-level language model (not an LLM), now developed as a pure
-CUDA C++ project. It started as an MLX proof of concept and keeps its core ideas
-while reworking the architecture, training, and infrastructure:
+This is a small byte-level language model (not an LLM), developed as a pure
+CUDA project and ported to Apple Silicon as a pure Zig + MLX project. It
+started as an MLX proof of concept and keeps its core ideas while reworking the
+architecture, training, and infrastructure:
 
 * Byte input/output (no tokenizer)
 * Gated hierarchical recurrence with geometrically staggered half-lives
@@ -15,10 +16,19 @@ while reworking the architecture, training, and infrastructure:
 * Continuous data streaming with explicit, checkpointed stream state
 * Knowledge-graph fact memory from Wikidata (`mem=1`, stage 1: cross-attention over retrieved facts)
 
-Everything lives in [`tmt-cuda/`](tmt-cuda/README.md). The original MLX and PyTorch
-prototypes have been removed; their checkpoints and results are not comparable to
-the CUDA model. See [CHANGES.md](CHANGES.md) for a detailed comparison with the
-original TMT.
+There are two implementations of the same model:
+
+| Directory | Stack | Hardware |
+|---|---|---|
+| [`tmt-cuda/`](tmt-cuda/README.md) | CUDA kernels, cuBLAS, host programs in Zig 0.16 (C++ still builds), no Python | Linux + NVIDIA GPU with BF16 |
+| [`tmt-mlx/`](tmt-mlx/README.md) | Zig 0.16 + MLX (C API), Metal kernels, no Python | macOS on Apple Silicon |
+
+Both share the architecture, the CLI, the defaults, the tests and the V3
+checkpoint format; the MLX build initializes bit-identically from the same seed.
+The knowledge-graph fact memory (`mem=1`) exists only in the CUDA build so far.
+The original Python MLX and PyTorch prototypes are gone; their checkpoints and
+results are not comparable. See [CHANGES.md](CHANGES.md) for a detailed
+comparison with the original TMT.
 
 Feel free to fork the code (everything is under MIT). Issues and pull requests
 are very welcome. If you have compute lying around, training larger models for
@@ -49,9 +59,9 @@ More numbers (kernel efficiency, roofline) are in [CHANGES.md](CHANGES.md).
 
 ## Training your own model
 
-Model weights are not provided. You can build and train your own model with
-Linux, an NVIDIA GPU with BF16 support, CUDA/cuBLAS, and a C++17 compiler. No
-Python is needed.
+Model weights are not provided. You can build and train your own model either
+with Linux, an NVIDIA GPU with BF16 support and CUDA/cuBLAS, or with an Apple
+Silicon Mac, Zig 0.16 and MLX. No Python is needed for either.
 
 ```sh
 cd tmt-cuda
@@ -60,6 +70,15 @@ make check    # native numeric and integration tests (requires a GPU)
 
 # other GPUs, e.g. Ada:
 make clean && make ARCH='-gencode arch=compute_89,code=sm_89'
+# or the same programs in Zig (kernels still compiled by nvcc):
+zig build           # -> zig-out/bin/
+```
+
+```sh
+cd tmt-mlx
+zig build            # MLX + mlx-c expected under ~/.local/mlx
+zig build check      # the same numeric and integration tests
+# the executables then live in ./zig-out/bin/
 ```
 
 The training data is a raw byte file. Train, resume, evaluate, and sample:
@@ -93,8 +112,10 @@ checkpoint. Checkpoints (format V3) contain the configuration, weights, optimize
 state, data position, and stream state, so resumed runs are reproducible. The last
 output line of a run is a JSON object with `ce`, `bpb`, and throughput.
 
-All options, defaults, and details are documented in the
-[tmt-cuda README](tmt-cuda/README.md).
+The MLX build takes exactly the same arguments; only the paths differ
+(`./zig-out/bin/train ...`). All options, defaults, and details are documented
+in the [tmt-cuda README](tmt-cuda/README.md) and the
+[tmt-mlx README](tmt-mlx/README.md).
 
 ## Architecture
 
