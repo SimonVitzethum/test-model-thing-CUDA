@@ -2,7 +2,13 @@
 //! Compares windowed gradients against the exact BPTT gradient of whole
 //! sequences (port of src/gradcheck.cu). Nothing is trained or written.
 const std = @import("std");
-const tmt = @import("tmt.zig");
+const config = @import("model/config.zig");
+const checkpoint = @import("model/checkpoint.zig");
+const session = @import("model/session.zig");
+const gpu = @import("model/gpu.zig");
+
+const kernels_ptx = @embedFile("kernels.ptx");
+extern "c" fn snprintf(buf: [*]u8, size: usize, fmt: [*:0]const u8, ...) c_int;
 
 const Fatal = error{Fatal};
 
@@ -10,7 +16,7 @@ const Out = struct {
     w: *std.Io.Writer,
     fn print(o: Out, comptime fmt: [:0]const u8, args: anytype) !void {
         var buf: [1024]u8 = undefined;
-        const n = @call(.auto, tmt.snprintf, .{ &buf, buf.len, fmt.ptr } ++ args);
+        const n = @call(.auto, snprintf, .{ &buf, buf.len, fmt.ptr } ++ args);
         try o.w.writeAll(buf[0..@intCast(@min(n, buf.len - 1))]);
         if (fmt[fmt.len - 1] == '\n') try o.w.flush();
     }
@@ -23,8 +29,14 @@ fn fail(comptime fmt: []const u8, args: anytype) Fatal {
     err_len = s.len;
     return error.Fatal;
 }
-fn api(rc: c_int) Fatal!void {
-    if (rc != 0) return fail("{s}", .{tmt.lastError()});
+fn cfgFail() Fatal {
+    return fail("{s}", .{config.lastError()});
+}
+fn ckptFail() Fatal {
+    return fail("{s}", .{checkpoint.lastError()});
+}
+fn gpuFail() Fatal {
+    return fail("{s}", .{gpu.lastError()});
 }
 
 /// Gradients of one configuration, accumulated over all windows, plus the
@@ -35,24 +47,24 @@ const Run = struct {
     ce_mean: f64,
 };
 
-fn run_cfg(gpa: std.mem.Allocator, cfg: *const tmt.Cfg, ckpt: [:0]const u8, data: []const u8,
-           starts: []const usize, len: usize, keep_groups: bool) !Run {
-    const model = tmt.tmt_model_new(cfg) orelse return fail("{s}", .{tmt.lastError()});
-    defer tmt.tmt_model_free(model);
-    try api(tmt.tmt_model_load_weights(model, ckpt.ptr));
-    const text = std.mem.span(tmt.tmt_cfg_text(@constCast(cfg)));
-    const B: usize = @intCast(std.fmt.parseInt(i64, tmt.configValue(text, "batch").?, 10) catch 0);
-    const T: usize = @intCast(std.fmt.parseInt(i64, tmt.configValue(text, "seqlen").?, 10) catch 0);
+fn run_cfg(gpa: std.mem.Allocator, io: std.Io, cfg: config.Cfg, ckpt: []const u8, file_cfg: config.Cfg,
+           data: []const u8, starts: []const usize, len: usize, keep_groups: bool) !Run {
+    var sess = session.Session.init(gpa, io, cfg, kernels_ptx) catch return gpuFail();
+    sess.attach();
+    defer sess.deinit();
+    checkpoint.loadWeights(gpa, io, ckpt, &sess.m, file_cfg) catch return ckptFail();
+    const B: usize = @intCast(cfg.batch);
+    const T: usize = @intCast(cfg.seqlen);
     const N = B * T;
 
-    const np: usize = @intCast(tmt.tmt_model_param_count(model));
+    const np: usize = sess.paramCount();
     const acc = try gpa.alloc([]f32, np);
     const groups = try gpa.alloc([]const u8, np);
     for (acc, groups, 0..) |*a, *g, j| {
-        const n: usize = @intCast(tmt.tmt_model_param_size(model, @intCast(j)));
+        const n: usize = sess.paramSize(j);
         a.* = try gpa.alloc(f32, n);
         @memset(a.*, 0);
-        g.* = if (keep_groups) try gpa.dupe(u8, std.mem.span(tmt.tmt_model_param_group(model, @intCast(j)))) else "";
+        g.* = if (keep_groups) try gpa.dupe(u8, sess.paramGroup(j)) else "";
     }
     const buf = try gpa.alloc(f32, blk: {
         var mx: usize = 0;
@@ -76,13 +88,11 @@ fn run_cfg(gpa: std.mem.Allocator, cfg: *const tmt.Cfg, ckpt: [:0]const u8, data
             nxt[b * T + t] = data[o + 1];
             end[b * T + t] = @intFromBool(data[o + 1] == 10);
         };
-        var loss: f32 = 0;
-        var ce: f32 = 0;
-        try api(tmt.tmt_model_forward(model, ids.ptr, nxt.ptr, end.ptr, &loss, &ce));
-        try api(tmt.tmt_model_backward(model, 0));
-        ce_sum += ce;
+        const window = sess.forward(ids, nxt, end) catch return gpuFail();
+        sess.backward(false) catch return gpuFail();
+        ce_sum += window.ce;
         for (acc, 0..) |a, j| {
-            try api(tmt.tmt_model_param_grad(model, @intCast(j), buf.ptr));
+            sess.paramGrad(j, buf[0..a.len]) catch return gpuFail();
             for (a, buf[0..a.len]) |*x, g| x.* += g;
         }
     }
@@ -99,9 +109,9 @@ fn main_run(init: std.process.Init, out: Out) !void {
         try out.print("usage: gradcheck DATA CHECKPOINT [len=4096] [window=128] [seqs=4] [offset=0] [key=value ...]\n", .{});
         return error.Usage;
     }
-    const ckpt = try arena.dupeZ(u8, argv[2]);
-    const cfg = tmt.tmt_cfg_from_checkpoint(ckpt.ptr) orelse return fail("{s}", .{tmt.lastError()});
-    defer tmt.tmt_cfg_free(cfg);
+    const ckpt = argv[2];
+    const file_cfg = checkpoint.readConfig(arena, io, ckpt) catch return ckptFail();
+    var cfg = file_cfg;
     var len: i64 = 4096;
     var window: i64 = 128;
     var seqs: i64 = 4;
@@ -118,7 +128,7 @@ fn main_run(init: std.process.Init, out: Out) !void {
             seqs = std.fmt.parseInt(i64, v, 10) catch return fail("stoi", .{});
         } else if (std.mem.eql(u8, k, "offset")) {
             offset = std.fmt.parseInt(usize, v, 10) catch return fail("stoul", .{});
-        } else try api(tmt.tmt_cfg_set(cfg, try arena.dupeZ(u8, k), try arena.dupeZ(u8, v)));
+        } else config.set(&cfg, k, v) catch return cfgFail();
     }
     if (len <= 0 or window <= 0 or seqs <= 0 or @rem(len, window) != 0)
         return fail("require len, window, seqs > 0 and len divisible by window", .{});
@@ -130,26 +140,21 @@ fn main_run(init: std.process.Init, out: Out) !void {
     const starts = try arena.alloc(usize, useqs);
     for (starts, 0..) |*s, i| s.* = offset + i * stride;
 
-    // with mla=1, len must not exceed mla_cache
-    try api(tmt.tmt_cfg_set(cfg, "batch", (try std.fmt.allocPrintSentinel(arena, "{d}", .{seqs}, 0)).ptr));
-    const len_z = try std.fmt.allocPrintSentinel(arena, "{d}", .{len}, 0);
-    const win_z = try std.fmt.allocPrintSentinel(arena, "{d}", .{window}, 0);
-    const text = try arena.dupe(u8, std.mem.span(tmt.tmt_cfg_text(cfg)));
-    const trace_decay = std.fmt.parseFloat(f64, tmt.configValue(text, "trace_decay") orelse "0") catch 0;
-    const docsep = std.fmt.parseInt(i64, tmt.configValue(text, "docsep") orelse "0", 10) catch 0;
+    cfg.batch = @intCast(seqs); // with mla=1, len must not exceed mla_cache
+    const trace_decay: f64 = cfg.trace_decay;
+    const docsep: i64 = cfg.docsep;
 
-    var cfgs: [3]*tmt.Cfg = undefined;
-    const spec = [3][2][:0]const u8{ .{ len_z, "0" }, .{ win_z, "0" }, .{ win_z, "1" } };
-    for (&cfgs, spec) |*c, s| {
-        c.* = tmt.tmt_cfg_copy(cfg).?;
-        try api(tmt.tmt_cfg_set(c.*, "seqlen", s[0].ptr));
-        try api(tmt.tmt_cfg_set(c.*, "traces", s[1].ptr));
-        try api(tmt.tmt_cfg_validate(c.*));
+    var cfgs: [3]config.Cfg = undefined;
+    const spec = [3][2]i32{ .{ @intCast(len), 0 }, .{ @intCast(window), 0 }, .{ @intCast(window), 1 } };
+    for (&cfgs, spec) |*c, sp| {
+        c.* = cfg;
+        c.seqlen = sp[0];
+        c.traces = sp[1];
+        config.validate(c.*) catch return cfgFail();
     }
-    defer for (cfgs) |c| tmt.tmt_cfg_free(c);
-    const gf = try run_cfg(arena, cfgs[0], ckpt, data, starts, ulen, true);
-    const gt = try run_cfg(arena, cfgs[1], ckpt, data, starts, ulen, false);
-    const gh = try run_cfg(arena, cfgs[2], ckpt, data, starts, ulen, false);
+    const gf = try run_cfg(arena, io, cfgs[0], ckpt, file_cfg, data, starts, ulen, true);
+    const gt = try run_cfg(arena, io, cfgs[1], ckpt, file_cfg, data, starts, ulen, false);
+    const gh = try run_cfg(arena, io, cfgs[2], ckpt, file_cfg, data, starts, ulen, false);
 
     try out.print("gradcheck: len=%d window=%d seqs=%d trace_decay=%g docsep=%d  CE full=%.4f windowed=%.4f\n", .{
         @as(c_int, @intCast(len)), @as(c_int, @intCast(window)), @as(c_int, @intCast(seqs)),

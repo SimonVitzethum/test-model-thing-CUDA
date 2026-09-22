@@ -9,6 +9,7 @@ const ptx = @import("ptx.zig");
 const config = @import("model/config.zig");
 const model = @import("model/model.zig");
 const checkpoint = @import("model/checkpoint.zig");
+const session = @import("model/session.zig");
 const gpu = @import("model/gpu.zig");
 
 const kernels_ptx = @embedFile("kernels.ptx");

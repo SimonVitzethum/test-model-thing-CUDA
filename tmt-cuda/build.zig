@@ -60,7 +60,9 @@ pub fn build(b: *std.Build) void {
     const ptx = llc.addOutputFileArg("kernels.ptx");
     b.getInstallStep().dependOn(&b.addInstallFile(ptx, "kernels.ptx").step);
 
-    const Tool = struct { name: []const u8, cuda: bool };
+    // `reference` links the C++ model through its C API; only the comparison
+    // program needs it, every other tool runs the Zig model.
+    const Tool = struct { name: []const u8, cuda: bool, reference: bool = false };
     const tools = [_]Tool{
         .{ .name = "dialogprep", .cuda = false },
         .{ .name = "kgprep", .cuda = false },
@@ -69,7 +71,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "train", .cuda = true },
         .{ .name = "gradcheck", .cuda = true },
         .{ .name = "kgtrain", .cuda = true },
-        .{ .name = "ktest", .cuda = true },
+        .{ .name = "ktest", .cuda = true, .reference = true },
     };
     for (tools) |t| {
         const mod = b.createModule(.{
@@ -79,15 +81,17 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         if (t.cuda) {
-            mod.addObjectFile(capi_obj);
             mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ cuda, "lib64" }) });
             mod.addRPath(.{ .cwd_relative = b.pathJoin(&.{ cuda, "lib64" }) });
             mod.linkSystemLibrary("cudart", .{});
             mod.linkSystemLibrary("cublas", .{});
+        }
+        if (t.reference) { // nvcc's object needs the system libstdc++
+            mod.addObjectFile(capi_obj);
             mod.addObjectFile(.{ .cwd_relative = libstdcxx });
             mod.addObjectFile(.{ .cwd_relative = libgcc });
         }
-        if (std.mem.eql(u8, t.name, "ktest")) {
+        if (t.cuda) { // the kernels are loaded from the embedded PTX module
             mod.addAnonymousImport("kernels.ptx", .{ .root_source_file = ptx });
             mod.linkSystemLibrary("cuda", .{});
         }

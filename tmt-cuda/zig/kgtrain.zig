@@ -7,7 +7,13 @@
 //! by kgprep qa. Each example is one window "question answer\n"; the loss
 //! covers only the answer bytes and the final newline.
 const std = @import("std");
-const tmt = @import("tmt.zig");
+const config = @import("model/config.zig");
+const checkpoint = @import("model/checkpoint.zig");
+const session = @import("model/session.zig");
+const gpu = @import("model/gpu.zig");
+
+const kernels_ptx = @embedFile("kernels.ptx");
+extern "c" fn snprintf(buf: [*]u8, size: usize, fmt: [*:0]const u8, ...) c_int;
 const stdrand = @import("stdrand.zig");
 const retrieval = @import("retrieval.zig");
 
@@ -19,7 +25,7 @@ const Out = struct {
     w: *std.Io.Writer,
     fn print(o: Out, comptime fmt: [:0]const u8, args: anytype) !void {
         var buf: [4096]u8 = undefined;
-        const n = @call(.auto, tmt.snprintf, .{ &buf, buf.len, fmt.ptr } ++ args);
+        const n = @call(.auto, snprintf, .{ &buf, buf.len, fmt.ptr } ++ args);
         try o.w.writeAll(buf[0..@intCast(@min(n, buf.len - 1))]);
         if (fmt[fmt.len - 1] == '\n') try o.w.flush();
     }
@@ -32,8 +38,14 @@ fn fail(comptime fmt: []const u8, args: anytype) Fatal {
     err_len = s.len;
     return error.Fatal;
 }
-fn api(rc: c_int) Fatal!void {
-    if (rc != 0) return fail("{s}", .{tmt.lastError()});
+fn cfgFail() Fatal {
+    return fail("{s}", .{config.lastError()});
+}
+fn ckptFail() Fatal {
+    return fail("{s}", .{checkpoint.lastError()});
+}
+fn gpuFail() Fatal {
+    return fail("{s}", .{gpu.lastError()});
 }
 
 const Example = struct { question: []const u8, answer: []const u8, memory: []const u8, subject: []const u8 };
@@ -140,7 +152,7 @@ const Window = struct {
 
 /// Model, window buffers and the passes shared by all three subcommands.
 const Kg = struct {
-    m: *tmt.Model,
+    sess: session.Session,
     w: Window,
     B: usize,
     T: usize,
@@ -151,26 +163,23 @@ const Kg = struct {
     last: []c_int,
     rows: []f32,
 
-    fn init(gpa: std.mem.Allocator, cfg: *tmt.Cfg) !Kg {
-        const model = tmt.tmt_model_new(cfg) orelse return fail("{s}", .{tmt.lastError()});
-        const text = std.mem.span(tmt.tmt_cfg_text(cfg));
-        const get = struct {
-            fn f(t: []const u8, key: []const u8) usize {
-                return @intCast(std.fmt.parseInt(i64, tmt.configValue(t, key) orelse "0", 10) catch 0);
-            }
-        }.f;
-        const B = get(text, "batch");
-        const D = get(text, "dim");
+    fn init(gpa: std.mem.Allocator, io: std.Io, cfg: config.Cfg) !Kg {
+        const B: usize = @intCast(cfg.batch);
+        const D: usize = @intCast(cfg.dim);
         var kg = Kg{
-            .m = model, .B = B, .T = get(text, "seqlen"), .M = get(text, "mem_len"), .D = D,
-            .R = get(text, "mem_rdim"), .gpa = gpa, .w = undefined,
+            .sess = session.Session.init(gpa, io, cfg, kernels_ptx) catch return gpuFail(),
+            .B = B, .T = @intCast(cfg.seqlen), .M = @intCast(cfg.mem_len), .D = D,
+            .R = @intCast(cfg.mem_rdim), .gpa = gpa, .w = undefined,
             .last = try gpa.alloc(c_int, B), .rows = try gpa.alloc(f32, B * D),
         };
+        kg.sess.attach();
         kg.w = try Window.init(gpa, B, kg.T, kg.M);
         return kg;
     }
     fn forward(kg: *Kg, loss: *f32, ce: *f32) !void {
-        try api(tmt.tmt_model_forward_mem(kg.m, kg.w.ids.ptr, kg.w.nxt.ptr, kg.w.mem.ptr, loss, ce));
+        const window = kg.sess.forwardMem(kg.w.ids, kg.w.nxt, kg.w.mem) catch return gpuFail();
+        loss.* = window.total;
+        ce.* = window.ce;
     }
     /// Forward one reading batch (questions or labels); rows at the last bytes.
     fn readBatch(kg: *Kg, texts: []const []const u8) ![]f32 {
@@ -183,14 +192,13 @@ const Kg = struct {
         var ce: f32 = 0;
         try kg.forward(&loss, &ce);
         @memset(kg.rows, 0);
-        try api(tmt.tmt_model_read_rows(kg.m, kg.last.ptr, kg.rows.ptr));
+        kg.sess.readRows(kg.last, kg.rows) catch return gpuFail();
         return kg.rows;
     }
-    fn master(kg: *Kg, which: c_int) ![]f32 {
-        const j = tmt.tmt_model_retrieval_param(kg.m, which);
-        const n: usize = @intCast(tmt.tmt_model_param_size(kg.m, j));
-        const out = try kg.gpa.alloc(f32, n);
-        try api(tmt.tmt_model_param_master(kg.m, j, out.ptr));
+    fn master(kg: *Kg, which: usize) ![]f32 {
+        const j = kg.sess.retrievalParam(which).?;
+        const out = try kg.gpa.alloc(f32, kg.sess.paramSize(j));
+        kg.sess.paramMaster(j, out) catch return gpuFail();
         return out;
     }
     /// Unit keys (nodes, R) of the whole index, from the label bytes.
@@ -225,8 +233,8 @@ const Kg = struct {
             const at = (b * kg.T + @as(usize, @intCast(kg.last[b]))) * kg.D;
             for (0..kg.D) |d| dX[at + d] = rweight * drows[b * kg.D + d];
         }
-        try api(tmt.tmt_model_backward_ext(kg.m, dX.ptr));
-        try api(tmt.tmt_model_acc_add(kg.m, -1));
+        kg.sess.backwardExt(dX) catch return gpuFail();
+        kg.sess.accAdd(null) catch return gpuFail();
     }
     fn score(kg: *Kg, keys: []const f32, q: []const f32, k: usize) f32 {
         var s: f32 = 0;
@@ -278,15 +286,14 @@ fn runAsk(init: std.process.Init, out: Out, argv: []const []const u8) !void {
         else if (std.mem.eql(u8, k, "temp")) temp = std.fmt.parseFloat(f32, v) catch return fail("stof", .{})
         else return fail("unknown option: {s}", .{k});
     }
-    const cfg = tmt.tmt_cfg_from_checkpoint(path.ptr) orelse return fail("{s}", .{tmt.lastError()});
-    const text = std.mem.span(tmt.tmt_cfg_text(cfg));
-    const mem = std.fmt.parseInt(i64, tmt.configValue(text, "mem") orelse "0", 10) catch 0;
-    const rdim = std.fmt.parseInt(i64, tmt.configValue(text, "mem_rdim") orelse "0", 10) catch 0;
+    const cfg = checkpoint.readConfig(gpa, io, path) catch return ckptFail();
+    const mem: i64 = cfg.mem;
+    const rdim: i64 = cfg.mem_rdim;
     if (mem == 0 or rdim <= 0 or nodes_path.len == 0)
         return fail("ask needs a stage-2 checkpoint (mem_rdim > 0) and nodes=NODES.tsv", .{});
     const nodes = try loadNodes(gpa, io, nodes_path);
-    var kg = try Kg.init(gpa, cfg);
-    try api(tmt.tmt_model_load_weights(kg.m, path.ptr));
+    var kg = try Kg.init(gpa, io, cfg);
+    checkpoint.loadWeights(gpa, io, path, &kg.sess.m, cfg) catch return ckptFail();
 
     var ebuf: [256]u8 = undefined;
     var ew = std.Io.File.stderr().writerStreaming(io, &ebuf);
@@ -332,7 +339,7 @@ fn runAsk(init: std.process.Init, out: Out, argv: []const []const u8) !void {
                 var loss: f32 = 0;
                 var ce: f32 = 0;
                 try k.forward(&loss, &ce);
-                try api(tmt.tmt_model_logits(k.m, logits.ptr));
+                k.sess.logits(logits) catch return gpuFail();
                 const row = logits[(buf.items.len - 1) * 256 ..][0..256];
                 var pick: usize = 0;
                 if (tp <= 0) {
@@ -400,10 +407,9 @@ fn run(init: std.process.Init, out: Out) !void {
         break :blk true;
     };
     if (!training and !exists) return fail("evaluation requires an existing checkpoint", .{});
-    const cfg = (if (exists) tmt.tmt_cfg_from_checkpoint(path.ptr) else tmt.tmt_cfg_new()) orelse
-        return fail("{s}", .{tmt.lastError()});
-    if (!exists) try api(tmt.tmt_cfg_set(cfg, "mem", "1"));
-    const saved = try gpa.dupe(u8, std.mem.span(tmt.tmt_cfg_text(cfg)));
+    var cfg = if (exists) checkpoint.readConfig(gpa, io, path) catch return ckptFail() else config.Cfg{};
+    if (!exists) cfg.mem = 1;
+    const saved = try config.text(gpa, cfg);
     var steps: u64 = 0;
     var saveevery: u64 = 500;
     var show: usize = 5;
@@ -424,19 +430,19 @@ fn run(init: std.process.Init, out: Out) !void {
         else if (std.mem.eql(u8, k, "negbatches")) negbatches = std.fmt.parseInt(i64, v, 10) catch return fail("stoi", .{})
         else if (std.mem.eql(u8, k, "tau")) tau = std.fmt.parseFloat(f32, v) catch return fail("stof", .{})
         else if (std.mem.eql(u8, k, "rweight")) rweight = std.fmt.parseFloat(f32, v) catch return fail("stof", .{})
-        else try api(tmt.tmt_cfg_set(cfg, try gpa.dupeZ(u8, k), try gpa.dupeZ(u8, v)));
+        else config.set(&cfg, k, v) catch return cfgFail();
     }
     const modes = [_][]const u8{ "on", "off", "shuffled", "retrieved" };
     var known = false;
     for (modes) |m| known = known or std.mem.eql(u8, memory_mode, m);
     if (!known) return fail("memory must be on, off, shuffled or retrieved", .{});
-    try api(tmt.tmt_cfg_validate(cfg));
-    const text = try gpa.dupe(u8, std.mem.span(tmt.tmt_cfg_text(cfg)));
-    if ((std.fmt.parseInt(i64, tmt.configValue(text, "mem") orelse "0", 10) catch 0) == 0)
+    config.validate(cfg) catch return cfgFail();
+    const text = try config.text(gpa, cfg);
+    if (cfg.mem == 0)
         return fail("kgtrain requires mem=1", .{});
     if (exists and !std.mem.eql(u8, text, saved))
         return fail("configuration differs from checkpoint; choose a new checkpoint path", .{});
-    const rdim = std.fmt.parseInt(i64, tmt.configValue(text, "mem_rdim") orelse "0", 10) catch 0;
+    const rdim: i64 = cfg.mem_rdim;
     const with_retrieval = rdim > 0 and nodes_path.len != 0;
     if (std.mem.eql(u8, memory_mode, "retrieved") and !with_retrieval)
         return fail("memory=retrieved requires a checkpoint with mem_rdim > 0 and nodes=...", .{});
@@ -447,9 +453,9 @@ fn run(init: std.process.Init, out: Out) !void {
         nodes = try loadNodes(gpa, io, nodes_path);
         for (nodes, 0..) |n, i| try node_of.put(n.qid, i);
     }
-    var kg = try Kg.init(gpa, cfg);
-    var progress = tmt.Progress{};
-    if (exists) try api(tmt.tmt_model_load(kg.m, path.ptr, &progress));
+    var kg = try Kg.init(gpa, io, cfg);
+    var progress = checkpoint.Progress{};
+    if (exists) checkpoint.load(gpa, io, path, &kg.sess.m, &kg.sess.state, &progress) catch return ckptFail();
     if (training and exists and (progress.data_size != data_size or progress.data_hash != data_hash))
         return fail("resume dataset differs from checkpoint", .{});
     progress.data_size = data_size;
@@ -461,16 +467,16 @@ fn run(init: std.process.Init, out: Out) !void {
     const R = kg.R;
     const N = B * T;
     const losses = try gpa.alloc(f32, N);
-    tmt.tmt_install_stop_handler();
-    const seed: u32 = @intCast(std.fmt.parseInt(i64, tmt.configValue(text, "seed") orelse "0", 10) catch 0);
+    session.installStopHandler();
+    const seed: u32 = @bitCast(cfg.seed);
 
     if (training) {
         try out.print("kgtrain: %zu examples, D=%d L=%d mem_len=%d heads=%d every=%d B=%d T=%d step=%llu%s\n", .{
             examples.len, @as(c_int, @intCast(D)),
-            @as(c_int, @intCast(std.fmt.parseInt(i64, tmt.configValue(text, "layers").?, 10) catch 0)),
+            @as(c_int, cfg.layers),
             @as(c_int, @intCast(kg.M)),
-            @as(c_int, @intCast(std.fmt.parseInt(i64, tmt.configValue(text, "mem_heads").?, 10) catch 0)),
-            @as(c_int, @intCast(std.fmt.parseInt(i64, tmt.configValue(text, "mem_every").?, 10) catch 0)),
+            @as(c_int, cfg.mem_heads),
+            @as(c_int, cfg.mem_every),
             @as(c_int, @intCast(B)), @as(c_int, @intCast(T)), @as(c_ulonglong, progress.step),
             if (with_retrieval) " retrieval".ptr else "".ptr,
         });
@@ -481,7 +487,7 @@ fn run(init: std.process.Init, out: Out) !void {
         var window_racc: f64 = 0;
         var window_count: i64 = 0;
         var rsteps: i64 = 0;
-        while (tmt.tmt_stop_requested() == 0 and (steps == 0 or progress.step - begin < steps)) {
+        while (!session.stopRequested() and (steps == 0 or progress.step - begin < steps)) {
             var rng = stdrand.Mt19937.init(seed *% 2654435761 +% @as(u32, @truncate(progress.step))); // resumable
             var chosen: std.ArrayList(usize) = .empty;
             var seen: std.ArrayList([]const u8) = .empty;
@@ -502,20 +508,20 @@ fn run(init: std.process.Init, out: Out) !void {
                     break;
                 }
             }
-            try api(tmt.tmt_model_acc_zero(kg.m));
+            kg.sess.accZero() catch return gpuFail();
             // Answer pass with the true facts (stage 1).
             for (0..B) |b| _ = try kg.w.answer(gpa, examples[chosen.items[b]], examples[chosen.items[b]].memory, b);
             var loss: f32 = 0;
             var ce: f32 = 0;
             try kg.forward(&loss, &ce);
-            try api(tmt.tmt_model_losses(kg.m, losses.ptr));
+            kg.sess.losses(losses) catch return gpuFail();
             for (losses, kg.w.nxt) |l, t| if (t >= 0) {
                 window_ce += l;
                 window_count += 1;
             };
             if (!std.math.isFinite(loss)) return fail("non-finite loss; update refused", .{});
-            try api(tmt.tmt_model_backward_ext(kg.m, null));
-            try api(tmt.tmt_model_acc_add(kg.m, -1));
+            kg.sess.backwardExt(null) catch return gpuFail();
+            kg.sess.accAdd(null) catch return gpuFail();
             if (with_retrieval) {
                 // Candidates: each distinct subject once (duplicates share their
                 // positive), then random other nodes as negatives.
@@ -567,15 +573,18 @@ fn run(init: std.process.Init, out: Out) !void {
                 for (labels, 0..) |batch, j| try kg.backwardRows(batch.items, dy[j * B * D ..][0 .. B * D], dX, rweight);
                 try kg.backwardRows(questions.items, dx, dX, rweight);
                 for ([_]struct { c_int, []const f64 }{ .{ 0, dWq }, .{ 1, dWk } }) |pair| {
-                    const j = tmt.tmt_model_retrieval_param(kg.m, pair[0]);
+                    const j = kg.sess.retrievalParam(@intCast(pair[0])).?;
                     const h = try gpa.alloc(f32, pair[1].len);
                     for (h, pair[1]) |*e, g| e.* = rweight * @as(f32, @floatCast(g));
-                    try api(tmt.tmt_model_param_set_grad(kg.m, j, h.ptr));
-                    try api(tmt.tmt_model_acc_add(kg.m, j));
+                    kg.sess.setParamGrad(j, h) catch return gpuFail();
+                    kg.sess.accAdd(j) catch return gpuFail();
                 }
             }
-            try api(tmt.tmt_model_acc_store(kg.m));
-            try api(tmt.tmt_model_optimizer_step(kg.m, @intCast(progress.step)));
+            kg.sess.accStore() catch return gpuFail();
+            kg.sess.optimizerStep(@intCast(progress.step)) catch |e| return if (e == error.NonFiniteGradient)
+                fail("non-finite gradient; update refused", .{})
+            else
+                gpuFail();
             progress.step += 1;
             if (progress.step % 20 == 0) {
                 try out.print("step=%llu answer_ce=%.4f", .{ @as(c_ulonglong, progress.step), window_ce / @as(f64, @floatFromInt(@max(window_count, 1))) });
@@ -590,12 +599,12 @@ fn run(init: std.process.Init, out: Out) !void {
                 rsteps = 0;
             }
             if (saveevery != 0 and progress.step % saveevery == 0) {
-                try api(tmt.tmt_model_reset_state(kg.m));
-                try api(tmt.tmt_model_save(kg.m, path.ptr, &progress));
+                kg.sess.resetState() catch return gpuFail();
+                checkpoint.save(gpa, io, path, &kg.sess.m, &kg.sess.state, &progress) catch return ckptFail();
             }
         }
-        try api(tmt.tmt_model_reset_state(kg.m));
-        try api(tmt.tmt_model_save(kg.m, path.ptr, &progress));
+        kg.sess.resetState() catch return gpuFail();
+        checkpoint.save(gpa, io, path, &kg.sess.m, &kg.sess.state, &progress) catch return ckptFail();
         try out.print("{\"mode\":\"train\",\"steps\":%llu}\n", .{@as(c_ulonglong, progress.step - begin)});
         return;
     }
@@ -668,12 +677,12 @@ fn run(init: std.process.Init, out: Out) !void {
         var loss: f32 = 0;
         var ce: f32 = 0;
         try kg.forward(&loss, &ce);
-        try api(tmt.tmt_model_losses(kg.m, losses.ptr));
+        kg.sess.losses(losses) catch return gpuFail();
         for (losses, kg.w.nxt) |l, t| if (t >= 0) {
             ce_sum += l;
             count += 1;
         };
-        try api(tmt.tmt_model_logits(kg.m, logits.ptr));
+        kg.sess.logits(logits) catch return gpuFail();
         for (0..B) |b| {
             const at = slot[b] orelse continue;
             var all = true;

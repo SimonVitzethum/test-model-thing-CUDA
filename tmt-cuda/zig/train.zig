@@ -2,7 +2,15 @@
 //! Training and evaluation CLI (port of src/train_main.cu; same checkpoints,
 //! same log lines). The model and its kernels run through the C API.
 const std = @import("std");
-const tmt = @import("tmt.zig");
+const config = @import("model/config.zig");
+const checkpoint = @import("model/checkpoint.zig");
+const session = @import("model/session.zig");
+const gpu = @import("model/gpu.zig");
+
+/// The compiled kernels, loaded by the session at startup.
+const kernels_ptx = @embedFile("kernels.ptx");
+/// Numbers are formatted through libc, so the log matches to the last digit.
+extern "c" fn snprintf(buf: [*]u8, size: usize, fmt: [*:0]const u8, ...) c_int;
 
 const Fatal = error{Fatal};
 
@@ -11,7 +19,7 @@ const Out = struct {
     w: *std.Io.Writer,
     fn print(o: Out, comptime fmt: [:0]const u8, args: anytype) !void {
         var buf: [1024]u8 = undefined;
-        const n = @call(.auto, tmt.snprintf, .{ &buf, buf.len, fmt.ptr } ++ args);
+        const n = @call(.auto, snprintf, .{ &buf, buf.len, fmt.ptr } ++ args);
         try o.w.writeAll(buf[0..@intCast(@min(n, buf.len - 1))]);
         if (fmt[fmt.len - 1] == '\n') try o.w.flush();
     }
@@ -24,18 +32,18 @@ fn fail(comptime fmt: []const u8, args: anytype) Fatal {
     err_len = s.len;
     return error.Fatal;
 }
-fn api(rc: c_int) Fatal!void {
-    if (rc != 0) return fail("{s}", .{tmt.lastError()});
+/// The three modules report their own reason for refusing.
+fn cfgFail() Fatal {
+    return fail("{s}", .{config.lastError()});
 }
-
-fn cfgText(gpa: std.mem.Allocator, c: *tmt.Cfg) ![]u8 {
-    return gpa.dupe(u8, std.mem.span(tmt.tmt_cfg_text(c)));
+fn ckptFail() Fatal {
+    return fail("{s}", .{checkpoint.lastError()});
+}
+fn gpuFail() Fatal {
+    return fail("{s}", .{gpu.lastError()});
 }
 fn cfgInt(text: []const u8, key: []const u8) i64 {
-    return std.fmt.parseInt(i64, tmt.configValue(text, key) orelse "0", 10) catch 0;
-}
-fn cfgFloat(text: []const u8, key: []const u8) f64 {
-    return std.fmt.parseFloat(f64, tmt.configValue(text, key) orelse "0") catch 0;
+    return std.fmt.parseInt(i64, config.value(text, key) orelse "0", 10) catch 0;
 }
 /// Like the C++ integer_option: a nonnegative int, nothing else.
 fn integerOption(v: []const u8) Fatal!u64 {
@@ -90,10 +98,13 @@ fn run(init: std.process.Init, out: Out) !void {
         init_path = try arena.dupeZ(u8, a[5..]);
     };
     if (init_path != null and have) return fail("init= only applies to a new checkpoint path", .{});
-    const cfg = (if (have) tmt.tmt_cfg_from_checkpoint(path) else if (init_path) |p| tmt.tmt_cfg_from_checkpoint(p) else tmt.tmt_cfg_new()) orelse
-        return fail("{s}", .{tmt.lastError()});
-    defer tmt.tmt_cfg_free(cfg);
-    const saved_config = try cfgText(arena, cfg);
+    var cfg = if (have)
+        checkpoint.readConfig(arena, io, path) catch return ckptFail()
+    else if (init_path) |p|
+        checkpoint.readConfig(arena, io, p) catch return ckptFail()
+    else
+        config.Cfg{};
+    const saved_config = try config.text(arena, cfg);
     var mode: []const u8 = "train";
     var steps: u64 = 0;
     var saveevery: u64 = 500;
@@ -108,27 +119,26 @@ fn run(init: std.process.Init, out: Out) !void {
             steps = try integerOption(value);
         } else if (std.mem.eql(u8, key, "saveevery")) {
             saveevery = try integerOption(value);
-        } else try api(tmt.tmt_cfg_set(cfg, try arena.dupeZ(u8, key), try arena.dupeZ(u8, value)));
+        } else config.set(&cfg, key, value) catch return cfgFail();
     }
     if (!std.mem.eql(u8, mode, "train") and !std.mem.eql(u8, mode, "eval")) return fail("mode must be train or eval", .{});
     const evaluation = std.mem.eql(u8, mode, "eval");
     if (evaluation and !have) return fail("evaluation requires an existing checkpoint", .{});
-    try api(tmt.tmt_cfg_validate(cfg));
+    config.validate(cfg) catch return cfgFail();
     // Evaluation may change seqlen, maxcarry, docsep and dialog: none affects
     // weights or the stored state layout, and eval starts from a fresh state.
-    const compared = tmt.tmt_cfg_copy(cfg).?;
-    defer tmt.tmt_cfg_free(compared);
+    var compared = cfg;
     if (evaluation and have) {
-        const stored = tmt.tmt_cfg_from_checkpoint(path) orelse return fail("{s}", .{tmt.lastError()});
-        defer tmt.tmt_cfg_free(stored);
-        const st = try cfgText(arena, stored);
-        for ([_][:0]const u8{ "seqlen", "maxcarry", "docsep", "dialog" }) |k|
-            try api(tmt.tmt_cfg_set(compared, k, try arena.dupeZ(u8, tmt.configValue(st, k).?)));
+        const stored = checkpoint.readConfig(arena, io, path) catch return ckptFail();
+        compared.seqlen = stored.seqlen;
+        compared.maxcarry = stored.maxcarry;
+        compared.docsep = stored.docsep;
+        compared.dialog = stored.dialog;
     }
-    if (have and !std.mem.eql(u8, try cfgText(arena, compared), saved_config))
+    if (have and !std.mem.eql(u8, try config.text(arena, compared), saved_config))
         return fail("configuration differs from checkpoint; choose a new checkpoint path", .{});
 
-    const text = try cfgText(arena, cfg);
+    const text = try config.text(arena, cfg);
     const B: u64 = @intCast(cfgInt(text, "batch"));
     const T: u64 = @intCast(cfgInt(text, "seqlen"));
     const N = B * T;
@@ -140,17 +150,20 @@ fn run(init: std.process.Init, out: Out) !void {
     const data = try Dataset.open(io, argv[1]);
     defer data.close();
     if (data.bytes.len < B * (if (evaluation) 2 else T + 1)) return fail("dataset too small for batch/seqlen", .{});
-    const model = tmt.tmt_model_new(cfg) orelse return fail("{s}", .{tmt.lastError()});
-    defer tmt.tmt_model_free(model);
-    var progress = tmt.Progress{};
-    const path_z = try arena.dupeZ(u8, path);
+    var sess = session.Session.init(arena, io, cfg, kernels_ptx) catch return gpuFail();
+    sess.attach();
+    defer sess.deinit();
+    var progress = checkpoint.Progress{};
     if (have) {
-        try api(tmt.tmt_model_load(model, path_z, &progress));
-    } else if (init_path) |p| try api(tmt.tmt_model_load_weights(model, p)); // architecture must match
+        checkpoint.load(arena, io, path, &sess.m, &sess.state, &progress) catch return ckptFail();
+    } else if (init_path) |p| { // the architecture must match
+        const file_cfg = checkpoint.readConfig(arena, io, p) catch return ckptFail();
+        checkpoint.loadWeights(arena, io, p, &sess.m, file_cfg) catch return ckptFail();
+    }
     if (!evaluation and have and (progress.data_size != data.bytes.len or progress.data_hash != data.hash))
         return fail("resume dataset differs from checkpoint", .{});
     if (evaluation) {
-        try api(tmt.tmt_model_reset_state(model));
+        sess.resetState() catch return gpuFail();
         progress = .{};
     }
     progress.data_size = data.bytes.len;
@@ -171,27 +184,27 @@ fn run(init: std.process.Init, out: Out) !void {
     const begin_step = progress.step;
     var measured: u64 = 0;
     var ce_sum: f64 = 0;
-    const ln2 = tmt.log(2.0);
+    const ln2 = @log(2.0);
     const begin = std.Io.Clock.awake.now(io);
-    tmt.tmt_install_stop_handler();
+    session.installStopHandler();
     const mode_z = try arena.dupeZ(u8, mode);
     try out.print("CUDA hierarchical byte model: D=%d L=%d E=%d k=%d B=%d T=%d mode=%s step=%llu\n", .{
         @as(c_int, @intCast(cfgInt(text, "dim"))),  @as(c_int, @intCast(layers)), @as(c_int, @intCast(experts)),
         @as(c_int, @intCast(cfgInt(text, "topk"))), @as(c_int, @intCast(B)),      @as(c_int, @intCast(T)),
         mode_z.ptr,                                 @as(c_ulonglong, progress.step),
     });
-    while (tmt.tmt_stop_requested() == 0 and (steps == 0 or progress.step - begin_step < steps)) {
+    while (!session.stopRequested() and (steps == 0 or progress.step - begin_step < steps)) {
         if (progress.step >= std.math.maxInt(i32) - 1) return fail("optimizer step limit reached", .{});
         if (!evaluation and progress.cursor + T >= per) {
             progress.cursor = 0;
             progress.epoch += 1;
             progress.carried = 0;
-            try api(tmt.tmt_model_reset_state(model));
+            sess.resetState() catch return gpuFail();
         }
         if (evaluation and progress.cursor >= (size + B - 1) / B - 1) break;
         if (maxcarry != 0 and progress.carried >= maxcarry) {
             progress.carried = 0;
-            try api(tmt.tmt_model_reset_state(model));
+            sess.resetState() catch return gpuFail();
         }
         var count: u64 = 0;
         for (0..B) |b| {
@@ -229,17 +242,17 @@ fn run(init: std.process.Init, out: Out) !void {
                 count += @intFromBool(valid[i]);
             }
         }
-        var loss: f32 = 0;
-        var ce: f32 = 0;
-        try api(tmt.tmt_model_forward(model, ids.ptr, targets.ptr, ends.ptr, &loss, &ce));
+        const window = sess.forward(ids, targets, ends) catch return gpuFail();
+        const loss = window.total;
+        const ce = window.ce;
         if (!evaluation and experts > 1) {
-            try api(tmt.tmt_model_expert_counts(model, counts.ptr));
+            sess.expertCounts(counts);
             for (use_acc, counts) |*a, c| a.* += c;
             use_win += 1;
         }
         if (evaluation) {
             // Score only real next-byte pairs in the final padded window.
-            try api(tmt.tmt_model_losses(model, losses.ptr));
+            sess.losses(losses) catch return gpuFail();
             for (losses, valid) |l, v| if (v) {
                 ce_sum += l;
             };
@@ -247,10 +260,10 @@ fn run(init: std.process.Init, out: Out) !void {
             if (!std.math.isFinite(loss)) return fail("non-finite loss; update refused", .{});
             const diagnostics = (progress.step + 1) % 100 == 0;
             const log_traces = traces and diagnostics;
-            try api(tmt.tmt_model_backward(model, @intFromBool(log_traces)));
+            sess.backward(log_traces) catch return gpuFail();
             if (log_traces) {
                 var s: [9]f64 = undefined;
-                try api(tmt.tmt_model_trace_stats(model, &s));
+                sess.traceStats(&s) catch return gpuFail();
                 try out.print("traces:", .{});
                 const names = [3][:0]const u8{ "decay", "gate", "emb" };
                 for (0..3) |g| {
@@ -265,14 +278,17 @@ fn run(init: std.process.Init, out: Out) !void {
             if (diagnostics) {
                 var sum: [5]f64 = undefined;
                 var cnt: [5]i64 = undefined;
-                try api(tmt.tmt_model_state_buckets(model, &sum, &cnt));
+                sess.stateBuckets(&sum, &cnt) catch return gpuFail();
                 const names = [5][:0]const u8{ "<16", "<128", "<1k", "<8k", ">=8k" };
                 try out.print("state:", .{});
                 for (0..5) |k| if (cnt[k] != 0)
                     try out.print(" h%s n=%ld |s|=%.3g", .{ names[k].ptr, @as(c_long, @intCast(@divTrunc(cnt[k], @as(i64, @intCast(B))))), sum[k] / @as(f64, @floatFromInt(cnt[k])) });
                 try out.print("\n", .{});
             }
-            try api(tmt.tmt_model_optimizer_step(model, @intCast(progress.step)));
+            sess.optimizerStep(@intCast(progress.step)) catch |e| return if (e == error.NonFiniteGradient)
+                fail("non-finite gradient; update refused", .{})
+            else
+                gpuFail();
             ce_sum += ce * @as(f32, @floatFromInt(count)); // float product, as in C++ (ce * count)
         }
         if (!std.math.isFinite(ce_sum)) return fail("non-finite evaluation score", .{});
@@ -280,7 +296,7 @@ fn run(init: std.process.Init, out: Out) !void {
         progress.step += 1;
         progress.cursor += T;
         progress.carried += T;
-        if (!evaluation and saveevery != 0 and progress.step % saveevery == 0) try api(tmt.tmt_model_save(model, path_z, &progress));
+        if (!evaluation and saveevery != 0 and progress.step % saveevery == 0) checkpoint.save(arena, io, path, &sess.m, &sess.state, &progress) catch return ckptFail();
         if (progress.step % 20 == 0)
             try out.print("step=%llu loss=%.6f ce=%.6f bpb=%.6f\n", .{ @as(c_ulonglong, progress.step), @as(f64, loss), @as(f64, ce), @as(f64, ce) / ln2 });
         if (!evaluation and experts > 1 and use_win > 0 and progress.step % 100 == 0) {
@@ -300,10 +316,10 @@ fn run(init: std.process.Init, out: Out) !void {
             use_win = 0;
         }
     }
-    try api(tmt.tmt_synchronize());
+    gpu.synchronize() catch return gpuFail();
     const ns = begin.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     const seconds = @as(f64, @floatFromInt(ns)) / 1e9;
-    if (!evaluation) try api(tmt.tmt_model_save(model, path_z, &progress));
+    if (!evaluation) checkpoint.save(arena, io, path, &sess.m, &sess.state, &progress) catch return ckptFail();
     if (measured == 0) return fail("no byte pairs evaluated", .{});
     // Stable machine-readable record for experiment runners.
     const m: f64 = @floatFromInt(measured);

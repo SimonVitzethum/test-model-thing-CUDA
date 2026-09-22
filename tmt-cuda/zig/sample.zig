@@ -2,7 +2,11 @@
 //! Feeds the prompt byte by byte, then continues it (port of src/sample.cu).
 const std = @import("std");
 const cli = @import("cli.zig");
-const tmt = @import("tmt.zig");
+const generate = @import("model/generate.zig");
+const gpu = @import("model/gpu.zig");
+
+/// The compiled kernels, loaded with the model.
+const kernels_ptx = @embedFile("kernels.ptx");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -20,8 +24,8 @@ pub fn main(init: std.process.Init) !void {
     const stop_thr: f32 = @floatCast(try args.float("stop", 0.5));
     const maxlen = try args.int(usize, "maxlen", 256);
     const path = try init.arena.allocator().dupeZ(u8, pos[0]);
-    var g = tmt.Generator.open(path, try args.int(u32, "seed", 1)) catch
-        return cli.fail(io, "error: {s}\n", .{tmt.lastError()});
+    var g = generate.Generator.open(init.arena.allocator(), io, path, try args.int(u32, "seed", 1), kernels_ptx) catch
+        return cli.fail(io, "error: {s}\n", .{gpu.lastError()});
     defer g.close();
     var buf: [256]u8 = undefined;
     var out = std.Io.File.stdout().writerStreaming(io, &buf);

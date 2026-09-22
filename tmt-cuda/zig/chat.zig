@@ -9,7 +9,11 @@
 //! Commands: /reset  /temp X  /maxlen N  /mode dialog|raw  /help  /quit
 const std = @import("std");
 const cli = @import("cli.zig");
-const tmt = @import("tmt.zig");
+const generate = @import("model/generate.zig");
+const gpu = @import("model/gpu.zig");
+
+/// The compiled kernels, loaded with the model.
+const kernels_ptx = @embedFile("kernels.ptx");
 
 const CONV = 0x1E;
 const USER = 0x02;
@@ -30,10 +34,10 @@ pub fn main(init: std.process.Init) !void {
     var maxlen = try args.int(usize, "maxlen", 512);
     var mode = args.get("mode", "auto");
     const path = try init.arena.allocator().dupeZ(u8, pos[0]);
-    var g = tmt.Generator.open(path, try args.int(u32, "seed", 1)) catch
-        return cli.fail(io, "error: {s}\n", .{tmt.lastError()});
+    var g = generate.Generator.open(init.arena.allocator(), io, path, try args.int(u32, "seed", 1), kernels_ptx) catch
+        return cli.fail(io, "error: {s}\n", .{gpu.lastError()});
     defer g.close();
-    if (std.mem.eql(u8, mode, "auto")) mode = if (g.configInt("dialog") != 0) "dialog" else "raw";
+    if (std.mem.eql(u8, mode, "auto")) mode = if (g.file_cfg.dialog != 0) "dialog" else "raw";
     if (!std.mem.eql(u8, mode, "dialog") and !std.mem.eql(u8, mode, "raw"))
         return cli.fail(io, "error: mode must be auto, dialog or raw\n", .{});
     const tty = std.Io.File.stdin().isTty(io) catch false;
@@ -47,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     try err.interface.flush();
 
     const Begin = struct {
-        fn run(gen: *tmt.Generator, m: []const u8) !void {
+        fn run(gen: *generate.Generator, m: []const u8) !void {
             try gen.reset();
             if (std.mem.eql(u8, m, "dialog")) try gen.feed(CONV);
         }
@@ -81,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
                 mode = if (std.mem.eql(u8, arg, "dialog")) "dialog" else "raw";
                 try Begin.run(&g, mode);
                 try w.print("({s} mode, state reset)\n", .{mode});
-            } else try w.print("commands: /reset /temp X /maxlen N /mode dialog|raw /quit  ({d} bytes in state)\n", .{g.fed()});
+            } else try w.print("commands: /reset /temp X /maxlen N /mode dialog|raw /quit  ({d} bytes in state)\n", .{g.fed});
             try w.flush();
             continue;
         }
