@@ -1377,6 +1377,54 @@ pub fn main(init: std.process.Init) !u8 {
         report("checkpoint round trip", cross_ok, "written by each build, read by the other");
     }
 
+    // ---- patching stays causal ----
+    // Changing a byte must leave every earlier prediction alone. The patch
+    // output reaches back to its own boundary byte, so an off-by-one in the
+    // broadcast would show up here as a changed logit before the edit.
+    {
+        var c = config.Cfg{};
+        try config.set(&c, "dim", "64");
+        try config.set(&c, "layers", "4");
+        try config.set(&c, "batch", "1");
+        try config.set(&c, "seqlen", "32");
+        try config.set(&c, "patch", "4");
+        try config.set(&c, "patch_lo", "1");
+        try config.set(&c, "patch_hi", "2");
+        var kern = try gpu.Kernels.load(gpa, kernels_ptx);
+        var sess = session.Session.init(gpa, init.io, c, kernels_ptx) catch return error.Session;
+        sess.attach();
+        defer sess.deinit();
+        _ = &kern;
+        const T = 32;
+        const bytes = try gpa.alloc(i32, T);
+        const targets = try gpa.alloc(i32, T);
+        const ends = try gpa.alloc(i32, T);
+        fillIds(bytes, 131, 32, 127);
+        @memset(targets, -1);
+        @memset(ends, 0);
+        const before = try gpa.alloc(f32, T * 256);
+        const after = try gpa.alloc(f32, T * 256);
+        try sess.resetState();
+        _ = sess.forward(bytes, targets, ends) catch return error.Forward;
+        try sess.logits(before);
+        const edit = 9; // inside the patch that spans bytes 8..11
+        bytes[edit] = if (bytes[edit] == 65) 66 else 65;
+        try sess.resetState();
+        _ = sess.forward(bytes, targets, ends) catch return error.Forward;
+        try sess.logits(after);
+        var leaked: usize = 0;
+        for (0..edit) |t| {
+            if (!std.mem.eql(f32, before[t * 256 ..][0..256], after[t * 256 ..][0..256])) leaked += 1;
+        }
+        var changed = false;
+        for (edit..T) |t| {
+            if (!std.mem.eql(f32, before[t * 256 ..][0..256], after[t * 256 ..][0..256])) changed = true;
+        }
+        var lb: [96]u8 = undefined;
+        report("patching causality", leaked == 0 and changed,
+            std.fmt.bufPrint(&lb, "{d} earlier positions moved, later ones did", .{leaked}) catch "");
+    }
+
     if (failures == 0) say("ALL KERNEL COMPARISONS PASSED\n", .{});
     return if (failures == 0) 0 else 1;
 }
