@@ -116,6 +116,8 @@ struct Model {
     // Optional external gradient on the final representation X (N,D), added to
     // the loss gradient in backward_window (stage-2 retrieval loss).
     float* dXext = nullptr;
+    MTParams opt;          // multi-tensor view of all parameters (optimizer, zeroing)
+    float* moe_stats = nullptr;  // (L, 17) router statistics, read once per window
 };
 
 struct StreamState {
@@ -172,6 +174,8 @@ static float lr_at(const Cfg& c, int step) {
     return c.lr * (c.minlr + 0.5f * (1 - c.minlr) *
                    (1 + cosf(3.14159265f * p)));
 }
+
+static void build_opt_table(Model& m);
 
 static void build_model(Model& m) {
     Cfg& c = m.c;
@@ -248,6 +252,10 @@ static void build_model(Model& m) {
         moe_keep_alloc(Ly.mc, N, E, K, D);
     }
     moe_ws_alloc(m.moeW, N, E, K, D);
+    if (E > 1) {
+        m.memory.allocate(m.moe_stats, (long)L * 17 * 4);
+        for (int l = 0; l < L; ++l) m.L[l].mc.stat = m.moe_stats + (long)l * 17;
+    }
     m.memory.allocate(m.enc, ND * 2);
     m.memory.allocate(m.X, ND * 2);
     m.memory.allocate(m.Sb, ND * 2);
@@ -416,6 +424,34 @@ static void build_model(Model& m) {
             S.rk = m.params.add((long)c.mem_rdim * D); init_u(S.rk, -r, r);
         }
     }
+    build_opt_table(m);  // every parameter exists now
+}
+
+// Chunk table over all parameters for the multi-tensor kernels. Built once,
+// after every parameter exists. Norm: all but the EMA target; AdamW: all but
+// the EMA target and an unused stop head.
+static void build_opt_table(Model& m) {
+    size_t P = m.params.values.size();
+    std::vector<float*> master(P), mm(P), vv(P), grad(P);
+    std::vector<bf16*> work(P);
+    std::vector<unsigned char> flags(P);
+    std::vector<MTChunk> chunks;
+    for (size_t i = 0; i < P; ++i) {
+        auto& p = m.params.at(i);
+        master[i] = p.master; mm[i] = p.m; vv[i] = p.v; grad[i] = p.grad; work[i] = p.work;
+        bool frozen = i == m.tgt, unused_stop = i == m.stop && m.c.stop == 0;
+        flags[i] = (frozen ? 0 : 1) | (frozen || unused_stop ? 0 : 2);
+        for (long s = 0; s < p.n; s += MT_CHUNK)
+            chunks.push_back({(int)i, (int)std::min<long>(MT_CHUNK, p.n - s), s});
+    }
+    auto up = [&](auto*& dst, const auto& src) {
+        m.memory.allocate(dst, src.size() * sizeof(src[0]));
+        CUDA_CHECK(cudaMemcpy(dst, src.data(), src.size() * sizeof(src[0]), cudaMemcpyHostToDevice));
+    };
+    up(m.opt.master, master); up(m.opt.m, mm); up(m.opt.v, vv); up(m.opt.grad, grad);
+    up(m.opt.work, work); up(m.opt.flags, flags); up(m.opt.chunks, chunks);
+    m.opt.nchunks = (int)chunks.size();
+    m.memory.allocate(m.opt.sumsq, sizeof(double));
 }
 
 static float host_sum(float* d, int n) {
@@ -476,7 +512,6 @@ static void forward_window(Model& m, StreamState& state, float& tot, float& ce_o
         exp_ptrs(m, (int)l, Wx);
         aux_acc += moe_forward(m.H, m.params.at(Ly.router).work, Wx, m.X,
                                Ly.mc, m.moeW, N, E, K, D, 1.0f);
-        z_acc += Ly.mc.zloss;
         // Residual-Add steckt in combine (beta=1), kein separater Pass.
         // MLA-Block (optional): norm auf X-Stream + Attention + residual
         if (c.mla && m.ML[l].use) {
@@ -504,32 +539,41 @@ static void forward_window(Model& m, StreamState& state, float& tot, float& ce_o
         extract_carry_kernel<<<gc, TPB>>>(Ly.S, state.carry[l], B, T, D);
     }
     state.position += T;
+    if (E > 1) {  // one host read for all layers' router statistics
+        std::vector<float> hs((size_t)m.L.size() * 17);
+        CUDA_CHECK(cudaMemcpy(hs.data(), m.moe_stats, hs.size() * 4, cudaMemcpyDeviceToHost));
+        for (size_t l = 0; l < m.L.size(); ++l) {
+            aux_acc += moe_aux_from(m.L[l].mc, &hs[l * 17]);
+            z_acc += m.L[l].mc.zloss;
+        }
+    }
     // Decode
     linear_fwd(N, 256, D, m.X, m.params.at(m.dec).work, m.logits);
-    linear_fwd(N, 1, D, m.X, m.params.at(m.stop).work, m.stoplog);
-    // CE
+    // CE (one host synchronization per window)
     ce_fwd_kernel<<<blocks, TPB>>>(m.logits, m.nxt, m.probs, m.losstmp, N);
     float ce_sum = host_sum(m.losstmp, N);
     ce_out = ce_sum / N;
-    // Stop
-    stop_fwd_kernel<<<blocks, TPB>>>(m.stoplog, m.end, m.losstmp, c.stopposw,
-                                     N);
-    float stop_mean = host_sum(m.losstmp, N) / N;
-    // Latent-Target
-    emb_forward(m.params.at(m.tgt).work, m.nxt, m.tgtX, N, D);
-    // Var-Hinge
-    meanvar_kernel<<<1, 256>>>(m.X, m.mv, ND);
-    float hmv[2];
-    CUDA_CHECK(cudaMemcpy(hmv, m.mv, 8, cudaMemcpyDeviceToHost));
-    float var_loss = fmaxf(0.0f, 1.0f - sqrtf(hmv[1] + 1e-4f));
-    // Latent-MSE-Wert
-    f32_of_bf16_kernel<<<blocksL, TPB>>>(m.X, m.dXres, ND);  // reuse als tmp
-    // (mse via Kernel unten nach tgtX-f32? tgtX bf16 -> cast nötig: reuse dEnc)
-    f32_of_bf16_kernel<<<blocksL, TPB>>>(m.tgtX, m.dEnc, ND);
-    mse_mean_kernel<<<1, 256>>>(m.dXres, m.dEnc, m.mv, ND);
-    float hmse[1];
-    CUDA_CHECK(cudaMemcpy(hmse, m.mv, 4, cudaMemcpyDeviceToHost));
-    tot = c.var * var_loss + c.latent * hmse[0] + c.ce * ce_out +
+    // Optional terms are computed only when enabled (each costs a host sync).
+    float stop_mean = 0, var_loss = 0, mse = 0;
+    if (c.stop > 0) {
+        linear_fwd(N, 1, D, m.X, m.params.at(m.stop).work, m.stoplog);
+        stop_fwd_kernel<<<blocks, TPB>>>(m.stoplog, m.end, m.losstmp, c.stopposw, N);
+        stop_mean = host_sum(m.losstmp, N) / N;
+    }
+    if (c.latent > 0) {  // MSE against the EMA target embedding of the next byte
+        emb_forward(m.params.at(m.tgt).work, m.nxt, m.tgtX, N, D);
+        f32_of_bf16_kernel<<<blocksL, TPB>>>(m.X, m.dXres, ND);  // temporaries
+        f32_of_bf16_kernel<<<blocksL, TPB>>>(m.tgtX, m.dEnc, ND);
+        mse_mean_kernel<<<1, 256>>>(m.dXres, m.dEnc, m.mv, ND);
+        CUDA_CHECK(cudaMemcpy(&mse, m.mv, 4, cudaMemcpyDeviceToHost));
+    }
+    if (c.var > 0) {
+        float hmv[2];
+        meanvar_kernel<<<1, 256>>>(m.X, m.mv, ND);
+        CUDA_CHECK(cudaMemcpy(hmv, m.mv, 8, cudaMemcpyDeviceToHost));
+        var_loss = fmaxf(0.0f, 1.0f - sqrtf(hmv[1] + 1e-4f));
+    }
+    tot = c.var * var_loss + c.latent * mse + c.ce * ce_out +
           c.stop * stop_mean + (c.aux * aux_acc + c.zloss * z_acc) / m.L.size();
 
     CUDA_CHECK(cudaGetLastError());
@@ -545,14 +589,16 @@ static void backward_window(Model& m, StreamState& state) {
     long blocksL = (ND + TPB - 1) / TPB;
     int blocks = (N + TPB - 1) / TPB;
     bf16* Wx[16];
-    for (auto& p : m.params.values) CUDA_CHECK(cudaMemset(p.grad, 0, p.n * 4));
+    mt_zero_kernel<<<m.opt.nchunks, 256>>>(m.opt);  // all gradients, one launch
     bool logging = m.log_traces && m.trlog;
     if (logging) CUDA_CHECK(cudaMemset(m.trlog, 0, (2L * c.layers + 256) * D * 4));
     // Reconstruct loss auxiliaries from the shared forward activations.
-    float hmv[2];
-    meanvar_kernel<<<1, 256>>>(m.X, m.mv, ND);
-    CUDA_CHECK(cudaMemcpy(hmv, m.mv, 8, cudaMemcpyDeviceToHost));
-    f32_of_bf16_kernel<<<blocksL, TPB>>>(m.tgtX, m.dEnc, ND);
+    float hmv[2] = {0.f, 1.f};
+    if (c.var > 0) {
+        meanvar_kernel<<<1, 256>>>(m.X, m.mv, ND);
+        CUDA_CHECK(cudaMemcpy(hmv, m.mv, 8, cudaMemcpyDeviceToHost));
+    }
+    if (c.latent > 0) f32_of_bf16_kernel<<<blocksL, TPB>>>(m.tgtX, m.dEnc, ND);
     // ---- Backward ----
     CUDA_CHECK(cudaMemset(m.dXres, 0, ND * 4));
     ce_bwd_kernel<<<blocks, TPB>>>(m.probs, m.nxt, m.dlogits, c.ce, N);
@@ -576,6 +622,19 @@ static void backward_window(Model& m, StreamState& state) {
             : -0.5f / sqrtf(hmv[1] + 1e-4f) * c.var,
         ND);
     if (m.dXext) add_f32_kernel<<<blocksL, TPB>>>(m.dXres, m.dXext, ND);
+    if (c.stop > 0) {
+        stop_bwd_kernel<<<blocks, TPB>>>(m.stoplog, m.end, m.dstop, c.stopposw, c.stop, N);
+        linear_dW(N, 1, D, m.dstop, m.X, m.params.at(m.stop).grad);
+        linear_dX(N, 1, D, m.dstop, m.params.at(m.stop).work, m.dXs);
+        cast_add_kernel<<<blocksL, TPB>>>(m.dXs, m.dXres, ND);
+    }
+    if (c.latent > 0 || c.var > 0) f32_of_bf16_kernel<<<blocksL, TPB>>>(m.X, m.dEncTmp, ND);
+    // Latent part (X in dEncTmp, target in dEnc)
+    if (c.latent > 0) latent_bwd_kernel<<<blocksL, TPB>>>(m.dEncTmp, m.dEnc, m.dXres, c.latent, ND);
+    // Variance hinge (active only below unit variance)
+    if (c.var > 0)
+        var_bwd_kernel<<<blocksL, TPB>>>(m.dEncTmp, m.dXres, hmv[0],
+            (hmv[1] + 1e-4f >= 1.0f) ? 0.0f : -0.5f / sqrtf(hmv[1] + 1e-4f) * c.var, ND);
     // Residual-Stream zurück nach bf16; dEnc neu für State-Pfad
     copy_bf16_kernel<<<blocksL, TPB>>>(m.dXres, m.dXs, ND);
     CUDA_CHECK(cudaMemset(m.dEnc, 0, ND * 4));
@@ -656,27 +715,15 @@ static void release_window(Model& m) {
 
 static void optimizer_step(Model& m, int step) {
     const Cfg& c = m.c;
-    double sum = 0;
-    for (size_t i = 0; i < m.params.values.size(); ++i) {
-        if (i == m.tgt) continue;
-        auto& p = m.params.at(i);
-        float norm = 0;
-        if (cublasSnrm2(cublas_handle(), (int)p.n, p.grad, 1, &norm) != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("gradient norm failed");
-        sum += (double)norm * norm;
-    }
-    if (!std::isfinite(sum)) throw std::runtime_error("non-finite gradient; update refused");
-    float scale = c.gradclip > 0 ? fminf(1.f, c.gradclip / fmaxf(sqrtf(sum), 1e-12f)) : 1.f;
-    for (size_t i = 0; i < m.params.values.size(); ++i) {
-        if (i == m.tgt || (i == m.stop && c.stop == 0)) continue;
-        auto& p = m.params.at(i);
-        if (scale < 1 && cublasSscal(cublas_handle(), (int)p.n, &scale, p.grad, 1) != CUBLAS_STATUS_SUCCESS)
-            throw std::runtime_error("gradient scaling failed");
-        adam_step_one(p.master, p.m, p.v, p.work, p.grad, p.n, lr_at(c, step),
-                      .9f, .999f, 1e-8f, .01f, step + 1);
-    }
+    const float b1 = .9f, b2 = .999f;
+    CUDA_CHECK(cudaMemsetAsync(m.opt.sumsq, 0, sizeof(double)));
+    mt_sumsq_kernel<<<m.opt.nchunks, 256>>>(m.opt);
+    mt_adam_kernel<<<m.opt.nchunks, 256>>>(m.opt, c.gradclip, lr_at(c, step), b1, b2, 1e-8f, .01f,
+                                           1.0f - powf(b1, step + 1), 1.0f - powf(b2, step + 1));
     auto& tgt = m.params.at(m.tgt);
     ema_kernel<<<(tgt.n + 255) / 256, 256>>>(tgt.master, m.params.at(m.emb).master, c.ematau, tgt.n);
     copy_bf16_kernel<<<(tgt.n + 255) / 256, 256>>>(tgt.master, tgt.work, tgt.n);
-    CUDA_CHECK(cudaGetLastError());
+    double sumsq;  // the only host synchronization of the step
+    CUDA_CHECK(cudaMemcpy(&sumsq, m.opt.sumsq, sizeof(double), cudaMemcpyDeviceToHost));
+    if (!std::isfinite(sumsq)) throw std::runtime_error("non-finite gradient; update refused");
 }

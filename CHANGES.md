@@ -49,6 +49,8 @@ BPC 1.31 (run2) and 2.50 (8h laptop run), reproducibly checkpointed.
 - **MoE backward bug (introduced in `f052b67`, fixed):** the expert-output gradient was zeroed after it was computed, and the expert-input recompute launched 1/D of the needed threads. Expert weights got zero gradient and no gradient flowed through the experts (only residual and router paths). Affects all MoE runs after 2026-09-20 22:35, including run3local and the 8h run; run2 predates it. A new test compares a two-expert MoE with identical experts against the dense path; the small MoE smoke test now reaches CE 0.82 instead of 3.36.
 - CUDA vs. torch port: **216× throughput** (106k vs. 0.49k tok/s same scale).
 
+- **Training loop overheads (2026-09-22):** profiling showed the optimizer, not the recurrence or the GEMMs, as the largest single cost (35%): one gradient-norm host sync and several launches per parameter block (~210 per step). A multi-tensor optimizer (global norm, clipping and AdamW in one launch each, one host sync per step), one-launch gradient zeroing, skipping disabled loss terms, and reading all MoE router statistics once per window raised throughput from 82k to 98k bytes/s (34M MoE, batch 16), 104k to 118k (batch 32), and 190k to 242k (dense, batch 16). The recurrence including traces is ~9% of the step. Grouped cuBLAS GEMMs for the experts were tried and gave no measurable gain (and bf16 inputs with fp32 outputs are not supported there).
+
 ## 5. Discarded/removed
 
 MLX original (`main.py`), PyTorch port + MoE (`main_torch_moe.py`), both benchmark scripts, old READMEs, V2 checkpoints, dummy-gradient hack, RTRL approximation, memory carried from training into chat/inference, per-byte-stdout training.

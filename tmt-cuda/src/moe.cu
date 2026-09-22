@@ -308,6 +308,10 @@ struct MoeKeep {  // pro Layer, persistent fwd->bwd (vorallokiert)
     int hoff[16] = {0};       // Host: Offsets (echt, für Aux/Statistiken)
     int phoff[16] = {0};      // Host: Offsets mit Padding (GEMM-Layout)
     int N = 0, E = 0, K = 0, D = 0, Tk = 0, Ptk = 0;
+    // Optional (E+1)-float device slot owned by the caller: if set, the router
+    // statistics are only copied there and the host reads all layers at once
+    // (moe_aux_from); otherwise moe_forward reads them itself (one sync).
+    float* stat = nullptr;
 };
 struct MoeWs {  // shared transient (ein Satz reicht, Layer laufen sequenziell)
     float* w = nullptr;       // (N,K) Gewichte (nur fwd)
@@ -441,7 +445,11 @@ inline float moe_forward(const bf16* X, const bf16* Wrouter, bf16** Wexp,
     CUDA_CHECK(cudaMemset(w.sum_p + E, 0, 4));
     zloss_kernel<<<(N + TPB - 1) / TPB, TPB>>>(k.logits, w.sum_p + E, N, E);
     sync_tick(5);
-    // Switch-Aux auf Host (gleicher Sync wie oben nutzbar, hier separat)
+    if (k.stat) {  // deferred: the owner reads all layers' statistics at once
+        CUDA_CHECK(cudaMemcpyAsync(k.stat, w.sum_p, (size_t)(E + 1) * 4, cudaMemcpyDeviceToDevice));
+        k.zloss = 0;
+        return 0.f;
+    }
     float hsum[17];
     CUDA_CHECK(cudaMemcpy(hsum, w.sum_p, (size_t)(E + 1) * 4, cudaMemcpyDeviceToHost));
     k.zloss = hsum[E];
@@ -455,6 +463,15 @@ inline float moe_forward(const bf16* X, const bf16* Wrouter, bf16** Wexp,
         fflush(stdout);
     }
     return E * aux;
+}
+
+// Switch aux loss (returned) and z-loss (into k.zloss) from host-side stats
+// that moe_forward copied to k.stat; same values as the immediate path.
+inline float moe_aux_from(MoeKeep& k, const float* hsum) {
+    k.zloss = hsum[k.E];
+    float aux = 0;
+    for (int e = 0; e < k.E; ++e) aux += (hsum[e] / k.N) * (k.hcnt[e] / (float)(k.N * k.K));
+    return k.E * aux;
 }
 
 // Backward: dY(N,D) bf16 -> dX(N,D) bf16 (genullt+gesetzt),
