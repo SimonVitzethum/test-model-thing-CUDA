@@ -7,6 +7,8 @@ const std = @import("std");
 const tmt = @import("tmt.zig");
 const ptx = @import("ptx.zig");
 const config = @import("model/config.zig");
+const model = @import("model/model.zig");
+const gpu = @import("model/gpu.zig");
 
 const kernels_ptx = @embedFile("kernels.ptx");
 
@@ -1268,6 +1270,68 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         report("configuration", ok, "");
+    }
+
+    // ---- the model built in Zig must have the C++ weights ----
+    {
+        var kernels = try gpu.Kernels.load(gpa, kernels_ptx);
+        var c = config.Cfg{};
+        try config.set(&c, "dim", "64");
+        try config.set(&c, "layers", "3");
+        try config.set(&c, "experts", "4");
+        try config.set(&c, "topk", "2");
+        try config.set(&c, "batch", "2");
+        try config.set(&c, "seqlen", "16");
+        try config.set(&c, "mla", "1");
+        try config.set(&c, "mla_cache", "64");
+        try config.set(&c, "mem", "1");
+        try config.set(&c, "mem_len", "32");
+        try config.set(&c, "mem_rdim", "8");
+        try config.set(&c, "traces", "1");
+        var mine = model.build(gpa, c, &kernels) catch |e| {
+            say("  building the model failed: {s} ({s})\n", .{ @errorName(e), gpu.lastError() });
+            return 1;
+        };
+        defer mine.deinit();
+        // The C++ model with the same configuration, through the C API.
+        const cc = tmt.tmt_cfg_new().?;
+        defer tmt.tmt_cfg_free(cc);
+        inline for (.{ .{ "dim", "64" }, .{ "layers", "3" }, .{ "experts", "4" }, .{ "topk", "2" },
+            .{ "batch", "2" }, .{ "seqlen", "16" }, .{ "mla", "1" }, .{ "mla_cache", "64" },
+            .{ "mem", "1" }, .{ "mem_len", "32" }, .{ "mem_rdim", "8" }, .{ "traces", "1" } }) |kv|
+            if (tmt.tmt_cfg_set(cc, kv[0], kv[1]) != 0) return error.Ref;
+        const theirs = tmt.tmt_model_new(cc) orelse return error.Ref;
+        defer tmt.tmt_model_free(theirs);
+
+        const count: usize = @intCast(tmt.tmt_model_param_count(theirs));
+        var ok = count == mine.store.values.items.len;
+        if (!ok) say("  parameter count differs: C++ {d}, Zig {d}\n", .{ count, mine.store.values.items.len });
+        var worst: f64 = 0;
+        var worst_at: usize = 0;
+        if (ok) for (0..count) |j| {
+            const n: usize = @intCast(tmt.tmt_model_param_size(theirs, @intCast(j)));
+            if (n != @as(usize, @intCast(mine.store.at(j).n))) {
+                say("  parameter {d} has a different size\n", .{j});
+                ok = false;
+                break;
+            }
+            const ref = try gpa.alloc(f32, n);
+            defer gpa.free(ref);
+            const got2 = try gpa.alloc(f32, n);
+            defer gpa.free(got2);
+            if (tmt.tmt_model_param_master(theirs, @intCast(j), ref.ptr) != 0) return error.Ref;
+            try gpu.download(std.mem.sliceAsBytes(got2), mine.store.at(j).master);
+            for (ref, got2) |a2, b2| if (a2 != b2) {
+                const d = @abs(@as(f64, a2) - @as(f64, b2));
+                if (d > worst) {
+                    worst = d;
+                    worst_at = j;
+                }
+            };
+        };
+        var mb: [128]u8 = undefined;
+        report("model weights", ok and worst == 0,
+            std.fmt.bufPrint(&mb, "{d} parameters, largest difference {e:.1} (at {d})", .{ count, worst, worst_at }) catch "");
     }
 
     if (failures == 0) say("ALL KERNEL COMPARISONS PASSED\n", .{});

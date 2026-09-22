@@ -1292,3 +1292,77 @@ export fn sum_heads(s: cuda.ConstGlobal(f32), d: cuda.Global(f32), B: i32, H: i3
     while (h < H) : (h += 1) acc += s[@intCast((b * H + h) * @as(i64, Cc) * F + c * F + f)];
     d[@intCast((b * Cc + c) * F + f)] = acc;
 }
+
+// ---- src/model.cu (elementary kernels) ----
+// add_bf16_kernel and f32_of_bf16_kernel are mem_add_bf16 and to_f32 above.
+
+export fn zero_f32(a: cuda.Global(f32), n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i < n) a[@intCast(i)] = 0;
+}
+
+/// The state of the last position of the window becomes the next carry.
+export fn extract_carry(S: cuda.ConstGlobal(f32), carry: cuda.Global(f32), B: i32, T: i32, D: i32) callconv(.nvptx_kernel) void {
+    const b = cuda.blockIdxX();
+    const d = cuda.blockIdxY() * cuda.blockDimX() + cuda.threadIdxX();
+    if (b >= @as(u32, @bitCast(B)) or d >= @as(u32, @bitCast(D))) return;
+    const dim: usize = @intCast(D);
+    carry[@as(usize, b) * dim + d] = S[(@as(usize, b) * @as(usize, @intCast(T)) + @as(usize, @intCast(T - 1))) * dim + d];
+}
+
+var mv_b1: [256]f32 addrspace(.shared) = undefined;
+var mv_b2: [256]f32 addrspace(.shared) = undefined;
+
+/// Mean and variance of a bf16 tensor, for the variance hinge.
+export fn meanvar(X: cuda.ConstGlobal(bf16), out2: cuda.Global(f32), n: i64) callconv(.nvptx_kernel) void {
+    const t = cuda.threadIdxX();
+    var s: f32 = 0;
+    var q: f32 = 0;
+    var i: i64 = @intCast(t);
+    while (i < n) : (i += @intCast(cuda.blockDimX())) {
+        const v = cuda.bf2f(X[@intCast(i)]);
+        s += v;
+        q += v * v;
+    }
+    mv_b1[t] = s;
+    mv_b2[t] = q;
+    cuda.syncThreads();
+    var half: u32 = 128;
+    while (half > 0) : (half >>= 1) {
+        if (t < half) {
+            mv_b1[t] += mv_b1[t + half];
+            mv_b2[t] += mv_b2[t + half];
+        }
+        cuda.syncThreads();
+    }
+    if (t == 0) {
+        const m = cuda.fdiv(mv_b1[0], @floatFromInt(n));
+        out2[0] = m;
+        out2[1] = cuda.fdiv(mv_b2[0], @floatFromInt(n)) - cuda.mulNoFma(m, m);
+    }
+}
+
+/// EMA target encoder: tgt = tau*tgt + (1-tau)*src.
+export fn ema(tgt: cuda.Global(f32), src: cuda.ConstGlobal(f32), tau: f32, n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i < n) tgt[@intCast(i)] = tau * tgt[@intCast(i)] + (1.0 - tau) * src[@intCast(i)];
+}
+
+/// Mean squared error of two fp32 tensors (latent loss).
+export fn mse_mean(a: cuda.ConstGlobal(f32), b: cuda.ConstGlobal(f32), out: cuda.Global(f32), n: i64) callconv(.nvptx_kernel) void {
+    const t = cuda.threadIdxX();
+    var s: f32 = 0;
+    var i: i64 = @intCast(t);
+    while (i < n) : (i += @intCast(cuda.blockDimX())) {
+        const d = a[@intCast(i)] - b[@intCast(i)];
+        s += d * d;
+    }
+    ln_buf[t] = s;
+    cuda.syncThreads();
+    var half: u32 = 128;
+    while (half > 0) : (half >>= 1) {
+        if (t < half) ln_buf[t] += ln_buf[t + half];
+        cuda.syncThreads();
+    }
+    if (t == 0) out[0] = cuda.fdiv(ln_buf[0], @floatFromInt(n));
+}
