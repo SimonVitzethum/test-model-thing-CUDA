@@ -97,7 +97,7 @@ static void checkpoint_header(Checkpoint& io, Cfg& cfg) {
         while (std::getline(canonical, line)) {
             std::string key = line.substr(0, line.find('='));
             if (stored_keys.find(" " + key + " ") != std::string::npos) expected += line + "\n";
-            else if (key != "traces" && key != "trace_decay" && key != "docsep")
+            else if (key != "traces" && key != "trace_decay" && key != "docsep" && key != "dialog")
                 throw std::runtime_error("checkpoint configuration schema mismatch");
         }
         if (expected != text) throw std::runtime_error("checkpoint configuration schema mismatch");

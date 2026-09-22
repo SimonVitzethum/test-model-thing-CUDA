@@ -144,7 +144,7 @@ must stay unchanged during a run. Resume checks its identity by size and content
 
 Existing checkpoints supply their configuration automatically. Diverging
 model or training parameters are rejected on resume. A different configuration
-gets a new checkpoint path. With `mode=eval`, `seqlen` and `maxcarry` may also differ (e.g. `maxcarry=1024` for a context ablation). `mode`, `steps`, and `saveevery` are run control
+gets a new checkpoint path. With `mode=eval`, `seqlen`, `maxcarry`, `docsep` and `dialog` may also differ (e.g. `maxcarry=1024` for a context ablation). `mode`, `steps`, and `saveevery` are run control
 and are not part of the stored configuration. `saveevery=0` saves only at the end.
 SIGINT/SIGTERM stops after the current window and saves during training; after a
 process crash the last complete checkpoint remains.
@@ -164,6 +164,7 @@ Important options:
 | `traces` | `0`; `1` enables hybrid traces across window boundaries (see below) |
 | `trace_decay` | `1`; per-byte trace decay γ (`e_t = γ·a_t·e_(t-1) + …`), independent of `seqlen` |
 | `docsep` | `-1`; byte value that starts a new document (state and traces reset there) |
+| `dialog` | `0`; `1` scores only assistant turns of dialog data (see below) |
 
 The file is split into `batch` contiguous streams. Each stream
 starts with empty state. Training processes complete windows; at the
@@ -254,6 +255,39 @@ It trains nothing and is much cheaper and less noisy than training runs. On the
 With half-lives up to 512 bytes, TBPTT is already close to exact and the hybrid
 mainly helps the gate. Checkpoints trained with long half-lives are the real
 test.
+
+## Chat and dialog fine-tuning
+
+`chat` is an interactive CLI with a persistent recurrent state: everything said
+stays in the model's memory until `/reset`, there is no context window.
+
+```sh
+./chat model.ckpt temp=0.7 maxlen=512     # commands: /reset /temp X /maxlen N /mode dialog|raw /quit
+```
+
+For plain text checkpoints it runs in `raw` mode: the input is fed as text and
+the model continues it until a newline. For dialog checkpoints it runs in
+`dialog` mode with a byte-level turn format:
+
+```text
+0x1E                 start of a conversation (docsep=30 resets the state there)
+0x02 text 0x04       user turn
+0x03 text 0x04       assistant turn (the model ends it by emitting 0x04)
+```
+
+`tools/dialogprep.cpp` builds such data, e.g. from the OpenAssistant oasst1 trees
+(Apache-2.0; every English root-to-leaf path is one conversation, split by tree),
+or from `user<TAB>assistant` pairs. `dialog=1` makes the loss cover only the
+assistant text and its closing `0x04`; the user turns are context. `init=` starts
+a new run from another checkpoint's weights (same architecture, fresh optimizer),
+so a text model can be fine-tuned:
+
+```sh
+zcat 2023-04-12_oasst_ready.trees.jsonl.gz | ./dialogprep oasst oasst
+./train oasst_train.bin chat.ckpt init=text.ckpt dialog=1 docsep=30 lr=0.0002 steps=30000
+./train oasst_test.bin chat.ckpt mode=eval
+./chat chat.ckpt
+```
 
 ## Checkpoints and reproducibility
 
