@@ -48,6 +48,19 @@ pub fn main(init: std.process.Init) !u8 {
         try internal.append(gpa, std.mem.trimEnd(u8, line[ptr + 5 ..], " \t\r"));
     }
 
+    // Two kernels with identical bodies end up as one definition with two
+    // aliases; renaming would silently drop one of them.
+    for (internal.items, 0..) |sym, i| for (internal.items[i + 1 ..], names.items[i + 1 ..]) |other, name| {
+        if (std.mem.eql(u8, sym, other)) {
+            warn(io, "irpatch: identical kernel bodies share one definition: ");
+            warn(io, names.items[i]);
+            warn(io, " and ");
+            warn(io, name);
+            warn(io, "\n");
+            return 1;
+        }
+    };
+
     lines = std.mem.splitScalar(u8, text, '\n');
     var first = true;
     while (lines.next()) |line| {

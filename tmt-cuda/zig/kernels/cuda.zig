@@ -94,6 +94,12 @@ pub inline fn mulNoFma(a: f32, b: f32) f32 {
         : [r] "=f" (-> f32),
         : [x] "f" (a), [y] "f" (b));
 }
+/// 1/x as nvcc emits it for a division whose numerator is the constant 1.
+pub inline fn frcp(a: f32) f32 {
+    return asm ("rcp.approx.ftz.f32 %[r], %[x];"
+        : [r] "=f" (-> f32),
+        : [x] "f" (a));
+}
 pub inline fn frsqrt(a: f32) f32 {
     return asm ("rsqrt.approx.ftz.f32 %[r], %[x];"
         : [r] "=f" (-> f32),
@@ -101,7 +107,7 @@ pub inline fn frsqrt(a: f32) f32 {
 }
 
 pub inline fn sigmoid(x: f32) f32 {
-    return fdiv(1.0, 1.0 + __nv_fast_expf(-x));
+    return frcp(1.0 + __nv_fast_expf(-x));
 }
 pub inline fn silu(x: f32) f32 {
     return x * sigmoid(x);
@@ -128,3 +134,15 @@ pub inline fn atomicAddI32(p: *addrspace(.global) i32, v: i32) i32 {
 }
 
 pub extern fn __nv_log1pf(x: f32) f32;
+
+extern fn @"llvm.nvvm.shfl.sync.down.f32"(mask: u32, val: f32, delta: u32, c: u32) f32;
+/// __shfl_down_sync over the full warp width.
+pub inline fn shflDown(mask: u32, val: f32, delta: u32) f32 {
+    return @"llvm.nvvm.shfl.sync.down.f32"(mask, val, delta, 0x1f);
+}
+
+/// The two bf16 halves of one 32-bit word, in the order __bfloat1622float2
+/// returns them (x = low half, y = high half).
+pub inline fn bf2x2(bits: u32) [2]f32 {
+    return .{ bf2f(@truncate(bits)), bf2f(@truncate(bits >> 16)) };
+}

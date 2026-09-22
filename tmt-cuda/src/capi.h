@@ -100,6 +100,28 @@ int tmt_ref_state_bwd(const void* dS, const float* S, const float* decay, float*
 int tmt_ref_emb_trace(const void* X, const float* S, const float* initial, const float* decay,
                       const float* gate, float* trEmb, float* dEmb, int B, int T, int D,
                       const void* opt);
+/* `params` points at an MTParams (src/adam.cu); which: 0 = sumsq, 1 = AdamW, 2 = zero. */
+int tmt_ref_mt(const void* params, int which, float clip, float lr, float bc1, float bc2);
+/* MoE reference kernels (src/moe.cu). */
+int tmt_ref_router_topk(const void* X, const void* Wr, float* logits, float* probs, int* idx,
+                        float* w, int N, int E, int K, int D);
+int tmt_ref_topk(const float* logits, int* idx, float* w, float* probs, int N, int E, int K);
+int tmt_ref_count(const int* idx, int* counts, int N, int K);
+int tmt_ref_fill(const int* idx, const float* w, int* cursor, int* perm, float* slotw,
+                 int* slot_of, int N, int K);
+int tmt_ref_gather_slot(const void* X, const int* slot_of, void* Xg, int N, int K, int D);
+int tmt_ref_combine(const void* Yg, const float* slotw, const int* slot_of, void* Y, float beta,
+                    int N, int K, int D);
+int tmt_ref_combine_bwd(const void* dY, const void* Yg, const float* slotw, const int* slot_of,
+                        void* dYg, int N, int K, int D);
+int tmt_ref_sdot(const void* dY, const void* Yg, const int* slot_of, float* s_j, int N, int K, int D);
+int tmt_ref_router_bwd(const float* probs, const int* idx, const float* s_j, float* dlogits,
+                       float aux, float zcoef, const float* logits, const int* counts,
+                       int N, int E, int K);
+int tmt_ref_scatter_add(const void* dXg, const int* slot_of, void* dX, int N, int K, int D);
+int tmt_ref_aux_sum(const float* probs, float* sum_p, int N, int E);
+int tmt_ref_zloss(const float* logits, float* out, int N, int E);
+int tmt_ref_dense_activation(const void* pre, const void* grad, void* out, float beta, long n);
 int tmt_ref_add_f32(float* acc, const float* x, long n);
 int tmt_ref_ln_fwd(const void* X, const float* gamma, const float* beta, void* Y,
                    float* mean, float* rstd, int N, int D);

@@ -24,6 +24,20 @@ const CellOpt = extern struct {
     logEmb: u64 = 0,
 };
 
+/// Host mirrors of the optimizer structures (device pointers as addresses).
+const MTChunk = extern struct { param: i32, len: i32, start: i64 };
+const MTParams = extern struct {
+    master: u64,
+    m: u64,
+    v: u64,
+    grad: u64,
+    work: u64,
+    flags: u64,
+    chunks: u64,
+    nchunks: i32,
+    sumsq: u64,
+};
+
 var failures: usize = 0;
 
 /// Deterministic test data, independent of the platform's RNG.
@@ -526,6 +540,313 @@ pub fn main(init: std.process.Init) !u8 {
             report("embedding trace", wE < 1e-6 and w2 < 1e-5,
                 std.fmt.bufPrint(&eb, "trace within {e:.1} (1 ulp), dEmb within {e:.1} (atomic order)", .{ wE, w2 }) catch "");
         }
+    }
+
+    // ---- multi-tensor optimizer: norm, AdamW with clipping, zeroing ----
+    {
+        const sizes = [_]usize{ 5000, 300, 40000 };
+        const CHUNK = 4096;
+        var nchunks: usize = 0;
+        for (sizes) |n| nchunks += (n + CHUNK - 1) / CHUNK;
+        const chunks = try gpa.alloc(MTChunk, nchunks);
+        var at: usize = 0;
+        for (sizes, 0..) |n, p| {
+            var off: usize = 0;
+            while (off < n) : (off += CHUNK) {
+                chunks[at] = .{ .param = @intCast(p), .len = @intCast(@min(CHUNK, n - off)), .start = @intCast(off) };
+                at += 1;
+            }
+        }
+        var total: usize = 0;
+        for (sizes) |n| total += n;
+        const master = try gpa.alloc(f32, total);
+        const mom = try gpa.alloc(f32, total);
+        const vel = try gpa.alloc(f32, total);
+        const grad = try gpa.alloc(f32, total);
+        fill(master, 71);
+        fill(mom, 73);
+        fill(vel, 79);
+        fill(grad, 83);
+        for (vel) |*v| v.* = @abs(v.*); // second moments are nonnegative
+        // device buffers per parameter plus the pointer tables
+        var d_master: [3]u64 = undefined;
+        var d_m: [3]u64 = undefined;
+        var d_v: [3]u64 = undefined;
+        var d_g: [3]u64 = undefined;
+        var d_w: [3]u64 = undefined;
+        var base: usize = 0;
+        for (sizes, 0..) |n, p| {
+            d_master[p] = @intFromPtr(try Dev.alloc(n * 4));
+            d_m[p] = @intFromPtr(try Dev.alloc(n * 4));
+            d_v[p] = @intFromPtr(try Dev.alloc(n * 4));
+            d_g[p] = @intFromPtr(try Dev.alloc(n * 4));
+            d_w[p] = @intFromPtr(try Dev.alloc(n * 2));
+            try Dev.up(@ptrFromInt(d_m[p]), bytesOf(f32, mom[base..][0..n]));
+            try Dev.up(@ptrFromInt(d_v[p]), bytesOf(f32, vel[base..][0..n]));
+            try Dev.up(@ptrFromInt(d_g[p]), bytesOf(f32, grad[base..][0..n]));
+            base += n;
+        }
+        const flags = [_]u8{ 3, 3, 1 }; // the third is in the norm but not updated
+        const tables = [_][]const u64{ &d_master, &d_m, &d_v, &d_g, &d_w };
+        var d_tab: [5]u64 = undefined;
+        for (tables, 0..) |t, i| {
+            d_tab[i] = @intFromPtr(try Dev.alloc(3 * 8));
+            try Dev.up(@ptrFromInt(d_tab[i]), std.mem.sliceAsBytes(t));
+        }
+        const d_flags = try Dev.alloc(3);
+        try Dev.up(d_flags, &flags);
+        const d_chunks = try Dev.alloc(nchunks * @sizeOf(MTChunk));
+        try Dev.up(d_chunks, std.mem.sliceAsBytes(chunks));
+        const d_sumsq = try Dev.alloc(8);
+        const P = MTParams{
+            .master = d_tab[0], .m = d_tab[1], .v = d_tab[2], .grad = d_tab[3], .work = d_tab[4],
+            .flags = @intFromPtr(d_flags), .chunks = @intFromPtr(d_chunks),
+            .nchunks = @intCast(nchunks), .sumsq = @intFromPtr(d_sumsq),
+        };
+        const out = try gpa.alloc(f32, 4 * total);
+        const mine = try gpa.alloc(f32, 4 * total);
+        var norms: [2]f64 = undefined;
+        for ([_][]f32{ out, mine }, 0..) |dst, run| {
+            base = 0;
+            for (sizes, 0..) |n, p| {
+                try Dev.up(@ptrFromInt(d_master[p]), bytesOf(f32, master[base..][0..n]));
+                try Dev.up(@ptrFromInt(d_m[p]), bytesOf(f32, mom[base..][0..n]));
+                try Dev.up(@ptrFromInt(d_v[p]), bytesOf(f32, vel[base..][0..n]));
+                try Dev.up(@ptrFromInt(d_g[p]), bytesOf(f32, grad[base..][0..n]));
+                base += n;
+            }
+            try Dev.up(d_sumsq, &[_]u8{0} ** 8);
+            if (run == 0) {
+                if (tmt.tmt_ref_mt(&P, 0, 0, 0, 0, 0) != 0) return error.Ref;
+                if (tmt.tmt_ref_mt(&P, 1, 1.0, 0.001, 0.1, 0.002) != 0) return error.Ref;
+            } else {
+                try (try mod.get("mt_sumsq")).launch(@intCast(nchunks), 256, .{P});
+                try (try mod.get("mt_adam")).launch(@intCast(nchunks), 256, .{ P, @as(f32, 1.0), @as(f32, 0.001),
+                    @as(f32, 0.9), @as(f32, 0.999), @as(f32, 1e-8), @as(f32, 0.01), @as(f32, 0.1), @as(f32, 0.002) });
+            }
+            try Dev.down(std.mem.asBytes(&norms[run]), d_sumsq);
+            base = 0;
+            for (sizes, 0..) |n, p| {
+                try Dev.down(bytesOf(f32, dst[base..][0..n]), @ptrFromInt(d_master[p]));
+                try Dev.down(bytesOf(f32, dst[total + base ..][0..n]), @ptrFromInt(d_m[p]));
+                try Dev.down(bytesOf(f32, dst[2 * total + base ..][0..n]), @ptrFromInt(d_v[p]));
+                const wbuf = try gpa.alloc(u16, n);
+                try Dev.down(bytesOf(u16, wbuf), @ptrFromInt(d_w[p]));
+                for (wbuf, 0..) |bits, i| dst[3 * total + base + i] = @bitCast(@as(u32, bits) << 16);
+                base += n;
+            }
+        }
+        // The squared norm is summed with atomic adds over blocks, so it is the
+        // one value that need not match to the last bit.
+        const nrel = @abs(norms[0] - norms[1]) / @max(@abs(norms[0]), 1e-30);
+        var ob: [128]u8 = undefined;
+        report("multi-tensor AdamW", std.mem.eql(f32, out, mine) and nrel < 1e-12,
+            std.fmt.bufPrint(&ob, "weights/moments identical, norm within {e:.1}", .{nrel}) catch "");
+
+        // gradient zeroing
+        try (try mod.get("mt_zero")).launch(@intCast(nchunks), 256, .{P});
+        base = 0;
+        var zeroed = true;
+        for (sizes, 0..) |n, p| {
+            const buf = try gpa.alloc(f32, n);
+            try Dev.down(bytesOf(f32, buf), @ptrFromInt(d_g[p]));
+            for (buf) |v| zeroed = zeroed and v == 0;
+            base += n;
+        }
+        report("mt_zero", zeroed, "");
+    }
+
+    // ---- Mixture of Experts ----
+    {
+        const R = 256; // positions
+        const E = 8;
+        const Kk = 2;
+        const Dm = 64;
+        const TK = R * Kk;
+        const xs = try gpa.alloc(f32, R * Dm);
+        const wr = try gpa.alloc(f32, E * Dm);
+        fill(xs, 89);
+        fill(wr, 97);
+        const d_xf = try Dev.alloc(R * Dm * 4);
+        const d_wf = try Dev.alloc(E * Dm * 4);
+        try Dev.up(d_xf, bytesOf(f32, xs));
+        try Dev.up(d_wf, bytesOf(f32, wr));
+        const d_xb = try Dev.alloc(R * Dm * 2);
+        const d_wb = try Dev.alloc(E * Dm * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_xf)), d_xb, R * Dm) != 0) return error.Ref;
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_wf)), d_wb, E * Dm) != 0) return error.Ref;
+        const d_rl = try Dev.alloc(R * E * 4);
+        const d_rp = try Dev.alloc(R * E * 4);
+        const d_idx = try Dev.alloc(TK * 4);
+        const d_rw = try Dev.alloc(TK * 4);
+        const rl = try gpa.alloc(f32, 2 * R * E);
+        const mrl = try gpa.alloc(f32, 2 * R * E);
+        const ridx = try gpa.alloc(i32, 2 * TK);
+        const midx = try gpa.alloc(i32, 2 * TK);
+
+        // router + top-k (warp shuffles, vector loads)
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_router_topk(d_xb, d_wb, @ptrCast(@alignCast(d_rl)), @ptrCast(@alignCast(d_rp)),
+                    @ptrCast(@alignCast(d_idx)), @ptrCast(@alignCast(d_rw)), R, E, Kk, Dm) != 0) return error.Ref;
+            } else try (try mod.get("router_topk")).launch(R, 64, .{ d_xb, d_wb, d_rl, d_rp, d_idx, d_rw,
+                @as(i32, R), @as(i32, E), @as(i32, Kk), @as(i32, Dm) });
+            const dst = if (run == 0) rl else mrl;
+            const di = if (run == 0) ridx else midx;
+            try Dev.down(bytesOf(f32, dst[0 .. R * E]), d_rl);
+            try Dev.down(bytesOf(f32, dst[R * E ..]), d_rp);
+            try Dev.down(bytesOf(i32, di[0..TK]), d_idx);
+            try Dev.down(bytesOf(f32, @as([]f32, @ptrCast(di[TK..]))), d_rw);
+        }
+        report("router + top-k", std.mem.eql(f32, rl, mrl) and std.mem.eql(i32, ridx, midx), "");
+
+        // dispatch: the counts must agree; the slot order comes from atomics
+        const zeros = try gpa.alloc(i32, E);
+        @memset(zeros, 0);
+        const d_counts = try Dev.alloc(E * 4);
+        const d_cursor = try Dev.alloc(E * 4);
+        const d_perm = try Dev.alloc(TK * 4);
+        const d_slotw = try Dev.alloc(TK * 4);
+        const d_slot = try Dev.alloc(TK * 4);
+        const cref = try gpa.alloc(i32, E);
+        const cmine = try gpa.alloc(i32, E);
+        try Dev.up(d_counts, bytesOf(i32, zeros));
+        if (tmt.tmt_ref_count(@ptrCast(@alignCast(d_idx)), @ptrCast(@alignCast(d_counts)), R, Kk) != 0) return error.Ref;
+        try Dev.down(bytesOf(i32, cref), d_counts);
+        try Dev.up(d_counts, bytesOf(i32, zeros));
+        try (try mod.get("count_experts")).launch((R + 255) / 256, 256, .{ d_idx, d_counts, @as(i32, R), @as(i32, Kk) });
+        try Dev.down(bytesOf(i32, cmine), d_counts);
+        report("expert counts", std.mem.eql(i32, cref, cmine), "");
+
+        // one dispatch (from the C++ kernel) feeds both builds from here on
+        const offsets = try gpa.alloc(i32, E);
+        var run_off: i32 = 0;
+        for (offsets, cref) |*o, c| {
+            o.* = run_off;
+            run_off += c;
+        }
+        try Dev.up(d_cursor, bytesOf(i32, offsets));
+        if (tmt.tmt_ref_fill(@ptrCast(@alignCast(d_idx)), @ptrCast(@alignCast(d_rw)), @ptrCast(@alignCast(d_cursor)),
+            @ptrCast(@alignCast(d_perm)), @ptrCast(@alignCast(d_slotw)), @ptrCast(@alignCast(d_slot)), R, Kk) != 0) return error.Ref;
+
+        // gather, combine, backward, scatter: all deterministic
+        const d_xg = try Dev.alloc(TK * Dm * 2);
+        const d_yg = try Dev.alloc(TK * Dm * 2);
+        const d_y = try Dev.alloc(R * Dm * 2);
+        const d_dyg = try Dev.alloc(TK * Dm * 2);
+        const d_sj = try Dev.alloc(TK * 4);
+        const d_dl = try Dev.alloc(R * E * 4);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_yg, TK * Dm) != 0) return error.Ref;
+        const bigA = try gpa.alloc(u16, TK * Dm);
+        const bigB = try gpa.alloc(u16, TK * Dm);
+        const fA = try gpa.alloc(f32, R * E);
+        const fB = try gpa.alloc(f32, R * E);
+
+        for ([_]u8{ 0, 1 }) |run| {
+            const dst = if (run == 0) bigA else bigB;
+            if (run == 0) {
+                if (tmt.tmt_ref_gather_slot(d_xb, @ptrCast(@alignCast(d_slot)), d_xg, R, Kk, Dm) != 0) return error.Ref;
+            } else try (try mod.get("gather_slot")).launch((TK * Dm + 255) / 256, 256,
+                .{ d_xb, d_slot, d_xg, @as(i32, R), @as(i32, Kk), @as(i32, Dm) });
+            try Dev.down(bytesOf(u16, dst[0 .. TK * Dm]), d_xg);
+        }
+        report("gather_slot", std.mem.eql(u16, bigA, bigB), "");
+        // Pristine start value for the kernels that read their own output (beta).
+        const y0 = try gpa.dupe(u16, bigA[0 .. R * Dm]);
+
+        for ([_]u8{ 0, 1 }) |run| {
+            try Dev.up(d_y, bytesOf(u16, y0));
+            if (run == 0) {
+                if (tmt.tmt_ref_combine(d_yg, @ptrCast(@alignCast(d_slotw)), @ptrCast(@alignCast(d_slot)), d_y, 1.0, R, Kk, Dm) != 0) return error.Ref;
+            } else try (try mod.get("combine")).launch((R * Dm + 255) / 256, 256,
+                .{ d_yg, d_slotw, d_slot, d_y, @as(i32, R), @as(i32, Kk), @as(i32, Dm), @as(f32, 1.0) });
+            try Dev.down(bytesOf(u16, (if (run == 0) bigA else bigB)[0 .. R * Dm]), d_y);
+        }
+        report("combine", std.mem.eql(u16, bigA[0 .. R * Dm], bigB[0 .. R * Dm]), "");
+
+        const sjA = try gpa.alloc(f32, TK);
+        const sjB = try gpa.alloc(f32, TK);
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_combine_bwd(d_y, d_yg, @ptrCast(@alignCast(d_slotw)), @ptrCast(@alignCast(d_slot)), d_dyg, R, Kk, Dm) != 0) return error.Ref;
+                if (tmt.tmt_ref_sdot(d_y, d_yg, @ptrCast(@alignCast(d_slot)), @ptrCast(@alignCast(d_sj)), R, Kk, Dm) != 0) return error.Ref;
+            } else {
+                try (try mod.get("combine_bwd")).launch((TK * Dm + 255) / 256, 256,
+                    .{ d_y, d_yg, d_slotw, d_slot, d_dyg, @as(u64, 0), @as(i32, R), @as(i32, Kk), @as(i32, Dm) });
+                try (try mod.get("sdot")).launch(TK, 256, .{ d_y, d_yg, d_slot, d_sj, @as(i32, R), @as(i32, Kk), @as(i32, Dm) });
+            }
+            try Dev.down(bytesOf(u16, (if (run == 0) bigA else bigB)[0 .. TK * Dm]), d_dyg);
+            try Dev.down(bytesOf(f32, if (run == 0) sjA else sjB), d_sj);
+        }
+        report("combine backward + sdot", std.mem.eql(u16, bigA[0 .. TK * Dm], bigB[0 .. TK * Dm]) and
+            std.mem.eql(f32, sjA, sjB), "");
+
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_router_bwd(@ptrCast(@alignCast(d_rp)), @ptrCast(@alignCast(d_idx)),
+                    @ptrCast(@alignCast(d_sj)), @ptrCast(@alignCast(d_dl)), 0.1, 0.001,
+                    @ptrCast(@alignCast(d_rl)), @ptrCast(@alignCast(d_counts)), R, E, Kk) != 0) return error.Ref;
+            } else try (try mod.get("router_bwd")).launch((R + 255) / 256, 256,
+                .{ d_rp, d_idx, d_sj, d_dl, @as(i32, R), @as(i32, E), @as(i32, Kk), d_rl, d_counts,
+                   @as(f32, 0.1), @as(f32, 0.001) });
+            try Dev.down(bytesOf(f32, if (run == 0) fA else fB), d_dl);
+        }
+        var rn: usize = 0;
+        var rsc: f32 = 1e-30;
+        var rw: f32 = 0;
+        for (fA) |v| rsc = @max(rsc, @abs(v));
+        for (fA, fB) |v, w| if (v != w) {
+            rn += 1;
+            rw = @max(rw, @abs(v - w) / rsc);
+        };
+        // The auxiliary and z-loss terms are a sum of products that nvcc
+        // hoists and fuses differently; the values stay within one or two
+        // units in the last place.
+        var rb: [128]u8 = undefined;
+        report("router backward", rw < 1e-6,
+            std.fmt.bufPrint(&rb, "within {e:.1} ({d} of {d} values, 1-2 ulp)", .{ rw, rn, fA.len }) catch "");
+
+        for ([_]u8{ 0, 1 }) |run| {
+            try Dev.up(d_y, bytesOf(u16, y0));
+            if (run == 0) {
+                if (tmt.tmt_ref_scatter_add(d_dyg, @ptrCast(@alignCast(d_slot)), d_y, R, Kk, Dm) != 0) return error.Ref;
+            } else try (try mod.get("scatter_add")).launch((R * Dm + 255) / 256, 256,
+                .{ d_dyg, d_slot, d_y, @as(i32, R), @as(i32, Kk), @as(i32, Dm) });
+            try Dev.down(bytesOf(u16, (if (run == 0) bigA else bigB)[R * Dm ..][0 .. R * Dm]), d_y);
+        }
+        report("scatter_add", std.mem.eql(u16, bigA[R * Dm ..][0 .. R * Dm], bigB[R * Dm ..][0 .. R * Dm]), "");
+
+        // dense path, auxiliary sums and z-loss
+        for ([_]u8{ 0, 1 }) |run| {
+            try Dev.up(d_y, bytesOf(u16, y0));
+            if (run == 0) {
+                if (tmt.tmt_ref_dense_activation(d_yg, d_xg, d_y, 0.5, R * Dm) != 0) return error.Ref;
+            } else try (try mod.get("dense_activation")).launch((R * Dm + 255) / 256, 256,
+                .{ d_yg, d_xg, d_y, @as(i64, R * Dm), @as(f32, 0.5) });
+            try Dev.down(bytesOf(u16, (if (run == 0) bigA else bigB)[0 .. R * Dm]), d_y);
+        }
+        report("dense activation", std.mem.eql(u16, bigA[0 .. R * Dm], bigB[0 .. R * Dm]), "");
+
+        const d_sump = try Dev.alloc(E * 4);
+        const auxA = try gpa.alloc(f32, E);
+        const auxB = try gpa.alloc(f32, E);
+        if (tmt.tmt_ref_aux_sum(@ptrCast(@alignCast(d_rp)), @ptrCast(@alignCast(d_sump)), R, E) != 0) return error.Ref;
+        try Dev.down(bytesOf(f32, auxA), d_sump);
+        try (try mod.get("aux_sum")).launch(1, 32, .{ d_rp, d_sump, @as(i32, R), @as(i32, E) });
+        try Dev.down(bytesOf(f32, auxB), d_sump);
+        const d_z = try Dev.alloc(4);
+        var zA: f32 = 0;
+        var zB: f32 = 0;
+        try Dev.up(d_z, &[_]u8{0} ** 4);
+        if (tmt.tmt_ref_zloss(@ptrCast(@alignCast(d_rl)), @ptrCast(@alignCast(d_z)), R, E) != 0) return error.Ref;
+        try Dev.down(std.mem.asBytes(&zA), d_z);
+        try Dev.up(d_z, &[_]u8{0} ** 4);
+        try (try mod.get("zloss")).launch((R + 255) / 256, 256, .{ d_rl, d_z, @as(i32, R), @as(i32, E) });
+        try Dev.down(std.mem.asBytes(&zB), d_z);
+        var zb: [96]u8 = undefined;
+        const zrel = @abs(zA - zB) / @max(@abs(zA), 1e-30);
+        report("aux sums + z-loss", std.mem.eql(f32, auxA, auxB) and zrel < 1e-6,
+            std.fmt.bufPrint(&zb, "z-loss within {e:.1} (atomic order)", .{zrel}) catch "");
     }
 
     if (failures == 0) say("ALL KERNEL COMPARISONS PASSED\n", .{});

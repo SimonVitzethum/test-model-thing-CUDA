@@ -386,6 +386,103 @@ int tmt_ref_emb_trace(const void* X, const float* S, const float* initial, const
         CUDA_CHECK(cudaDeviceSynchronize());
     });
 }
+int tmt_ref_mt(const void* params, int which, float clip, float lr, float bc1, float bc2) {
+    return guard([&] {
+        MTParams P; std::memcpy(&P, params, sizeof(MTParams));
+        if (which == 0) mt_sumsq_kernel<<<P.nchunks, 256>>>(P);
+        else if (which == 1) mt_adam_kernel<<<P.nchunks, 256>>>(P, clip, lr, .9f, .999f, 1e-8f, .01f, bc1, bc2);
+        else mt_zero_kernel<<<P.nchunks, 256>>>(P);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_router_topk(const void* X, const void* Wr, float* logits, float* probs, int* idx,
+                        float* w, int N, int E, int K, int D) {
+    return guard([&] {
+        router_topk_kernel<<<N, 64>>>((const bf16*)X, (const bf16*)Wr, logits, probs, idx, w, N, E, K, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_topk(const float* logits, int* idx, float* w, float* probs, int N, int E, int K) {
+    return guard([&] {
+        topk_kernel<<<(N + 255) / 256, 256>>>(logits, idx, w, probs, N, E, K);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_count(const int* idx, int* counts, int N, int K) {
+    return guard([&] {
+        count_kernel<<<(N + 255) / 256, 256>>>(idx, counts, N, K);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_fill(const int* idx, const float* w, int* cursor, int* perm, float* slotw,
+                 int* slot_of, int N, int K) {
+    return guard([&] {
+        fill_kernel<<<(N + 255) / 256, 256>>>(idx, w, cursor, perm, slotw, slot_of, N, K);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_gather_slot(const void* X, const int* slot_of, void* Xg, int N, int K, int D) {
+    return guard([&] {
+        long n = (long)N * K * D;
+        gather_slot_kernel<<<(n + 255) / 256, 256>>>((const bf16*)X, slot_of, (bf16*)Xg, N, K, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_combine(const void* Yg, const float* slotw, const int* slot_of, void* Y, float beta,
+                    int N, int K, int D) {
+    return guard([&] {
+        long n = (long)N * D;
+        combine_kernel<<<(n + 255) / 256, 256>>>((const bf16*)Yg, slotw, slot_of, (bf16*)Y, N, K, D, beta);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_combine_bwd(const void* dY, const void* Yg, const float* slotw, const int* slot_of,
+                        void* dYg, int N, int K, int D) {
+    return guard([&] {
+        long n = (long)N * K * D;
+        combine_bwd_kernel<<<(n + 255) / 256, 256>>>((const bf16*)dY, (const bf16*)Yg, slotw, slot_of,
+                                                     (bf16*)dYg, nullptr, N, K, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_sdot(const void* dY, const void* Yg, const int* slot_of, float* s_j, int N, int K, int D) {
+    return guard([&] {
+        sdot_kernel<<<N * K, 256>>>((const bf16*)dY, (const bf16*)Yg, slot_of, s_j, N, K, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_router_bwd(const float* probs, const int* idx, const float* s_j, float* dlogits,
+                       float aux, float zcoef, const float* logits, const int* counts,
+                       int N, int E, int K) {
+    return guard([&] {
+        router_bwd_kernel<<<(N + 255) / 256, 256>>>(probs, idx, s_j, dlogits, N, E, K, logits,
+                                                    counts, aux, zcoef);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_scatter_add(const void* dXg, const int* slot_of, void* dX, int N, int K, int D) {
+    return guard([&] {
+        long n = (long)N * D;
+        scatter_add_kernel<<<(n + 255) / 256, 256>>>((const bf16*)dXg, slot_of, (bf16*)dX, N, K, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_aux_sum(const float* probs, float* sum_p, int N, int E) {
+    return guard([&] { aux_sum_kernel<<<1, 32>>>(probs, sum_p, N, E); CUDA_CHECK(cudaDeviceSynchronize()); });
+}
+int tmt_ref_zloss(const float* logits, float* out, int N, int E) {
+    return guard([&] {
+        zloss_kernel<<<(N + 255) / 256, 256>>>(logits, out, N, E);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_dense_activation(const void* pre, const void* grad, void* out, float beta, long n) {
+    return guard([&] {
+        dense_activation_kernel<<<(n + 255) / 256, 256>>>((const bf16*)pre, (const bf16*)grad,
+                                                          (bf16*)out, n, beta);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
 int tmt_ref_copy_bf16(const float* src, void* dst, long n) {
     return guard([&] {
         copy_bf16_kernel<<<(n + 255) / 256, 256>>>(src, (bf16*)dst, n);
