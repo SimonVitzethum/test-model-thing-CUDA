@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
         return cli.fail(io, "error: {s}\n", .{tmt.lastError()});
     defer g.close();
     var buf: [256]u8 = undefined;
-    var out = std.Io.File.stdout().writer(io, &buf);
+    var out = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &out.interface;
     // Every byte is fed exactly once: the prediction after the last prompt
     // byte gives the first output byte.

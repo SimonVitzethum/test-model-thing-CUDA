@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     const libgcc = b.option([]const u8, "libgcc", "path of libgcc_s (C++ exception unwinding)") orelse "/usr/lib/libgcc_s.so.1";
 
     // nvcc: the model and its C API as one object.
-    const nvcc = b.addSystemCommand(&.{ b.pathJoin(&.{ cuda, "bin", "nvcc" }), "-O3", "-std=c++17", "--use_fast_math", "-Xcompiler", "-fPIC,-Wall" });
+    const nvcc = b.addSystemCommand(&.{ b.pathJoin(&.{ cuda, "bin", "nvcc" }), "-O3", "-std=c++17", "--use_fast_math", "-diag-suppress", "549,550", "-Xcompiler", "-fPIC,-Wall" });
     const compute = b.fmt("-gencode=arch=compute_{s},code={s}", .{ arch[3..], arch });
     nvcc.addArg(compute);
     nvcc.addArgs(&.{ "-c", "-o" });
@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "kgprep", .cuda = false },
         .{ .name = "sample", .cuda = true },
         .{ .name = "chat", .cuda = true },
+        .{ .name = "train", .cuda = true },
     };
     for (tools) |t| {
         const mod = b.createModule(.{

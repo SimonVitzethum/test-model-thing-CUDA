@@ -39,10 +39,10 @@ pub fn main(init: std.process.Init) !void {
     const tty = std.Io.File.stdin().isTty(io) catch false;
 
     var obuf: [4096]u8 = undefined;
-    var out = std.Io.File.stdout().writer(io, &obuf);
+    var out = std.Io.File.stdout().writerStreaming(io, &obuf);
     const w = &out.interface;
     var ebuf: [256]u8 = undefined;
-    var err = std.Io.File.stderr().writer(io, &ebuf);
+    var err = std.Io.File.stderr().writerStreaming(io, &ebuf);
     try err.interface.print("tmt chat ({s} mode, temp {d:.2}). /help for commands.\n", .{ mode, temp });
     try err.interface.flush();
 

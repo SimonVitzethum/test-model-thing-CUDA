@@ -34,7 +34,7 @@ pub const Args = struct {
 /// Prints `msg` to stderr (unbuffered) and returns error.Usage.
 pub fn fail(io: std.Io, comptime fmt: []const u8, args: anytype) error{Usage} {
     var buf: [1024]u8 = undefined;
-    var w = std.Io.File.stderr().writer(io, &buf);
+    var w = std.Io.File.stderr().writerStreaming(io, &buf);
     w.interface.print(fmt, args) catch {};
     w.interface.flush() catch {};
     return error.Usage;

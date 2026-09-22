@@ -63,7 +63,7 @@ const Writer = struct {
     fn finish(self: *Writer, io: std.Io, prefix: []const u8) !void {
         const names = [2][]const u8{ "train", "test" };
         var ebuf: [512]u8 = undefined;
-        var e = std.Io.File.stderr().writer(io, &ebuf);
+        var e = std.Io.File.stderr().writerStreaming(io, &ebuf);
         for (0..2) |k| {
             try self.writers[k].interface.flush();
             self.files[k].close(io);
@@ -132,7 +132,7 @@ pub fn main(init: std.process.Init) !void {
             if (!ok) errors += 1;
         }
         var ebuf: [256]u8 = undefined;
-        var e = std.Io.File.stderr().writer(io, &ebuf);
+        var e = std.Io.File.stderr().writerStreaming(io, &ebuf);
         try e.interface.print("{d} trees, {d} parse errors\n", .{ trees, errors });
         try e.interface.flush();
         try w.finish(io, pos[1]);

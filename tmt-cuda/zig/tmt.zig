@@ -93,3 +93,48 @@ pub const Generator = struct {
         return 255;
     }
 };
+
+// ---- training (src/capi.h) ----
+pub const Cfg = opaque {};
+pub const Model = opaque {};
+pub const Progress = extern struct {
+    step: u64 = 0,
+    cursor: u64 = 0,
+    epoch: u64 = 0,
+    carried: u64 = 0,
+    data_size: u64 = 0,
+    data_hash: u64 = 0,
+};
+pub extern fn tmt_cfg_new() ?*Cfg;
+pub extern fn tmt_cfg_from_checkpoint(path: [*:0]const u8) ?*Cfg;
+pub extern fn tmt_cfg_copy(c: *const Cfg) ?*Cfg;
+pub extern fn tmt_cfg_free(c: *Cfg) void;
+pub extern fn tmt_cfg_set(c: *Cfg, key: [*:0]const u8, value: [*:0]const u8) c_int;
+pub extern fn tmt_cfg_validate(c: *const Cfg) c_int;
+pub extern fn tmt_cfg_text(c: *Cfg) [*:0]const u8;
+pub extern fn tmt_model_new(c: *const Cfg) ?*Model;
+pub extern fn tmt_model_free(m: *Model) void;
+pub extern fn tmt_model_load(m: *Model, path: [*:0]const u8, p: *Progress) c_int;
+pub extern fn tmt_model_load_weights(m: *Model, path: [*:0]const u8) c_int;
+pub extern fn tmt_model_save(m: *Model, path: [*:0]const u8, p: *const Progress) c_int;
+pub extern fn tmt_model_reset_state(m: *Model) c_int;
+pub extern fn tmt_model_forward(m: *Model, ids: [*]const c_int, targets: [*]const c_int, ends: [*]const c_int, loss: *f32, ce: *f32) c_int;
+pub extern fn tmt_model_losses(m: *Model, out: [*]f32) c_int;
+pub extern fn tmt_model_backward(m: *Model, log_traces: c_int) c_int;
+pub extern fn tmt_model_optimizer_step(m: *Model, step: c_int) c_int;
+pub extern fn tmt_model_expert_counts(m: *const Model, out: [*]i64) c_int;
+pub extern fn tmt_model_trace_stats(m: *Model, out: *[9]f64) c_int;
+pub extern fn tmt_model_state_buckets(m: *Model, sum: *[5]f64, count: *[5]i64) c_int;
+pub extern fn tmt_synchronize() c_int;
+pub extern fn tmt_install_stop_handler() void;
+pub extern fn tmt_stop_requested() c_int;
+
+/// Fails with error.Api (message in lastError()) if a C API call returned -1.
+pub fn check(rc: c_int) !void {
+    if (rc != 0) return error.Api;
+}
+
+/// printf-compatible formatting through libc, so logs match the C++ tools
+/// byte for byte (%.9g, %.3g, ...).
+pub extern "c" fn snprintf(buf: [*]u8, size: usize, fmt: [*:0]const u8, ...) c_int;
+pub extern "c" fn log(x: f64) f64;

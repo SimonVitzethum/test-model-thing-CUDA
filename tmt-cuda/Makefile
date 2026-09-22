@@ -44,7 +44,13 @@ check: architecture_test train sample chat gradcheck dialogprep kgtrain kgprep
 	sh tests/cli.sh
 	sh tests/kg.sh
 
+# The Zig host programs must behave like the C++ ones (needs zig).
+check-zig: all
+	zig build
+	zig build test
+	sh tests/zig.sh
+
 clean:
 	rm -f bench train selftest architecture_test sample chat gradcheck dialogprep kgtrain kgprep profile roofline
 
-.PHONY: all check clean
+.PHONY: all check check-zig clean

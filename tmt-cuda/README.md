@@ -19,6 +19,16 @@ make ARCH='-gencode arch=compute_89,code=sm_89'
 # After changing ARCH, run `make clean` first.
 ```
 
+The host programs are being rewritten in Zig (the CUDA kernels stay in
+`src/*.cu` and are reached through the C API in `src/capi.h`):
+
+```sh
+zig build                 # zig-out/bin: train, sample, chat, dialogprep, kgprep
+zig build test            # Zig unit tests
+make check-zig            # compares the Zig binaries against the C++ ones
+zig build -Darch=sm_89    # other GPU (default sm_120a)
+```
+
 `make check` requires a GPU but neither Python nor PyTorch. It checks:
 
 - normalized recurrence with/without input gate, nonempty carry, and numeric gradients;

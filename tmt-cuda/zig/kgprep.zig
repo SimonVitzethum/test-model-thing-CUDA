@@ -184,7 +184,7 @@ fn cmdDump(io: std.Io, gpa: std.mem.Allocator, out_path: []const u8, threads: us
     var line_buf = std.Io.Writer.Allocating.init(gpa);
     defer line_buf.deinit();
     var err_buf: [256]u8 = undefined;
-    var err = std.Io.File.stderr().writer(io, &err_buf);
+    var err = std.Io.File.stderr().writerStreaming(io, &err_buf);
     var batch: std.ArrayList([]u8) = .empty;
     var n: usize = 0;
     while (try cli.readLine(&in.interface, &line_buf)) |raw| {
@@ -349,7 +349,7 @@ fn cmdQa(io: std.Io, arena: std.mem.Allocator, graph: []const u8, prefix: []cons
         }
     }
     var err_buf: [512]u8 = undefined;
-    var err = std.Io.File.stderr().writer(io, &err_buf);
+    var err = std.Io.File.stderr().writerStreaming(io, &err_buf);
     const names = [2][]const u8{ "train", "test" };
     for (0..2) |k| {
         shuffle(Row, rows[k].items, &rng);

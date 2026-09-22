@@ -18,6 +18,50 @@ int tmt_gen_feed(tmt_gen* h, int byte, float* logits /* [256] */, float* stop_pr
 int tmt_gen_reset(tmt_gen* h);
 long tmt_gen_fed(const tmt_gen* h);
 
+/* ---- training ---- */
+#include <stdint.h>
+
+/* Model configuration (schema, parsing and validation of src/config.h). */
+typedef struct tmt_cfg tmt_cfg;
+tmt_cfg* tmt_cfg_new(void);                          /* defaults */
+tmt_cfg* tmt_cfg_from_checkpoint(const char* path);  /* NULL on error */
+tmt_cfg* tmt_cfg_copy(const tmt_cfg* c);
+void tmt_cfg_free(tmt_cfg* c);
+int tmt_cfg_set(tmt_cfg* c, const char* key, const char* value);
+int tmt_cfg_validate(const tmt_cfg* c);
+const char* tmt_cfg_text(tmt_cfg* c);                /* key=value lines, valid until the next call */
+
+/* Training progress stored in checkpoints. */
+typedef struct {
+    uint64_t step, cursor, epoch, carried, data_size, data_hash;
+} tmt_progress;
+
+/* A model with its streaming state (one window of batch x seqlen bytes). */
+typedef struct tmt_model tmt_model;
+tmt_model* tmt_model_new(const tmt_cfg* c);          /* NULL on error */
+void tmt_model_free(tmt_model* m);
+int tmt_model_load(tmt_model* m, const char* path, tmt_progress* p);   /* full resume */
+int tmt_model_load_weights(tmt_model* m, const char* path);            /* init= */
+int tmt_model_save(tmt_model* m, const char* path, const tmt_progress* p);
+int tmt_model_reset_state(tmt_model* m);
+/* ids/targets/ends: batch*seqlen each; targets < 0 are not scored. */
+int tmt_model_forward(tmt_model* m, const int* ids, const int* targets, const int* ends,
+                      float* loss, float* ce);
+int tmt_model_losses(tmt_model* m, float* out);      /* per-position CE of the last forward */
+int tmt_model_backward(tmt_model* m, int log_traces);
+int tmt_model_optimizer_step(tmt_model* m, int step);
+int tmt_model_expert_counts(const tmt_model* m, int64_t* out /* layers*experts */);
+/* Trace part vs in-window part of the gradient after a backward with
+   log_traces=1: {pp, ww, pw} for decay, gate, embedding (9 values). */
+int tmt_model_trace_stats(tmt_model* m, double* out);
+/* Mean |state| per half-life bucket (<16, <128, <1k, <8k, >=8k). */
+int tmt_model_state_buckets(tmt_model* m, double* sum /* 5 */, int64_t* count /* 5 */);
+int tmt_synchronize(void);
+
+/* SIGINT/SIGTERM set a flag instead of terminating. */
+void tmt_install_stop_handler(void);
+int tmt_stop_requested(void);
+
 #ifdef __cplusplus
 }
 #endif
