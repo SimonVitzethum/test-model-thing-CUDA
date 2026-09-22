@@ -261,6 +261,41 @@ static void test_moe_backward() {
         "embedding gradient through MoE differs from dense");
     std::puts("PASS MoE backward: identical experts reproduce dense expert and input gradients");
 }
+// Multi-tensor optimizer against an independent host reference: global-norm
+// clipping, AdamW on every parameter except the EMA target and an unused stop
+// head, EMA target update, and a non-finite gradient refusing the whole step.
+static void test_optimizer() {
+    Cfg c=small_config(3);c.gradclip=.05f;Model m;m.c=c;build_model(m);
+    std::mt19937 rng(9);std::uniform_real_distribution<float> U(-1,1);
+    size_t P=m.params.values.size();std::vector<std::vector<float>> w(P),mm(P),vv(P),g(P);
+    for(size_t j=0;j<P;++j){auto& p=m.params.at(j);w[j]=read_gpu(p.master,p.n);mm[j].resize(p.n);vv[j].resize(p.n);g[j].resize(p.n);
+        for(long i=0;i<p.n;++i){mm[j][i]=U(rng)*.01f;vv[j][i]=fabsf(U(rng))*1e-4f;g[j][i]=U(rng);}
+        CUDA_CHECK(cudaMemcpy(p.m,mm[j].data(),p.n*4,cudaMemcpyHostToDevice));CUDA_CHECK(cudaMemcpy(p.v,vv[j].data(),p.n*4,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(p.grad,g[j].data(),p.n*4,cudaMemcpyHostToDevice));}
+    const int step=5;optimizer_step(m,step);
+    double sumsq=0;for(size_t j=0;j<P;++j)if(j!=m.tgt)for(float e:g[j])sumsq+=(double)e*e;
+    double scale=std::min(1.0,c.gradclip/std::max(sqrt(sumsq),1e-12));require(scale<1,"test does not exercise clipping");
+    // Same float constants and bias corrections as the optimizer (and the previous per-parameter code).
+    const double B1=.9f,B2=.999f;double lr=lr_at(c,step),bc1=1.0f-powf(.9f,step+1),bc2=1.0f-powf(.999f,step+1);
+    for(size_t j=0;j<P;++j){if(j==m.tgt)continue;auto& p=m.params.at(j);
+        auto gw=read_gpu(p.master,p.n),gm=read_gpu(p.m,p.n),gv=read_gpu(p.v,p.n);
+        for(long i=0;i<p.n;++i){
+            if(j==m.stop){near(gw[i],w[j][i],0,0,"unused stop head was updated");continue;}
+            double gg=g[j][i]*scale,nm=B1*mm[j][i]+(1-B1)*gg,nv=B2*vv[j][i]+(1-B2)*gg*gg;
+            double nw=w[j][i]-lr*((nm/bc1)/(sqrt(nv/bc2)+1e-8)+.01*w[j][i]);
+            near(gm[i],nm,1e-8,1e-4,"optimizer first moment");near(gv[i],nv,1e-10,1e-4,"optimizer second moment");
+            near(gw[i],nw,1e-7,1e-5,"optimizer weight");}}
+    auto tgt=read_gpu(m.params.at(m.tgt).master,m.params.at(m.tgt).n),emb=read_gpu(m.params.at(m.emb).master,m.params.at(m.emb).n);
+    for(size_t i=0;i<tgt.size();++i)near(tgt[i],c.ematau*w[m.tgt][i]+(1-c.ematau)*emb[i],1e-6,1e-5,"EMA target");
+    // Non-finite gradient: the step is refused and nothing changes.
+    auto before=read_gpu(m.params.at(m.emb).master,m.params.at(m.emb).n);
+    float nan=NAN;CUDA_CHECK(cudaMemcpy(m.params.at(m.dec).grad,&nan,4,cudaMemcpyHostToDevice));
+    bool refused=false;try{optimizer_step(m,step+1);}catch(const std::exception&){refused=true;}
+    require(refused,"non-finite gradient accepted");
+    auto after=read_gpu(m.params.at(m.emb).master,m.params.at(m.emb).n);
+    for(size_t i=0;i<after.size();++i)near(after[i],before[i],0,0,"weights changed by a refused step");
+    std::printf("PASS multi-tensor optimizer: %d chunks, clipping, AdamW, EMA and refused steps match the reference\n",m.opt.nchunks);
+}
 static void test_mla_chunks() {
     Model a,b;a.c=small_config();a.c.layers=1;a.c.mla=1;a.c.mla_heads=2;
     a.c.mla_dh=4;a.c.mla_L=4;a.c.mla_R=6;a.c.mla_cache=17;a.c.mla_cc=3;
@@ -383,6 +418,6 @@ static void compare_checkpoints(const std::string& first,const std::string& seco
 }
 int main(int argc,char** argv){try{
     if(argc==4 && std::string(argv[1])=="--compare") {compare_checkpoints(argv[2],argv[3]);return 0;}
-test_cell();test_router();test_moe_backward();test_model(1);test_model(3);test_traces();test_traces(70);test_docsep();test_trace_decay();test_mla_chunks();test_mla_reference();
+test_cell();test_router();test_moe_backward();test_optimizer();test_model(1);test_model(3);test_traces();test_traces(70);test_docsep();test_trace_decay();test_mla_chunks();test_mla_reference();
     CUDA_CHECK(cudaDeviceSynchronize());std::puts("ALL ARCHITECTURE TESTS PASSED");return 0;
 }catch(const std::exception& e){std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}}

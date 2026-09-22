@@ -51,6 +51,9 @@ grep -q '^state:' "$work/doc.log"
 ./train "$work/heldout" "$work/doc" mode=eval > "$work/doc-eval.log"
 ./gradcheck "$work/data" "$work/doc" len=28 window=7 seqs=2 > "$work/gradcheck.log"
 grep -q '^decay' "$work/gradcheck.log"
+# Optional loss terms (latent, variance, stop) still train when enabled.
+./train "$work/data" "$work/losses" dim=16 layers=2 batch=2 seqlen=7 latent=1 var=1 stop=1 steps=3 saveevery=0 > "$work/losses.log"
+grep -q '"mode":"train"' "$work/losses.log"
 # Dialog data, answer-only loss, init= from another checkpoint, interactive chat.
 awk 'BEGIN { for (i=0;i<200;i++) printf "\036\002hi\004\003ok\004" }' > "$work/dialog.bin"
 ./train "$work/dialog.bin" "$work/dlg" init="$work/whole" dialog=1 batch=1 seqlen=9 steps=40 saveevery=0 > "$work/dlg.log"
