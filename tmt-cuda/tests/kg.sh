@@ -49,4 +49,6 @@ test "$(wc -l < "$work/qa_nodes.tsv")" -eq 3
 grep -q 'retrieval_loss=' "$work/r.log"
 ./kgtrain eval "$work/qa_train.tsv" "$work/r.ckpt" nodes="$work/qa_nodes.tsv" memory=retrieved > "$work/r-eval.log"
 grep -q '"index_nodes":3,' "$work/r-eval.log"
-echo 'PASS KG: dump parsing (ranks, enwiki filter, escapes, self-references), QA split, kgtrain resume/eval, sampler without memory, stage-2 retrieval'
+./kgtrain ask "$work/r.ckpt" nodes="$work/qa_nodes.tsv" "What is the capital of Paris?" top=2 maxlen=4 > "$work/ask.log" 2> /dev/null
+grep -q '^retrieved: ' "$work/ask.log" && grep -q '^answer: ' "$work/ask.log"
+echo 'PASS KG: dump parsing (ranks, enwiki filter, escapes, self-references), QA split, kgtrain resume/eval, sampler without memory, stage-2 retrieval, ask demo'

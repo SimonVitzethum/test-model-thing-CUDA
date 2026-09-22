@@ -1,6 +1,8 @@
 // kgtrain: train and evaluate the fact memory on knowledge-graph QA data.
 //   kgtrain train DATA.tsv CKPT [steps=N] [saveevery=N] [nodes=NODES.tsv] [key=value ...]
 //   kgtrain eval  DATA.tsv CKPT [memory=on|off|shuffled|retrieved] [nodes=NODES.tsv] [show=N]
+//   kgtrain ask   CKPT nodes=NODES.tsv ["question"] [top=5] [maxlen=80] [temp=0]
+//     (stage-2 checkpoint; without a question it reads questions from stdin)
 // DATA.tsv rows: question <tab> answer <tab> memory <tab> subject, as written by
 // kgprep qa. Each example is one window "question answer\n"; the loss covers
 // only the answer bytes and the final newline. Evaluation reports exact match
@@ -15,6 +17,7 @@
 #include "checkpoint.h"
 #include "retrieval.h"
 #include <csignal>
+#include <iostream>
 #include <fstream>
 #include <random>
 #include <unordered_map>
@@ -113,14 +116,119 @@ static std::vector<float> host_master(Model& m, size_t p) {
     return v;
 }
 
+// Interactive stage-2 demo: retrieve the subject from the model's own state,
+// show the best nodes, load the winner's facts and generate the answer byte by
+// byte (autoregressive, not teacher-forced).
+static int run_ask(int argc, char** argv) {
+    std::string path = argv[2], nodes_path, question;
+    int top = 5, maxlen = 80;
+    float temp = 0.f;
+    for (int i = 3; i < argc; ++i) {
+        std::string a = argv[i]; size_t eq = a.find('=');
+        if (eq == std::string::npos) { question = a; continue; }
+        std::string k = a.substr(0, eq), v = a.substr(eq + 1);
+        if (k == "nodes") nodes_path = v;
+        else if (k == "top") top = std::stoi(v);
+        else if (k == "maxlen") maxlen = std::stoi(v);
+        else if (k == "temp") temp = std::stof(v);
+        else throw std::runtime_error("unknown option: " + k);
+    }
+    Cfg cfg = checkpoint_config(path);
+    if (!cfg.mem || cfg.mem_rdim <= 0 || nodes_path.empty())
+        throw std::runtime_error("ask needs a stage-2 checkpoint (mem_rdim > 0) and nodes=NODES.tsv");
+    auto nodes = load_nodes(nodes_path);
+    Model m; m.c = cfg; build_model(m);
+    StreamState state; build_state(state, m);
+    load_weights_only(path, m, cfg);
+    int B = cfg.batch, T = cfg.seqlen, M = cfg.mem_len, D = cfg.dim, R = cfg.mem_rdim, N = B * T;
+    std::vector<int> ids(N), nxt(N), mem((size_t)B * M);
+    auto read_batch = [&](const std::vector<std::string>& texts, std::vector<int>& last) {
+        last.assign(B, -1);
+        for (int b = 0; b < B; ++b) {
+            if (b < (int)texts.size()) last[b] = fill_reading(texts[b], b, cfg, ids, nxt, mem);
+            if (last[b] < 0) fill_reading(" ", b, cfg, ids, nxt, mem);
+        }
+        upload_batch(m, ids, nxt, mem);
+        reset_state(state, cfg);
+        float loss, ce; forward_window(m, state, loss, ce);
+        return read_rows(m, last);
+    };
+    std::fprintf(stderr, "indexing %zu nodes...\n", nodes.size());
+    auto Wk = host_master(m, m.MS.rk), Wq = host_master(m, m.MS.rq);
+    std::vector<float> keys(nodes.size() * R, 0.f);
+    for (size_t first = 0; first < nodes.size(); first += B) {
+        std::vector<std::string> batch;
+        for (size_t i = first; i < std::min(nodes.size(), first + B); ++i) batch.push_back(nodes[i].label);
+        std::vector<int> last;
+        auto rows = read_batch(batch, last);
+        for (size_t b = 0; b < batch.size(); ++b)
+            if (last[b] >= 0) { auto u = head_unit(Wk, &rows[b * D], R, D); std::copy(u.begin(), u.end(), keys.begin() + (first + b) * R); }
+    }
+    std::mt19937 rng(1);
+    auto answer = [&](const std::string& q) {
+        std::vector<int> last;
+        auto rows = read_batch({q}, last);
+        if (last[0] < 0) { std::printf("(question longer than seqlen=%d)\n", T); return; }
+        auto qv = head_unit(Wq, &rows[0], R, D);
+        std::vector<std::pair<float, int>> scored(nodes.size());
+        for (size_t k = 0; k < nodes.size(); ++k) {
+            float s = 0;
+            for (int r = 0; r < R; ++r) s += qv[r] * keys[k * R + r];
+            scored[k] = {s, (int)k};
+        }
+        int shown = std::min<int>(top, (int)scored.size());
+        std::partial_sort(scored.begin(), scored.begin() + shown, scored.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        std::printf("retrieved:");
+        for (int i = 0; i < shown; ++i) std::printf(" %s (%.3f)%s", nodes[scored[i].second].label.c_str(), scored[i].first, i + 1 < shown ? "," : "\n");
+        const Node& best = nodes[scored[0].second];
+        std::printf("memory:    %s\n", best.memory.c_str());
+        // Generate "question answer\n": one window forward per byte, memory = best node's facts.
+        std::string text = q + " ", out;
+        std::vector<bf16> row(256);
+        for (int step = 0; step < maxlen && (int)text.size() < T; ++step) {
+            for (int t = 0; t < T; ++t) { ids[t] = t < (int)text.size() ? (unsigned char)text[t] : ' '; nxt[t] = -1; }
+            for (int j = 0; j < M; ++j) mem[j] = j < (int)best.memory.size() ? (unsigned char)best.memory[j] : -1;
+            for (int b = 1; b < B; ++b) { fill_reading(" ", b, cfg, ids, nxt, mem); }
+            upload_batch(m, ids, nxt, mem);
+            reset_state(state, cfg);
+            float loss, ce; forward_window(m, state, loss, ce);
+            CUDA_CHECK(cudaMemcpy(row.data(), m.logits + (size_t)(text.size() - 1) * 256, 256 * 2, cudaMemcpyDeviceToHost));
+            int pick = 0;
+            if (temp <= 0) { for (int k = 1; k < 256; ++k) if (bf2f(row[k]) > bf2f(row[pick])) pick = k; }
+            else {
+                double p[256], sum = 0; float mx = -1e30f;
+                for (int k = 0; k < 256; ++k) mx = std::max(mx, bf2f(row[k]));
+                for (int k = 0; k < 256; ++k) sum += p[k] = exp((bf2f(row[k]) - mx) / temp);
+                double r = std::uniform_real_distribution<double>(0, 1)(rng) * sum;
+                for (pick = 0; pick < 255 && (r -= p[pick]) > 0; ++pick) {}
+            }
+            if (pick == '\n') break;
+            text += (char)pick; out += (char)pick;
+        }
+        std::printf("answer:    %s\n", out.c_str());
+        std::fflush(stdout);
+    };
+    if (!question.empty()) { answer(question); return 0; }
+    std::string line;
+    bool tty = isatty(0);
+    while (true) {
+        if (tty) { std::printf("question> "); std::fflush(stdout); }
+        if (!std::getline(std::cin, line) || line == "/quit") break;
+        if (!line.empty()) answer(line);
+    }
+    return 0;
+}
+
 static volatile sig_atomic_t interrupted = 0;
 static void stop_requested(int) { interrupted = 1; }
 
 int main(int argc, char** argv) {
     try {
+        if (argc >= 3 && std::string(argv[1]) == "ask") return run_ask(argc, argv);
         if (argc < 4 || (std::string(argv[1]) != "train" && std::string(argv[1]) != "eval")) {
             std::printf("usage: kgtrain train DATA.tsv CKPT [steps=N] [saveevery=N] [nodes=NODES.tsv] [key=value ...]\n"
-                        "       kgtrain eval  DATA.tsv CKPT [memory=on|off|shuffled|retrieved] [nodes=NODES.tsv] [show=N]\n");
+                        "       kgtrain eval  DATA.tsv CKPT [memory=on|off|shuffled|retrieved] [nodes=NODES.tsv] [show=N]\n"
+                        "       kgtrain ask   CKPT nodes=NODES.tsv [\"question\"] [top=5] [maxlen=80] [temp=0]\n");
             return 1;
         }
         bool training = std::string(argv[1]) == "train";
