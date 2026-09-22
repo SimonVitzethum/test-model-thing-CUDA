@@ -24,7 +24,7 @@ gradcheck: src/gradcheck.cu $(wildcard src/*.h src/*.cu) Makefile
 kgtrain: src/kg_main.cu $(wildcard src/*.h src/*.cu) Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/kg_main.cu -lcublas
 
-kgprep: tools/kgprep.cpp Makefile
+kgprep: tools/kgprep.cpp tools/json_scan.h Makefile
 	$(CXX) -O3 -std=c++17 -Wall -pthread -o $@ tools/kgprep.cpp
 
 chat: src/chat.cu src/generate.h $(wildcard src/*.h src/*.cu) Makefile
