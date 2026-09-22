@@ -223,12 +223,29 @@ pub const CellOpt = extern struct {
     logDec: ?cuda.Global(f32) = null,
     logGate: ?cuda.Global(f32) = null,
     logEmb: ?cuda.Global(f32) = null,
+    /// (B,T) 0 marks a padded step, which leaves the state untouched.
+    mask: ?cuda.ConstGlobal(i32) = null,
+    /// (B,T) bytes covered by this step; the decay per step becomes a^len, so
+    /// a half-life stays a half-life in bytes when a layer runs per patch.
+    plen: ?cuda.ConstGlobal(i32) = null,
 };
 
-/// a = sigmoid(decay + gate*x), or 0 at a document separator (s_t = x_t).
-inline fn cellA(o: CellOpt, decay: f32, gate: ?cuda.ConstGlobal(f32), d: u32, x: f32, b: u32, T: i32, t: i32) f32 {
-    if (o.docsep >= 0 and o.ids.?[@intCast(@as(i32, @intCast(b)) * T + t)] == o.docsep) return 0;
-    return cuda.sigmoid(decay + if (gate) |g| g[d] * x else 0);
+/// The decay of one step: its value, and the derivative with respect to the
+/// pre-activation, which the backward needs.
+const Step = struct { eff: f32, dadz: f32 };
+
+inline fn cellStep(o: CellOpt, decay: f32, gate: ?cuda.ConstGlobal(f32), d: u32, x: f32,
+                   b: u32, T: i32, t: i32) Step {
+    const at: usize = @intCast(@as(i32, @intCast(b)) * T + t);
+    if (o.mask) |m| if (m[at] == 0) return .{ .eff = 1, .dadz = 0 };
+    if (o.docsep >= 0 and o.ids.?[at] == o.docsep) return .{ .eff = 0, .dadz = 0 };
+    const a = cuda.sigmoid(decay + if (gate) |g| g[d] * x else 0);
+    if (o.plen) |lens| {
+        const len: f32 = @floatFromInt(lens[at]);
+        const eff = cuda.__nv_fast_powf(a, len);
+        return .{ .eff = eff, .dadz = len * eff * (1.0 - a) };
+    }
+    return .{ .eff = a, .dadz = a * (1.0 - a) };
 }
 
 /// Pass 1: the time loop, one thread per (stream, channel).
@@ -243,7 +260,7 @@ export fn state_pass(X: cuda.ConstGlobal(bf16), S: cuda.Global(f32), decay: cuda
     while (t < T) : (t += 1) {
         const idx: u32 = @bitCast((@as(i32, @intCast(b)) * T + t) * D + @as(i32, @intCast(d)));
         const x = cuda.bf2f(X[idx]);
-        const dec = cellA(o, decay[d], gate, d, x, b, T, t);
+        const dec = cellStep(o, decay[d], gate, d, x, b, T, t).eff;
         state = dec * state + (1.0 - dec) * x;
         S[idx] = state;
     }
@@ -311,10 +328,11 @@ export fn state_bwd(dS: cuda.ConstGlobal(bf16), S: cuda.ConstGlobal(f32), decay:
     while (t >= 0) : (t -= 1) {
         const idx: usize = @intCast((@as(i64, b) * T + t) * D + @as(i64, d));
         const x = cuda.bf2f(X[idx]);
-        const a = cellA(o, decay[d], gate, d, x, b, T, t);
+        const st = cellStep(o, decay[d], gate, d, x, b, T, t);
+        const a = st.eff;
         const total = cuda.bf2f(dS[idx]) + future;
         const prev = if (t != 0) S[idx - @as(usize, @intCast(D))] else if (initial) |i| i[@as(usize, b) * @as(usize, @intCast(D)) + d] else 0;
-        const local = (prev - x) * a * (1.0 - a);
+        const local = (prev - x) * st.dadz;
         const gz = total * local;
         dX[idx] = total * (1.0 - a) + if (gate) |g| gz * g[d] else 0;
         gd += gz;
@@ -372,9 +390,10 @@ export fn emb_trace(X: cuda.ConstGlobal(bf16), S: cuda.ConstGlobal(f32), initial
     while (t >= 0) : (t -= 1) {
         const idx: usize = @intCast((@as(i64, b) * T + t) * D + @as(i64, d));
         const x = cuda.bf2f(X[idx]);
-        const a = cellA(o, decay[d], gate, d, x, b, T, t);
+        const st = cellStep(o, decay[d], gate, d, x, b, T, t);
+        const a = st.eff;
         const prev = if (t != 0) S[idx - dim] else initial[bd];
-        const k = if (gate) |g| @mulAdd(f32, (prev - x) * a * (1.0 - a), g[d], 1.0 - a) else 1.0 - a;
+        const k = if (gate) |g| @mulAdd(f32, (prev - x) * st.dadz, g[d], 1.0 - a) else 1.0 - a;
         e[@as(usize, @intCast(o.ids.?[@intCast(@as(i32, @intCast(b)) * T + t)])) * dim] += suffix * k;
         suffix *= o.gamma * a;
     }
@@ -1439,3 +1458,72 @@ export fn muon_update(master: cuda.Global(f32), x: cuda.ConstGlobal(bf16), work:
 }
 
 // The fp32 -> bf16 conversion the Newton-Schulz products need is copy_bf16.
+
+// ---- dynamic byte patching ----
+// The lower layers run per byte, a middle group runs once per patch, and the
+// upper layers run per byte again as a local decoder. Pooling reads the
+// representation at the last byte of each patch; the broadcast gives byte i
+// the output of the last patch that ends at or before i, so the boundary byte
+// itself already sees its own patch (its output depends only on bytes <= i).
+
+/// Gather the representation at each patch boundary: Xp[b,j] = X[b, ends[b,j]].
+/// A negative end marks a padded patch slot, whose row becomes zero.
+export fn patch_pool(X: cuda.ConstGlobal(bf16), ends: cuda.ConstGlobal(i32), Xp: cuda.Global(bf16),
+                     B: i32, T: i32, Tp: i32, D: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * Tp * D) return;
+    const d = @rem(i, D);
+    const bj = @divTrunc(i, D);
+    const j = @rem(bj, Tp);
+    const b = @divTrunc(bj, Tp);
+    const at = ends[@intCast(b * Tp + j)];
+    Xp[@intCast(i)] = if (at < 0) cuda.f2bf(0) else X[@intCast((b * T + at) * D + d)];
+}
+
+/// X[b,i] += Xp[b, patch_of[b,i]], with patch_of < 0 where no patch has ended yet.
+export fn patch_broadcast(Xp: cuda.ConstGlobal(bf16), patch_of: cuda.ConstGlobal(i32), X: cuda.Global(bf16),
+                          B: i32, T: i32, Tp: i32, D: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * T * D) return;
+    const d = @rem(i, D);
+    const bt = @divTrunc(i, D);
+    const t = @rem(bt, T);
+    const b = @divTrunc(bt, T);
+    const j = patch_of[@intCast(b * T + t)];
+    if (j < 0) return;
+    X[@intCast(i)] = cuda.f2bf(cuda.bf2f(X[@intCast(i)]) + cuda.bf2f(Xp[@intCast((b * Tp + j) * D + d)]));
+}
+
+/// Backward of the pooling: the boundary byte receives the patch gradient.
+export fn patch_pool_bwd(dXp: cuda.ConstGlobal(bf16), ends: cuda.ConstGlobal(i32), dX: cuda.Global(bf16),
+                         B: i32, T: i32, Tp: i32, D: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * Tp * D) return;
+    const d = @rem(i, D);
+    const bj = @divTrunc(i, D);
+    const j = @rem(bj, Tp);
+    const b = @divTrunc(bj, Tp);
+    const at = ends[@intCast(b * Tp + j)];
+    if (at < 0) return;
+    const to: usize = @intCast((b * T + at) * D + d);
+    dX[to] = cuda.f2bf(cuda.bf2f(dX[to]) + cuda.bf2f(dXp[@intCast(i)]));
+}
+
+/// Backward of the broadcast: each patch sums the gradient of the bytes it
+/// was broadcast to. The bytes of one patch are contiguous, so one thread per
+/// (patch, channel) adds them in order, which needs no atomics.
+export fn patch_broadcast_bwd(dX: cuda.ConstGlobal(bf16), first: cuda.ConstGlobal(i32), last: cuda.ConstGlobal(i32),
+                              dXp: cuda.Global(bf16), B: i32, T: i32, Tp: i32, D: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * Tp * D) return;
+    const d = @rem(i, D);
+    const bj = @divTrunc(i, D);
+    const j = @rem(bj, Tp);
+    const b = @divTrunc(bj, Tp);
+    const lo = first[@intCast(b * Tp + j)];
+    const hi = last[@intCast(b * Tp + j)];
+    var acc: f32 = 0;
+    var t: i64 = lo;
+    while (t <= hi and lo >= 0) : (t += 1) acc += cuda.bf2f(dX[@intCast((b * T + t) * D + d)]);
+    dXp[@intCast(i)] = cuda.f2bf(acc);
+}

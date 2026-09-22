@@ -18,6 +18,10 @@ pub const CellOpt = extern struct {
     logDec: u64 = 0,
     logGate: u64 = 0,
     logEmb: u64 = 0,
+    /// (B,T) 0 marks a padded step, which leaves the state untouched.
+    mask: u64 = 0,
+    /// (B,T) bytes per step, so a half-life stays one in bytes at patch rate.
+    plen: u64 = 0,
 };
 
 fn blocks(n: usize) u32 {

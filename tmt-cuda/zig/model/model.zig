@@ -28,6 +28,21 @@ pub const Layer = struct {
     mc: moe.Keep = .{},
 };
 
+/// The patch layout of the current window. The boundary rule is applied on
+/// the host, where the bytes already are, and uploaded once per window.
+pub const Patches = struct {
+    /// Patch slots per stream in this window; padded slots carry mask 0.
+    Tp: usize = 0,
+    ends: [*]i32 = undefined, // (B,Tp) last byte of the patch
+    patch_of: [*]i32 = undefined, // (B,T) patch whose output this byte receives
+    first: [*]i32 = undefined, // (B,Tp) first byte receiving this patch
+    last: [*]i32 = undefined, // (B,Tp) last byte receiving it
+    plen: [*]i32 = undefined, // (B,Tp) bytes covered by the patch
+    mask: [*]i32 = undefined, // (B,Tp) 1 for a real patch
+    Xp: [*]bf16 = undefined,
+    dXp: [*]bf16 = undefined,
+};
+
 pub const MlaLayer = struct {
     use: bool = false,
     p: mla.P = .{},
@@ -113,6 +128,7 @@ pub const Model = struct {
     muon_params: []usize = &.{},
     muon_ws: muon.Ws = .{},
     muon_x: [*]f32 = undefined,
+    patches: Patches = .{},
 
     pub fn deinit(m: *Model) void {
         m.store.deinit();
@@ -265,6 +281,17 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
     m.mv = try m.mem.allocT(f32, 2);
     m.pos = try m.mem.allocT(i64, N);
 
+    if (c.patch_hi > 0) { // room for the worst case, one patch per byte
+        const P = &m.patches;
+        P.ends = try m.mem.allocT(i32, N);
+        P.patch_of = try m.mem.allocT(i32, N);
+        P.first = try m.mem.allocT(i32, N);
+        P.last = try m.mem.allocT(i32, N);
+        P.plen = try m.mem.allocT(i32, N);
+        P.mask = try m.mem.allocT(i32, N);
+        P.Xp = try m.mem.allocT(bf16, ND);
+        P.dXp = try m.mem.allocT(bf16, ND);
+    }
     m.ML = try gpa.alloc(MlaLayer, nl);
     for (m.ML) |*ml| ml.* = .{};
     if (c.mla != 0) {
@@ -602,6 +629,157 @@ fn hostSum(gpa: std.mem.Allocator, d: [*]const f32, n: usize) !f32 {
 pub const Losses = struct { total: f32, ce: f32 };
 
 /// One window: embedding, the layer stack, the decoder and the losses.
+
+/// Work out this window's patch boundaries from the bytes and upload them.
+/// A fixed stride is the baseline; the byte-class rule ends a patch after a
+/// separator, never inside a UTF-8 character and never later than patch_max.
+pub fn layoutPatches(m: *Model, ids: []const i32) !void {
+    if (m.c.patch_hi == 0) return;
+    const c = m.c;
+    const B: usize = @intCast(c.batch);
+    const T: usize = @intCast(c.seqlen);
+    const gpa = m.gpa;
+    const ends = try gpa.alloc(i32, B * T);
+    defer gpa.free(ends);
+    const counts = try gpa.alloc(usize, B);
+    defer gpa.free(counts);
+    @memset(ends, -1);
+
+    for (0..B) |b| {
+        var n: usize = 0;
+        if (c.patch > 0) {
+            const P: usize = @intCast(c.patch);
+            while ((n + 1) * P <= T) : (n += 1) ends[b * T + n] = @intCast((n + 1) * P - 1);
+        } else {
+            var since: usize = 0;
+            for (0..T) |t| {
+                since += 1;
+                const byte: u8 = @intCast(ids[b * T + t] & 0xff);
+                const separator = byte == ' ' or byte == '\n' or byte == '\t' or byte == '\r' or
+                    byte == ',' or byte == '.' or byte == ';' or byte == ':' or byte == '"' or byte == '\'';
+                // Cutting before a continuation byte would split a character.
+                const next_continues = t + 1 < T and (ids[b * T + t + 1] & 0xc0) == 0x80;
+                const forced = since >= @as(usize, @intCast(c.patch_max));
+                const last_byte = t + 1 == T;
+                if ((separator or forced or last_byte) and (!next_continues or forced or last_byte)) {
+                    ends[b * T + n] = @intCast(t);
+                    n += 1;
+                    since = 0;
+                }
+            }
+        }
+        counts[b] = n;
+    }
+    var Tp: usize = 0;
+    for (counts) |n| Tp = @max(Tp, n);
+    if (Tp == 0) Tp = 1;
+    m.patches.Tp = Tp;
+
+    // The slot arrays are laid out (B, Tp), so they are rebuilt from `ends`.
+    const slot_ends = try gpa.alloc(i32, B * Tp);
+    defer gpa.free(slot_ends);
+    const first = try gpa.alloc(i32, B * Tp);
+    defer gpa.free(first);
+    const last = try gpa.alloc(i32, B * Tp);
+    defer gpa.free(last);
+    const plen = try gpa.alloc(i32, B * Tp);
+    defer gpa.free(plen);
+    const mask = try gpa.alloc(i32, B * Tp);
+    defer gpa.free(mask);
+    const patch_of = try gpa.alloc(i32, B * T);
+    defer gpa.free(patch_of);
+    @memset(patch_of, -1);
+    for (0..B) |b| {
+        for (0..Tp) |j| {
+            const real = j < counts[b];
+            const at: i32 = if (real) ends[b * T + j] else -1;
+            slot_ends[b * Tp + j] = at;
+            mask[b * Tp + j] = if (real) 1 else 0;
+            // A patch covers the bytes after the previous boundary up to its own.
+            const prev: i32 = if (j == 0) -1 else ends[b * T + j - 1];
+            plen[b * Tp + j] = if (real) at - prev else 1;
+            // Its output reaches from its own boundary byte to just before the next.
+            first[b * Tp + j] = at;
+            last[b * Tp + j] = if (!real) -1 else if (j + 1 < counts[b]) ends[b * T + j + 1] - 1 else @intCast(T - 1);
+        }
+        for (0..counts[b]) |j| {
+            const from: usize = @intCast(first[b * Tp + j]);
+            const to: usize = @intCast(last[b * Tp + j]);
+            for (from..to + 1) |t| patch_of[b * T + t] = @intCast(j);
+        }
+    }
+    const P = &m.patches;
+    try gpu.upload(P.ends, std.mem.sliceAsBytes(slot_ends));
+    try gpu.upload(P.first, std.mem.sliceAsBytes(first));
+    try gpu.upload(P.last, std.mem.sliceAsBytes(last));
+    try gpu.upload(P.plen, std.mem.sliceAsBytes(plen));
+    try gpu.upload(P.mask, std.mem.sliceAsBytes(mask));
+    try gpu.upload(P.patch_of, std.mem.sliceAsBytes(patch_of));
+}
+
+/// What a layer group needs beyond the model: which stream it runs on and,
+/// at patch rate, the padding mask and the bytes each step covers.
+pub const GroupOpt = struct { mask: u64 = 0, plen: u64 = 0 };
+
+/// Layers [from, to) over `stream`, which holds B x T rows.
+fn layersForward(m: *Model, s: *StreamState, from: usize, to: usize, stream: [*]bf16,
+                 B: usize, T: usize, g: GroupOpt) !f32 {
+    const c = m.c;
+    const D: usize = @intCast(c.dim);
+    const E: usize = @intCast(c.experts);
+    const N = B * T;
+    const ND = N * D;
+    const k = m.kernels;
+    const byte_rate = g.mask == 0;
+    var aux_acc: f32 = 0;
+    var Wx: [16][*]bf16 = undefined;
+    for (from..to) |l| {
+        const ly = &m.L[l];
+        try gpu.copyDevice(ly.input, stream, ND * 2);
+        try gpu.copyDevice(ly.initial, s.carry[l], B * D * 4);
+        const opt = ops.CellOpt{
+            .ids = if (byte_rate) @intFromPtr(m.ids) else 0,
+            .docsep = if (byte_rate) c.docsep else -1,
+            .mask = g.mask,
+            .plen = g.plen,
+        };
+        const gate: u64 = if (c.gated != 0) @intFromPtr(m.store.at(ly.gate).master) else 0;
+        try ops.stateForward(k, ly.input, ly.S, m.store.at(ly.decay).master,
+            @intFromPtr(ly.initial), @intCast(B), @intCast(T), c.dim, gate, opt);
+        try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ ly.S, m.Sb, @as(i64, @intCast(ND)) });
+        try ops.layernormFwd(k, m.Sb, m.store.at(ly.gamma).master, m.store.at(ly.beta).master,
+            m.H, ly.mean, ly.rstd, @intCast(N), c.dim);
+        for (0..E) |e| Wx[e] = m.store.at(ly.exp[e]).work;
+        // The residual add is folded into the combine (beta = 1).
+        aux_acc += try moe.forward(k, m.H, m.store.at(ly.router).work, Wx[0..E], stream,
+            &ly.mc, &m.moeW, N, E, @intCast(c.topk), D, 1.0);
+        if (c.mla != 0 and m.ML[l].use) {
+            const ml = &m.ML[l];
+            try gpu.copyDevice(ml.Xsnap, stream, ND * 2);
+            try ops.layernormFwd(k, stream, m.store.at(ml.p.gamma).master, m.store.at(ml.p.beta).master,
+                m.H, ml.mmean, ml.mrstd, @intCast(N), c.dim);
+            const sc = attnScale(c, c.mla_dh);
+            try mla.forward(k, m.H, @intCast(N), m.store.at(ml.p.q).work, m.store.at(ml.p.dkv).work,
+                m.store.at(ml.p.kr).work, m.store.at(ml.p.uk).work, m.store.at(ml.p.uv).work,
+                m.store.at(ml.p.o).work, &s.cache[l], &ml.keep, &m.MW, m.M, m.pos,
+                @intCast(B), @intCast(T), c.mla_heads, c.mla_dh, c.mla_L, c.mla_R, c.mla_cc,
+                c.mla_cache, c.mla_theta, sc, c.dim);
+            try (try k.get("mem_add_bf16")).launch(blocks(ND), 256, .{ stream, m.M, @as(i64, @intCast(ND)) });
+        }
+        if (c.mem != 0 and m.MEM[l].use) {
+            const me = &m.MEM[l];
+            try memory.forward(k, stream, me, &m.MS, m.store.at(me.gamma).master, m.store.at(me.beta).master,
+                m.store.at(me.wq).work, m.store.at(me.wk).work, m.store.at(me.wv).work,
+                m.store.at(me.wo).work, m.M, @intCast(B), @intCast(T), c.mem_len, c.mem_heads, c.mem_dh, c.dim,
+                attnScale(c, c.mem_dh));
+        }
+        const gy: u32 = @intCast(@divTrunc(c.dim + 255, 256));
+        try (try k.get("extract_carry")).launchGrid(@intCast(B), gy, 256,
+            .{ ly.S, s.carry[l], @as(i32, @intCast(B)), @as(i32, @intCast(T)), c.dim });
+    }
+    return aux_acc;
+}
+
 pub fn forwardWindow(m: *Model, s: *StreamState) !Losses {
     const c = m.c;
     const B: usize = @intCast(c.batch);
@@ -628,45 +806,23 @@ pub fn forwardWindow(m: *Model, s: *StreamState) !Losses {
     }
     var aux_acc: f32 = 0;
     var z_acc: f32 = 0;
-    var Wx: [16][*]bf16 = undefined;
-    for (m.L, 0..) |*ly, l| {
-        try gpu.copyDevice(ly.input, m.X, ND * 2);
-        try gpu.copyDevice(ly.initial, s.carry[l], B * D * 4);
-        const opt = ops.CellOpt{ .ids = @intFromPtr(m.ids), .docsep = c.docsep };
-        const gate: u64 = if (c.gated != 0) @intFromPtr(m.store.at(ly.gate).master) else 0;
-        try ops.stateForward(k, ly.input, ly.S, m.store.at(ly.decay).master,
-            @intFromPtr(ly.initial), c.batch, c.seqlen, c.dim, gate, opt);
-        try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ ly.S, m.Sb, @as(i64, @intCast(ND)) });
-        try ops.layernormFwd(k, m.Sb, m.store.at(ly.gamma).master, m.store.at(ly.beta).master,
-            m.H, ly.mean, ly.rstd, @intCast(N), c.dim);
-        for (0..E) |e| Wx[e] = m.store.at(ly.exp[e]).work;
-        // The residual add is folded into the combine (beta = 1).
-        aux_acc += try moe.forward(k, m.H, m.store.at(ly.router).work, Wx[0..E], m.X,
-            &ly.mc, &m.moeW, N, E, @intCast(c.topk), D, 1.0);
-        if (c.mla != 0 and m.ML[l].use) {
-            const ml = &m.ML[l];
-            try gpu.copyDevice(ml.Xsnap, m.X, ND * 2);
-            try ops.layernormFwd(k, m.X, m.store.at(ml.p.gamma).master, m.store.at(ml.p.beta).master,
-                m.H, ml.mmean, ml.mrstd, @intCast(N), c.dim);
-            const sc = attnScale(c, c.mla_dh);
-            try mla.forward(k, m.H, @intCast(N), m.store.at(ml.p.q).work, m.store.at(ml.p.dkv).work,
-                m.store.at(ml.p.kr).work, m.store.at(ml.p.uk).work, m.store.at(ml.p.uv).work,
-                m.store.at(ml.p.o).work, &s.cache[l], &ml.keep, &m.MW, m.M, m.pos,
-                c.batch, c.seqlen, c.mla_heads, c.mla_dh, c.mla_L, c.mla_R, c.mla_cc,
-                c.mla_cache, c.mla_theta, sc, c.dim);
-            try (try k.get("mem_add_bf16")).launch(blocks(ND), 256, .{ m.X, m.M, @as(i64, @intCast(ND)) });
-        }
-        if (c.mem != 0 and m.MEM[l].use) {
-            const me = &m.MEM[l];
-            try memory.forward(k, m.X, me, &m.MS, m.store.at(me.gamma).master, m.store.at(me.beta).master,
-                m.store.at(me.wq).work, m.store.at(me.wk).work, m.store.at(me.wv).work,
-                m.store.at(me.wo).work, m.M, c.batch, c.seqlen, c.mem_len, c.mem_heads, c.mem_dh, c.dim,
-                attnScale(c, c.mem_dh));
-        }
-        const gy: u32 = @intCast(@divTrunc(c.dim + 255, 256));
-        try (try k.get("extract_carry")).launchGrid(@intCast(B), gy, 256,
-            .{ ly.S, s.carry[l], c.batch, c.seqlen, c.dim });
+    // Patching splits the stack: byte layers, then a group that runs once per
+    // patch, then byte layers again as a local decoder.
+    const hi: usize = if (c.patch_hi > 0) @intCast(c.patch_hi) else 0;
+    const lo: usize = if (hi > 0) @intCast(c.patch_lo) else 0;
+    aux_acc += try layersForward(m, s, 0, lo, m.X, B, T, .{});
+    if (hi > 0) {
+        const P = &m.patches;
+        try (try k.get("patch_pool")).launch(blocks(B * P.Tp * D), 256,
+            .{ m.X, P.ends, P.Xp, @as(i32, @intCast(B)), @as(i32, @intCast(T)), @as(i32, @intCast(P.Tp)), c.dim });
+        aux_acc += try layersForward(m, s, lo, lo + hi, P.Xp, B, P.Tp, .{
+            .mask = @intFromPtr(P.mask),
+            .plen = if (c.patch_decay != 0) @intFromPtr(P.plen) else 0,
+        });
+        try (try k.get("patch_broadcast")).launch(blocks(ND), 256,
+            .{ P.Xp, P.patch_of, m.X, @as(i32, @intCast(B)), @as(i32, @intCast(T)), @as(i32, @intCast(P.Tp)), c.dim });
     }
+    aux_acc += try layersForward(m, s, lo + hi, m.L.len, m.X, B, T, .{});
     s.position += @intCast(T);
     if (E > 1) { // one host read for the router statistics of every layer
         const hs = try m.gpa.alloc(f32, m.L.len * 17);
@@ -720,6 +876,94 @@ pub fn forwardWindow(m: *Model, s: *StreamState) !Losses {
         c.mtp_weight * mtp_ce + (c.aux * aux_acc + c.zloss * z_acc) / @as(f32, @floatFromInt(m.L.len));
     try gpu.checkLaunch();
     return .{ .total = total, .ce = ce_out };
+}
+
+
+/// Layers [from, to) backward over `dstream`, which holds B x T rows of the
+/// gradient of that group's stream.
+fn layersBackward(m: *Model, s: *StreamState, from: usize, to: usize, dstream: [*]bf16,
+                  B: usize, T: usize, g: GroupOpt, logging: bool) !void {
+    const c = m.c;
+    const D: usize = @intCast(c.dim);
+    const N = B * T;
+    const ND = N * D;
+    const nd_i64: i64 = @intCast(ND);
+    const k = m.kernels;
+    const byte_rate = g.mask == 0;
+    var Wx: [16][*]bf16 = undefined;
+    var dWx: [16][*]f32 = undefined;
+    var l: usize = to;
+    while (l > from) {
+        l -= 1;
+        const ly = &m.L[l];
+        // The memory came last in the forward, so it goes first here.
+        if (c.mem != 0 and m.MEM[l].use) {
+            const me = &m.MEM[l];
+            try memory.backward(k, dstream, me, &m.MS, m.store.at(me.gamma).master,
+                m.store.at(me.wq).work, m.store.at(me.wk).work, m.store.at(me.wv).work, m.store.at(me.wo).work,
+                m.store.at(me.gamma).grad, m.store.at(me.beta).grad, m.store.at(me.wq).grad,
+                m.store.at(me.wk).grad, m.store.at(me.wv).grad, m.store.at(me.wo).grad,
+                @intCast(B), @intCast(T), c.mem_len, c.mem_heads, c.mem_dh, c.dim, attnScale(c, c.mem_dh));
+        }
+        if (c.mla != 0 and m.ML[l].use) {
+            const ml = &m.ML[l];
+            try gpu.copyDevice(m.dM, dstream, ND * 2);
+            const sc = attnScale(c, c.mla_dh);
+            try mla.backward(k, m.dM, @intCast(N), m.store.at(ml.p.q).work, m.store.at(ml.p.dkv).work,
+                m.store.at(ml.p.kr).work, m.store.at(ml.p.uk).work, m.store.at(ml.p.uv).work,
+                m.store.at(ml.p.o).work, m.store.at(ml.p.q).grad, m.store.at(ml.p.dkv).grad,
+                m.store.at(ml.p.kr).grad, m.store.at(ml.p.uk).grad, m.store.at(ml.p.uv).grad,
+                m.store.at(ml.p.o).grad, &s.cache[l], &ml.keep, &m.MW, m.dH, ml.keep.Xq, m.pos,
+                @intCast(B), @intCast(T), c.mla_heads, c.mla_dh, c.mla_L, c.mla_R, c.mla_cc,
+                c.mla_theta, sc, c.dim);
+            try ops.layernormBwd(k, ml.Xsnap, m.dH, m.store.at(ml.p.gamma).master, ml.mmean, ml.mrstd,
+                m.dSnorm, m.store.at(ml.p.gamma).grad, m.store.at(ml.p.beta).grad, @intCast(N), c.dim);
+            try (try k.get("mem_add_bf16")).launch(blocks(ND), 256, .{ dstream, m.dSnorm, nd_i64 });
+        }
+        // The residual passthrough stays in dXs while the block works on a copy.
+        try gpu.copyDevice(m.dM, dstream, ND * 2);
+        const E: usize = @intCast(c.experts);
+        for (0..E) |e| {
+            Wx[e] = m.store.at(ly.exp[e]).work;
+            dWx[e] = m.store.at(ly.exp[e]).grad;
+        }
+        const layers_f: f32 = @floatFromInt(c.layers);
+        try moe.backward(k, m.dM, Wx[0..E], m.store.at(ly.router).work, m.store.at(ly.router).grad,
+            dWx[0..E], m.dH, &ly.mc, &m.moeW, c.aux / layers_f, c.zloss / layers_f);
+        try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ ly.S, m.Sb, nd_i64 });
+        try ops.layernormBwd(k, m.Sb, m.dH, m.store.at(ly.gamma).master, ly.mean, ly.rstd, m.dSnorm,
+            m.store.at(ly.gamma).grad, m.store.at(ly.beta).grad, @intCast(N), c.dim);
+        const gate: u64 = if (c.gated != 0) @intFromPtr(m.store.at(ly.gate).master) else 0;
+        var opt = ops.CellOpt{
+            .ids = if (byte_rate) @intFromPtr(m.ids) else 0,
+            .docsep = if (byte_rate) c.docsep else -1,
+            .gamma = c.trace_decay,
+            .mask = g.mask,
+            .plen = g.plen,
+        };
+        if (c.traces != 0 and byte_rate) {
+            opt.trDec = @intFromPtr(s.tdec[l]);
+            opt.trGate = @intFromPtr(s.tgate[l]);
+            if (l == 0) {
+                opt.lam = @intFromPtr(m.lam);
+                opt.prod = @intFromPtr(m.prod);
+            }
+            if (logging) {
+                opt.logDec = @intFromPtr(m.trlog.? + l * D);
+                opt.logGate = @intFromPtr(m.trlog.? + (@as(usize, @intCast(c.layers)) + l) * D);
+                opt.logEmb = @intFromPtr(m.trlog.? + 2 * @as(usize, @intCast(c.layers)) * D);
+            }
+        }
+        try ops.cellBackward(k, m.dSnorm, ly.S, m.store.at(ly.decay).master, m.dEncTmp,
+            m.store.at(ly.decay).grad, @intCast(B), @intCast(T), c.dim, ly.input, @intFromPtr(ly.initial),
+            gate, @intFromPtr(m.store.at(ly.gate).grad), opt);
+        if (c.traces != 0 and byte_rate and l == 0)
+            try ops.embTrace(k, ly.input, ly.S, ly.initial, m.store.at(ly.decay).master, gate,
+                s.temb.?, m.store.at(m.emb).grad, @intCast(B), @intCast(T), c.dim, opt);
+        // Chain into the previous layer, residual passthrough included.
+        try (try k.get("cast_add")).launch(blocks(ND), 256, .{ dstream, m.dEncTmp, nd_i64 });
+        try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ m.dEncTmp, dstream, nd_i64 });
+    }
 }
 
 /// The backward pass of the window the forward just computed. With traces=1
@@ -781,74 +1025,25 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
     try gpu.zero(m.dEnc, ND * 4);
     if (c.mem != 0) try gpu.zero(m.MS.dEnc, B * @as(usize, @intCast(c.mem_len)) * D * 4);
 
-    var Wx: [16][*]bf16 = undefined;
-    var dWx: [16][*]f32 = undefined;
-    var l: usize = m.L.len;
-    while (l > 0) {
-        l -= 1;
-        const ly = &m.L[l];
-        // The memory came last in the forward, so it goes first here.
-        if (c.mem != 0 and m.MEM[l].use) {
-            const me = &m.MEM[l];
-            try memory.backward(k, m.dXs, me, &m.MS, m.store.at(me.gamma).master,
-                m.store.at(me.wq).work, m.store.at(me.wk).work, m.store.at(me.wv).work, m.store.at(me.wo).work,
-                m.store.at(me.gamma).grad, m.store.at(me.beta).grad, m.store.at(me.wq).grad,
-                m.store.at(me.wk).grad, m.store.at(me.wv).grad, m.store.at(me.wo).grad,
-                c.batch, c.seqlen, c.mem_len, c.mem_heads, c.mem_dh, c.dim, attnScale(c, c.mem_dh));
-        }
-        if (c.mla != 0 and m.ML[l].use) {
-            const ml = &m.ML[l];
-            try gpu.copyDevice(m.dM, m.dXs, ND * 2);
-            const sc = attnScale(c, c.mla_dh);
-            try mla.backward(k, m.dM, @intCast(N), m.store.at(ml.p.q).work, m.store.at(ml.p.dkv).work,
-                m.store.at(ml.p.kr).work, m.store.at(ml.p.uk).work, m.store.at(ml.p.uv).work,
-                m.store.at(ml.p.o).work, m.store.at(ml.p.q).grad, m.store.at(ml.p.dkv).grad,
-                m.store.at(ml.p.kr).grad, m.store.at(ml.p.uk).grad, m.store.at(ml.p.uv).grad,
-                m.store.at(ml.p.o).grad, &s.cache[l], &ml.keep, &m.MW, m.dH, ml.keep.Xq, m.pos,
-                c.batch, c.seqlen, c.mla_heads, c.mla_dh, c.mla_L, c.mla_R, c.mla_cc,
-                c.mla_theta, sc, c.dim);
-            try ops.layernormBwd(k, ml.Xsnap, m.dH, m.store.at(ml.p.gamma).master, ml.mmean, ml.mrstd,
-                m.dSnorm, m.store.at(ml.p.gamma).grad, m.store.at(ml.p.beta).grad, @intCast(N), c.dim);
-            try (try k.get("mem_add_bf16")).launch(blocks(ND), 256, .{ m.dXs, m.dSnorm, nd_i64 });
-        }
-        // The residual passthrough stays in dXs while the block works on a copy.
-        try gpu.copyDevice(m.dM, m.dXs, ND * 2);
-        const E: usize = @intCast(c.experts);
-        for (0..E) |e| {
-            Wx[e] = m.store.at(ly.exp[e]).work;
-            dWx[e] = m.store.at(ly.exp[e]).grad;
-        }
-        const layers_f: f32 = @floatFromInt(c.layers);
-        try moe.backward(k, m.dM, Wx[0..E], m.store.at(ly.router).work, m.store.at(ly.router).grad,
-            dWx[0..E], m.dH, &ly.mc, &m.moeW, c.aux / layers_f, c.zloss / layers_f);
-        try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ ly.S, m.Sb, nd_i64 });
-        try ops.layernormBwd(k, m.Sb, m.dH, m.store.at(ly.gamma).master, ly.mean, ly.rstd, m.dSnorm,
-            m.store.at(ly.gamma).grad, m.store.at(ly.beta).grad, @intCast(N), c.dim);
-        const gate: u64 = if (c.gated != 0) @intFromPtr(m.store.at(ly.gate).master) else 0;
-        var opt = ops.CellOpt{ .ids = @intFromPtr(m.ids), .docsep = c.docsep, .gamma = c.trace_decay };
-        if (c.traces != 0) {
-            opt.trDec = @intFromPtr(s.tdec[l]);
-            opt.trGate = @intFromPtr(s.tgate[l]);
-            if (l == 0) {
-                opt.lam = @intFromPtr(m.lam);
-                opt.prod = @intFromPtr(m.prod);
-            }
-            if (logging) {
-                opt.logDec = @intFromPtr(m.trlog.? + l * D);
-                opt.logGate = @intFromPtr(m.trlog.? + (@as(usize, @intCast(c.layers)) + l) * D);
-                opt.logEmb = @intFromPtr(m.trlog.? + 2 * @as(usize, @intCast(c.layers)) * D);
-            }
-        }
-        try ops.cellBackward(k, m.dSnorm, ly.S, m.store.at(ly.decay).master, m.dEncTmp,
-            m.store.at(ly.decay).grad, c.batch, c.seqlen, c.dim, ly.input, @intFromPtr(ly.initial),
-            gate, @intFromPtr(m.store.at(ly.gate).grad), opt);
-        if (c.traces != 0 and l == 0)
-            try ops.embTrace(k, ly.input, ly.S, ly.initial, m.store.at(ly.decay).master, gate,
-                s.temb.?, m.store.at(m.emb).grad, c.batch, c.seqlen, c.dim, opt);
-        // Chain into the previous layer, residual passthrough included.
-        try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dEncTmp, nd_i64 });
-        try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ m.dEncTmp, m.dXs, nd_i64 });
+    // The three groups run in reverse: local decoder, patch stack, byte stack.
+    const hi: usize = if (c.patch_hi > 0) @intCast(c.patch_hi) else 0;
+    const lo: usize = if (hi > 0) @intCast(c.patch_lo) else 0;
+    try layersBackward(m, s, lo + hi, m.L.len, m.dXs, B, T, .{}, logging);
+    if (hi > 0) {
+        const P = &m.patches;
+        try (try k.get("patch_broadcast_bwd")).launch(blocks(B * P.Tp * D), 256,
+            .{ m.dXs, P.first, P.last, P.dXp, @as(i32, @intCast(B)), @as(i32, @intCast(T)),
+               @as(i32, @intCast(P.Tp)), c.dim });
+        try layersBackward(m, s, lo, lo + hi, P.dXp, B, P.Tp, .{
+            .mask = @intFromPtr(P.mask),
+            .plen = if (c.patch_decay != 0) @intFromPtr(P.plen) else 0,
+        }, false);
+        // The pooled gradient lands on the boundary byte it was read from.
+        try (try k.get("patch_pool_bwd")).launch(blocks(B * P.Tp * D), 256,
+            .{ P.dXp, P.ends, m.dXs, @as(i32, @intCast(B)), @as(i32, @intCast(T)),
+               @as(i32, @intCast(P.Tp)), c.dim });
     }
+    try layersBackward(m, s, 0, lo, m.dXs, B, T, .{}, logging);
     if (c.mem != 0)
         try memory.encodeBackward(k, &m.MS, m.store.at(m.MS.decay).master, m.store.at(m.MS.gate).master,
             m.store.at(m.MS.decay).grad, m.store.at(m.MS.gate).grad, m.store.at(m.emb).grad,
