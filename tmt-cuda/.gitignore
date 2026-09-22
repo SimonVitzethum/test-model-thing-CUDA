@@ -6,5 +6,7 @@
 /roofline
 /sample
 /gradcheck
-/kgtrain
+/chat
+/dialogprep
 /kgprep
+/kgtrain

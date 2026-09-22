@@ -97,13 +97,21 @@ int main(int argc, char** argv) {
         struct stat checkpoint_stat{};
         bool exists = stat(path.c_str(), &checkpoint_stat) == 0;
         if (!exists && errno != ENOENT) throw std::runtime_error("cannot stat checkpoint");
-        Cfg cfg = exists ? checkpoint_config(path) : Cfg{};
+        // init=PATH starts a NEW run from another checkpoint's weights (fresh
+        // optimizer and progress); its configuration is the default for this run.
+        std::string init;
+        for (int i = 3; i < argc; ++i)
+            if (std::string(argv[i]).rfind("init=", 0) == 0) init = std::string(argv[i]).substr(5);
+        if (!init.empty() && exists) throw std::runtime_error("init= only applies to a new checkpoint path");
+        Cfg init_cfg = init.empty() ? Cfg{} : checkpoint_config(init);
+        Cfg cfg = exists ? checkpoint_config(path) : init_cfg;
         const std::string saved_config = config_text(cfg);
         int steps = 0, saveevery = 500;
         for (int i = 3; i < argc; ++i) {
             std::string arg = argv[i]; size_t eq = arg.find('=');
             if (eq == std::string::npos) throw std::runtime_error("expected key=value");
             auto key = arg.substr(0, eq), value = arg.substr(eq + 1);
+            if (key == "init") continue;
             if (key == "mode") mode = value;
             else if (key == "steps") steps = integer_option(value);
             else if (key == "saveevery") saveevery = integer_option(value);
@@ -113,12 +121,13 @@ int main(int argc, char** argv) {
         bool evaluation = mode == "eval";
         if (evaluation && !exists) throw std::runtime_error("evaluation requires an existing checkpoint");
         validate_cfg(cfg);
-        // Evaluation may change seqlen and maxcarry: neither affects weights
-        // or the stored state layout, and eval starts from a fresh state.
+        // Evaluation may change seqlen, maxcarry, docsep and dialog: none affects
+        // weights or the stored state layout, and eval starts from a fresh state.
         Cfg compared = cfg;
         if (evaluation && exists) {
             Cfg stored = checkpoint_config(path);
             compared.seqlen = stored.seqlen; compared.maxcarry = stored.maxcarry;
+            compared.docsep = stored.docsep; compared.dialog = stored.dialog;
         }
         if (exists && config_text(compared) != saved_config)
             throw std::runtime_error("configuration differs from checkpoint; choose a new checkpoint path");
@@ -129,6 +138,7 @@ int main(int argc, char** argv) {
         StreamState state; build_state(state, m);
         Progress progress;
         if (exists) load_checkpoint(path, m, state, progress);
+        else if (!init.empty()) load_weights_only(init, m, init_cfg);  // architecture must match
         if (!evaluation && exists && (progress.data_size != data.size || progress.data_hash != data.hash))
             throw std::runtime_error("resume dataset differs from checkpoint");
         if (evaluation) { reset_state(state, cfg); progress = Progress{}; }
@@ -164,12 +174,25 @@ int main(int argc, char** argv) {
             for (int b = 0; b < B; ++b) {
                 size_t start = evaluation ? data.size * b / B : per * b;
                 size_t end = evaluation ? data.size * (b + 1) / B : start + per;
+                // dialog=1: only bytes inside an assistant turn (after 0x03, up to and
+                // including its closing 0x04) are scored; the rest is context.
+                bool assistant = false;
+                if (cfg.dialog)
+                    for (size_t k = start + progress.cursor; k-- > start;) {
+                        unsigned char c = data.bytes[k];
+                        if (c == 0x02 || c == 0x03 || c == 0x04 || c == 0x1E) { assistant = c == 0x03; break; }
+                    }
                 for (int t = 0; t < T; ++t) {
                     int i = b * T + t;
                     size_t offset = start + progress.cursor + t;
                     valid[i] = offset + 1 < end;
                     ids[i] = valid[i] ? data.bytes[offset] : 0;
                     targets[i] = valid[i] ? data.bytes[offset + 1] : 0;
+                    if (cfg.dialog && valid[i]) {
+                        unsigned char c = data.bytes[offset];
+                        if (c == 0x02 || c == 0x03 || c == 0x04 || c == 0x1E) assistant = c == 0x03;
+                        if (!assistant) { valid[i] = 0; targets[i] = -1; }  // context only, not scored
+                    }
                     ends[i] = targets[i] == 10;
                     count += valid[i];
                 }

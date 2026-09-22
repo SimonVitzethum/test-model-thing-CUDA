@@ -1,10 +1,6 @@
 // sample: CHECKPOINT "prompt..." [temp=0.7] [maxlen=256] [stop=0.5] [seed=1]
-// Nutzt exakt den Trainings-Forward (forward_window, B=1/T=1) Byte für Byte;
-// StreamState (Carry + MLA-Cache) läuft persistent. Nur Gewichte laden.
-#include "checkpoint.h"
-#include <cmath>
-#include <cstring>
-#include <random>
+// Feeds the prompt byte by byte, then continues it (src/generate.h).
+#include "generate.h"
 
 int main(int argc, char** argv) {
     try {
@@ -13,9 +9,8 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::string path = argv[1], prompt = argv[2];
-        float temp = 0.7f;
+        float temp = 0.7f, stop_thr = 0.5f;
         int maxlen = 256;
-        float stop_thr = 0.5f;
         unsigned seed = 1;
         for (int i = 3; i < argc; ++i) {
             std::string a = argv[i];
@@ -28,73 +23,17 @@ int main(int argc, char** argv) {
             else if (k == "seed") seed = (unsigned)std::stoul(v);
             else throw std::runtime_error("unknown option: " + k);
         }
-        Cfg file_cfg = checkpoint_config(path);
-        Cfg cfg = file_cfg;
-        cfg.batch = 1; cfg.seqlen = 1;  // Single-Step (nur Runtime-Keys)
-        validate_cfg(cfg);
-        Model m;
-        m.c = cfg;
-        build_model(m);
-        StreamState state;
-        build_state(state, m);
-        load_weights_only(path, m, file_cfg);
-        std::mt19937 rng(seed);
-        std::vector<unsigned char> out;
-        auto step_byte = [&](int b) -> std::pair<int, float> {
-            int ids = b, nxt = 0, end = 0;
-            CUDA_CHECK(cudaMemcpy(m.ids, &ids, 4, cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(m.nxt, &nxt, 4, cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(m.end, &end, 4, cudaMemcpyHostToDevice));
-            float tot = 0, ce = 0;
-            forward_window(m, state, tot, ce);
-            float logits[256], stop[1];
-            CUDA_CHECK(cudaMemcpy(logits, m.logits, 256 * 2, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(stop, m.stoplog, 2, cudaMemcpyDeviceToHost));
-            // bf16 -> fp32 auf Host
-            float lf[256];
-            for (int i = 0; i < 256; ++i) {
-                uint16_t bits;
-                memcpy(&bits, (char*)logits + i * 2, 2);
-                uint32_t u = (uint32_t)bits << 16;
-                memcpy(&lf[i], &u, 4);
-            }
-            uint16_t sbits;
-            memcpy(&sbits, stop, 2);
-            uint32_t su = (uint32_t)sbits << 16;
-            float sstop;
-            memcpy(&sstop, &su, 4);
-            float mx = lf[0];
-            for (int i = 1; i < 256; ++i) mx = fmaxf(mx, lf[i]);
-            if (temp <= 0) {
-                int best = 0;
-                for (int i = 1; i < 256; ++i)
-                    if (lf[i] > lf[best]) best = i;
-                return {best, 1.0f / (1.0f + expf(-sstop))};
-            }
-            double se = 0;
-            for (int i = 0; i < 256; ++i) se += exp((lf[i] - mx) / temp);
-            double r = std::uniform_real_distribution<double>(0, 1)(rng) * se, acc = 0;
-            int pick = 255;
-            for (int i = 0; i < 256; ++i) {
-                acc += exp((lf[i] - mx) / temp);
-                if (acc >= r) { pick = i; break; }
-            }
-            return {pick, 1.0f / (1.0f + expf(-sstop))};
-        };
-        // Stop-Head ohne Training (stop=0) liefert Zufallslogits -> ignorieren.
-        const bool use_stop = file_cfg.stop > 0;
-        // Jedes Byte genau einmal einspeisen: die Vorhersage nach dem letzten
-        // Prompt-Byte liefert direkt das erste Ausgabe-Byte.
-        std::pair<int, float> next{0, 0.f};
-        for (size_t i = 0; i < prompt.size(); ++i)
-            next = step_byte((unsigned char)prompt[i]);
+        if (prompt.empty()) throw std::runtime_error("empty prompt");
+        Generator g(path, seed);
+        // Every byte is fed exactly once: the prediction after the last prompt
+        // byte gives the first output byte.
+        g.feed(prompt);
         for (int i = 0; i < maxlen; ++i) {
-            auto [b, s] = next;
-            if (use_stop && s > stop_thr) break;
-            out.push_back((unsigned char)b);
-            fwrite(&out.back(), 1, 1, stdout);
-            fflush(stdout);
-            if (i + 1 < maxlen) next = step_byte(b);
+            if (g.stop_trained() && g.stop_prob > stop_thr) break;
+            int b = g.sample(temp);
+            std::fputc(b, stdout);
+            std::fflush(stdout);
+            if (i + 1 < maxlen) g.feed(b);
         }
         std::printf("\n");
         return 0;

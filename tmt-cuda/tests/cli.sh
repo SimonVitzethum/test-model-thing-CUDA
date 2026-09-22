@@ -51,4 +51,28 @@ grep -q '^state:' "$work/doc.log"
 ./train "$work/heldout" "$work/doc" mode=eval > "$work/doc-eval.log"
 ./gradcheck "$work/data" "$work/doc" len=28 window=7 seqs=2 > "$work/gradcheck.log"
 grep -q '^decay' "$work/gradcheck.log"
-echo 'PASS CLI: dense resume within FP32 tolerance, evaluation tails, unchanged checkpoints, invalid input rejection, MLA resume, trace resume, document resets and gradcheck'
+# Dialog data, answer-only loss, init= from another checkpoint, interactive chat.
+awk 'BEGIN { for (i=0;i<200;i++) printf "\036\002hi\004\003ok\004" }' > "$work/dialog.bin"
+./train "$work/dialog.bin" "$work/dlg" init="$work/whole" dialog=1 batch=1 seqlen=9 steps=40 saveevery=0 > "$work/dlg.log"
+./train "$work/dialog.bin" "$work/dlg" mode=eval > "$work/dlg-eval.log"
+grep -q '"bytes":600,' "$work/dlg-eval.log"   # 200 x ("o", "k", end of turn)
+if ./train "$work/dialog.bin" "$work/dlg" init="$work/whole" steps=1 > "$work/error.log" 2>&1; then
+    echo 'FAIL: init= accepted for an existing checkpoint'; exit 1
+fi
+printf 'hello\n/reset\nbye\n' | ./chat "$work/dlg" maxlen=6 > "$work/chat.log" 2> /dev/null
+test "$(grep -c '^tmt> ' "$work/chat.log")" -eq 2
+grep -q 'state reset' "$work/chat.log"
+printf 'ABC\n' | ./chat "$work/whole" maxlen=4 > "$work/raw.log" 2> /dev/null
+grep -q '^tmt> ABC' "$work/raw.log"
+printf 'hi there\thello!\nno tab line\n' > "$work/pairs.tsv"
+./dialogprep tsv "$work/pairs.tsv" "$work/pairs" test_frac=0 2> /dev/null
+test "$(cat "$work/pairs_train.bin")" = "$(printf '\036\002hi there\004\003hello!\004')"
+m() { printf '{"text":"%s","role":"%s","lang":"%s","replies":[%s]}' "$1" "$2" "$3" "$4"; }
+{   # one English path (prompt -> answer A -> follow-up -> answer), one ending on a German reply
+    printf '{"message_tree_id":"t1","tree_state":"ready_for_export","prompt":'
+    m 'Q?' prompter en "$(m 'A1' assistant en "$(m 'More\nplease' prompter en "$(m 'A2' assistant en '')")"),$(m 'B1' assistant en "$(m 'Nein' prompter de "$(m 'x' assistant de '')")")"
+    printf '}\n'
+} > "$work/trees.jsonl"
+./dialogprep oasst "$work/oa" test_frac=0 < "$work/trees.jsonl" 2> /dev/null
+test "$(cat "$work/oa_train.bin")" = "$(printf '\036\002Q?\004\003A1\004\002More\nplease\004\003A2\004')"
+echo 'PASS CLI: dense resume within FP32 tolerance, evaluation tails, unchanged checkpoints, invalid input rejection, MLA resume, trace resume, document resets, gradcheck, dialog training, init=, chat and dialogprep'

@@ -3,7 +3,7 @@ NVCC ?= nvcc
 ARCH = -gencode arch=compute_120a,code=sm_120a
 OPTS = -O3 -std=c++17 -Xcompiler -Wall --use_fast_math
 
-all: bench train architecture_test sample gradcheck kgtrain kgprep profile roofline
+all: bench train architecture_test sample chat gradcheck dialogprep kgtrain kgprep profile roofline
 
 bench: src/bench.cu src/cell.cu src/common.h Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o bench src/bench.cu src/cell.cu
@@ -15,7 +15,7 @@ train: src/model.cu src/checkpoint.h src/config.h src/train_main.cu src/train.cu
 architecture_test: src/architecture_test.cu $(wildcard src/*.h src/*.cu) Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/architecture_test.cu -lcublas
 
-sample: src/sample.cu $(wildcard src/*.h src/*.cu) Makefile
+sample: src/sample.cu src/generate.h $(wildcard src/*.h src/*.cu) Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/sample.cu -lcublas
 
 gradcheck: src/gradcheck.cu $(wildcard src/*.h src/*.cu) Makefile
@@ -27,18 +27,24 @@ kgtrain: src/kg_main.cu $(wildcard src/*.h src/*.cu) Makefile
 kgprep: tools/kgprep.cpp Makefile
 	$(CXX) -O3 -std=c++17 -Wall -pthread -o $@ tools/kgprep.cpp
 
+chat: src/chat.cu src/generate.h $(wildcard src/*.h src/*.cu) Makefile
+	$(NVCC) $(ARCH) $(OPTS) -o $@ src/chat.cu -lcublas
+
+dialogprep: tools/dialogprep.cpp tools/json_scan.h Makefile
+	$(CXX) -O3 -std=c++17 -Wall -o $@ tools/dialogprep.cpp
+
 profile: src/profile.cu src/util.h src/linalg.cu src/moe.cu Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/profile.cu -lcublas
 
 roofline: src/roofline.cu src/common.h Makefile
 	$(NVCC) $(ARCH) $(OPTS) -o $@ src/roofline.cu -lcublas
 
-check: architecture_test train sample gradcheck kgtrain kgprep
+check: architecture_test train sample chat gradcheck dialogprep kgtrain kgprep
 	./architecture_test
 	sh tests/cli.sh
 	sh tests/kg.sh
 
 clean:
-	rm -f bench train selftest architecture_test sample gradcheck kgtrain kgprep profile roofline
+	rm -f bench train selftest architecture_test sample chat gradcheck dialogprep kgtrain kgprep profile roofline
 
 .PHONY: all check clean

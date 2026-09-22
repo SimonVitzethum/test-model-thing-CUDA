@@ -80,6 +80,12 @@ The training data is a raw byte file. Train, resume, evaluate, and sample:
 
 # generate text (never modifies weights)
 ./sample model.ckpt "The history of" temp=0.7 maxlen=256
+
+# interactive, the recurrent state persists across turns (/reset clears it)
+./chat model.ckpt
+
+# fine-tune a text model on dialogs (answer-only loss), then chat with it
+./train oasst_train.bin chat.ckpt init=model.ckpt dialog=1 docsep=30 steps=30000
 ```
 
 You can safely ^C training; it stops after the current window and saves a

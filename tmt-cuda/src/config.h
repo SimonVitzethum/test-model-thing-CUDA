@@ -16,7 +16,7 @@
     F(float, aux, .01f) F(float, zloss, .001f) F(float, latent, 0.f) \
     F(float, ce, 1.f) F(float, var, 0.f) F(float, stop, 0.f) \
     F(float, stopposw, 20.f) F(float, ematau, .99f) F(float, gradclip, 1.f) \
-    F(int, maxcarry, 0) F(int, seed, 1234) F(int, traces, 0) F(float, trace_decay, 1.f) F(int, docsep, -1) \
+    F(int, maxcarry, 0) F(int, seed, 1234) F(int, traces, 0) F(float, trace_decay, 1.f) F(int, docsep, -1) F(int, dialog, 0) \
     F(int, mem, 0) F(int, mem_len, 256) F(int, mem_heads, 4) F(int, mem_dh, 32) F(int, mem_every, 2) F(int, mem_rdim, 0) \
     F(int, mla, 0) F(int, mla_heads, 4) F(int, mla_dh, 32) \
     F(int, mla_L, 32) F(int, mla_R, 16) F(int, mla_cache, 4096) \
@@ -66,6 +66,7 @@ static void validate_cfg(const Cfg& c) {
     require(c.traces == 0 || c.traces == 1, "traces must be 0 or 1");
     require(c.trace_decay > 0 && c.trace_decay <= 1, "require 0 < trace_decay <= 1");
     require(c.docsep >= -1 && c.docsep <= 255, "docsep must be -1 (off) or a byte value");
+    require(c.dialog == 0 || c.dialog == 1, "dialog must be 0 or 1");
     require(c.mem == 0 || c.mem == 1, "mem must be 0 or 1");
     if (c.mem) {
         require(c.mem_len > 0 && c.mem_len <= 4096 && c.mem_heads > 0 && c.mem_dh > 0 &&
