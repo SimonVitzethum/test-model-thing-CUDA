@@ -849,6 +849,139 @@ pub fn main(init: std.process.Init) !u8 {
             std.fmt.bufPrint(&zb, "z-loss within {e:.1} (atomic order)", .{zrel}) catch "");
     }
 
+    // ---- fact memory (cross-attention over the retrieved facts) ----
+    {
+        const B = 3;
+        const T = 16;
+        const M = 24;
+        const H = 2;
+        const dh = 8;
+        const Dm = 32;
+        const HD = H * dh;
+        const mids = try gpa.alloc(i32, B * M);
+        fillIds(mids, 101, -1, 256); // -1 is padding and must stay masked
+        const d_mids = try Dev.alloc(B * M * 4);
+        try Dev.up(d_mids, bytesOf(i32, mids));
+        const d_tabs = try Dev.alloc(256 * Dm * 2); // E, Eprev share the table buffer
+        const d_pos = try Dev.alloc(M * Dm * 2);
+        const d_enc = try Dev.alloc(B * M * Dm * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_tab_f)), d_tabs, 256 * Dm) != 0) return error.Ref;
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_pos, M * Dm) != 0) return error.Ref;
+        const encA = try gpa.alloc(u16, B * M * Dm);
+        const encB = try gpa.alloc(u16, B * M * Dm);
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_mem_encode(d_tabs, d_tabs, d_pos, @ptrCast(@alignCast(d_mids)), d_enc, B, M, Dm) != 0) return error.Ref;
+            } else try (try mod.get("mem_encode")).launch((B * M * Dm + 255) / 256, 256,
+                .{ d_tabs, d_tabs, d_pos, d_mids, d_enc, @as(i32, B), @as(i32, M), @as(i32, Dm) });
+            try Dev.down(bytesOf(u16, if (run == 0) encA else encB), d_enc);
+        }
+        report("memory encoding", std.mem.eql(u16, encA, encB), "");
+
+        // cross-attention forward and both backward halves
+        const d_Q = try Dev.alloc(B * T * HD * 2);
+        const d_K = try Dev.alloc(B * M * HD * 2);
+        const d_V = try Dev.alloc(B * M * HD * 2);
+        const d_O = try Dev.alloc(B * T * HD * 2);
+        const d_Pm = try Dev.alloc(B * H * T * M * 4);
+        const d_dS = try Dev.alloc(B * H * T * M * 4);
+        const d_dQ = try Dev.alloc(B * T * HD * 2);
+        const d_dK = try Dev.alloc(B * M * HD * 2);
+        const d_dV = try Dev.alloc(B * M * HD * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_Q, B * T * HD) != 0) return error.Ref;
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_acc)), d_K, B * M * HD) != 0) return error.Ref;
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_tab_f)), d_V, B * M * HD) != 0) return error.Ref;
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_O, B * T * HD) != 0) return error.Ref;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(dh)));
+        const fwdA = try gpa.alloc(u16, B * T * HD);
+        const fwdB = try gpa.alloc(u16, B * T * HD);
+        const pA = try gpa.alloc(f32, B * H * T * M);
+        const pB = try gpa.alloc(f32, B * H * T * M);
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_mem_attn_fwd(scale, d_Q, d_K, d_V, @ptrCast(@alignCast(d_mids)),
+                    @ptrCast(@alignCast(d_Pm)), d_O, B, T, M, H, dh) != 0) return error.Ref;
+            } else try (try mod.get("mem_attn_fwd")).launch((B * H * T + 255) / 256, 256,
+                .{ d_Q, d_K, d_V, d_mids, d_Pm, d_O, @as(i32, B), @as(i32, T), @as(i32, M), @as(i32, H),
+                   @as(i32, dh), scale });
+            try Dev.down(bytesOf(u16, if (run == 0) fwdA else fwdB), d_O);
+            try Dev.down(bytesOf(f32, if (run == 0) pA else pB), d_Pm);
+        }
+        report("memory attention forward", std.mem.eql(u16, fwdA, fwdB) and std.mem.eql(f32, pA, pB), "");
+
+        const dqA = try gpa.alloc(u16, B * T * HD + 2 * B * M * HD);
+        const dqB = try gpa.alloc(u16, B * T * HD + 2 * B * M * HD);
+        const dsA = try gpa.alloc(f32, B * H * T * M);
+        const dsB = try gpa.alloc(f32, B * H * T * M);
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_mem_attn_bwd_q(scale, d_O, d_K, d_V, @ptrCast(@alignCast(d_Pm)),
+                    @ptrCast(@alignCast(d_dS)), d_dQ, B, T, M, H, dh) != 0) return error.Ref;
+                if (tmt.tmt_ref_mem_attn_bwd_kv(scale, d_Q, d_O, @ptrCast(@alignCast(d_Pm)),
+                    @ptrCast(@alignCast(d_dS)), d_dK, d_dV, B, T, M, H, dh) != 0) return error.Ref;
+            } else {
+                try (try mod.get("mem_attn_bwd_q")).launch((B * H * T + 255) / 256, 256,
+                    .{ d_O, d_K, d_V, d_Pm, d_dS, d_dQ, @as(i32, B), @as(i32, T), @as(i32, M),
+                       @as(i32, H), @as(i32, dh), scale });
+                try (try mod.get("mem_attn_bwd_kv")).launch((B * H * M + 255) / 256, 256,
+                    .{ d_Q, d_O, d_Pm, d_dS, d_dK, d_dV, @as(i32, B), @as(i32, T), @as(i32, M),
+                       @as(i32, H), @as(i32, dh), scale });
+            }
+            const dst = if (run == 0) dqA else dqB;
+            try Dev.down(bytesOf(u16, dst[0 .. B * T * HD]), d_dQ);
+            try Dev.down(bytesOf(u16, dst[B * T * HD ..][0 .. B * M * HD]), d_dK);
+            try Dev.down(bytesOf(u16, dst[B * T * HD + B * M * HD ..]), d_dV);
+            try Dev.down(bytesOf(f32, if (run == 0) dsA else dsB), d_dS);
+        }
+        report("memory attention backward", std.mem.eql(u16, dqA, dqB) and std.mem.eql(f32, dsA, dsB), "");
+
+        // encoding gradient (atomic scatter) and the two elementwise helpers
+        const zeroT = try gpa.alloc(f32, 256 * Dm);
+        @memset(zeroT, 0);
+        const d_dE = try Dev.alloc(256 * Dm * 4);
+        const d_dEp = try Dev.alloc(256 * Dm * 4);
+        const d_dP = try Dev.alloc(M * Dm * 4);
+        const gA = try gpa.alloc(f32, 2 * 256 * Dm + M * Dm);
+        const gB = try gpa.alloc(f32, 2 * 256 * Dm + M * Dm);
+        for ([_]u8{ 0, 1 }) |run| {
+            try Dev.up(d_dE, bytesOf(f32, zeroT));
+            try Dev.up(d_dEp, bytesOf(f32, zeroT));
+            try Dev.up(d_dP, bytesOf(f32, zeroT[0 .. M * Dm]));
+            if (run == 0) {
+                if (tmt.tmt_ref_mem_encode_bwd(@ptrCast(@alignCast(d_x)), @ptrCast(@alignCast(d_mids)),
+                    @ptrCast(@alignCast(d_dE)), @ptrCast(@alignCast(d_dEp)), @ptrCast(@alignCast(d_dP)), B, M, Dm) != 0) return error.Ref;
+            } else try (try mod.get("mem_encode_bwd")).launch((B * M * Dm + 255) / 256, 256,
+                .{ d_x, d_mids, d_dE, d_dEp, d_dP, @as(i32, B), @as(i32, M), @as(i32, Dm) });
+            const dst = if (run == 0) gA else gB;
+            try Dev.down(bytesOf(f32, dst[0 .. 256 * Dm]), d_dE);
+            try Dev.down(bytesOf(f32, dst[256 * Dm ..][0 .. 256 * Dm]), d_dEp);
+            try Dev.down(bytesOf(f32, dst[2 * 256 * Dm ..]), d_dP);
+        }
+        var gscale: f32 = 1e-30;
+        var gworst: f32 = 0;
+        for (gA) |v| gscale = @max(gscale, @abs(v));
+        for (gA, gB) |v, w| gworst = @max(gworst, @abs(v - w) / gscale);
+        var gb: [96]u8 = undefined;
+        report("memory encoding gradient", gworst < 1e-5,
+            std.fmt.bufPrint(&gb, "within {e:.1} (atomic order)", .{gworst}) catch "");
+
+        const n2 = B * M * Dm;
+        const hA = try gpa.alloc(u16, n2);
+        const hB = try gpa.alloc(u16, n2);
+        for ([_]u8{ 0, 1 }) |run| {
+            try Dev.up(d_enc, bytesOf(u16, encA));
+            if (run == 0) {
+                if (tmt.tmt_ref_mem_add_bf16(d_enc, d_tabs, n2) != 0) return error.Ref;
+                if (tmt.tmt_ref_mem_sum(d_enc, @ptrCast(@alignCast(d_x)), d_enc, n2) != 0) return error.Ref;
+            } else {
+                try (try mod.get("mem_add_bf16")).launch((n2 + 255) / 256, 256, .{ d_enc, d_tabs, @as(i64, n2) });
+                try (try mod.get("mem_sum")).launch((n2 + 255) / 256, 256, .{ d_enc, d_x, d_enc, @as(i64, n2) });
+            }
+            try Dev.down(bytesOf(u16, if (run == 0) hA else hB), d_enc);
+        }
+        report("memory helpers", std.mem.eql(u16, hA, hB), "");
+    }
+
     if (failures == 0) say("ALL KERNEL COMPARISONS PASSED\n", .{});
     return if (failures == 0) 0 else 1;
 }

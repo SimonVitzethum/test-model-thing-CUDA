@@ -735,3 +735,170 @@ export fn dense_activation(pre: cuda.ConstGlobal(bf16), grad: ?cuda.ConstGlobal(
     const base: f32 = if (beta != 0) beta * cuda.bf2f(out[u]) else 0;
     out[u] = cuda.f2bf(base + if (grad) |g| cuda.siluBwd(cuda.bf2f(pre[u]), cuda.bf2f(g[u])) else cuda.silu(cuda.bf2f(pre[u])));
 }
+
+// ---- src/memory.cu (knowledge-graph fact memory) ----
+// mem_cast_add, mem_f32_to_bf16 and mem_add_f32 are the same functions as
+// cast_add, copy_bf16 and add_f32 above and reuse those kernels.
+
+/// Fact bytes to their encoding: E[byte] + E_prev[previous byte] + P[position].
+export fn mem_encode(E: cuda.ConstGlobal(bf16), Eprev: cuda.ConstGlobal(bf16), P: cuda.ConstGlobal(bf16),
+                     ids: cuda.ConstGlobal(i32), enc: cuda.Global(bf16), B: i32, M: i32, D: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * M * D) return;
+    const d = @rem(i, D);
+    const bj = @divTrunc(i, D);
+    const j = @rem(bj, M);
+    const b = @divTrunc(bj, M);
+    const byte = ids[@intCast(b * M + j)];
+    if (byte < 0) {
+        enc[@intCast(i)] = cuda.f2bf(0);
+        return;
+    }
+    const prev: i32 = if (j != 0) ids[@intCast(b * M + j - 1)] else -1;
+    var v = cuda.bf2f(E[@intCast(@as(i64, byte) * D + d)]) + cuda.bf2f(P[@intCast(j * D + d)]);
+    if (prev >= 0) v += cuda.bf2f(Eprev[@intCast(@as(i64, prev) * D + d)]);
+    enc[@intCast(i)] = cuda.f2bf(v);
+}
+
+/// Scatter the encoding gradient into E, Eprev and P (padding skipped).
+export fn mem_encode_bwd(dEnc: cuda.ConstGlobal(f32), ids: cuda.ConstGlobal(i32), dE: cuda.Global(f32),
+                         dEprev: cuda.Global(f32), dP: cuda.Global(f32), B: i32, M: i32, D: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * M * D) return;
+    const d = @rem(i, D);
+    const bj = @divTrunc(i, D);
+    const j = @rem(bj, M);
+    const b = @divTrunc(bj, M);
+    const byte = ids[@intCast(b * M + j)];
+    if (byte < 0) return;
+    const g = dEnc[@intCast(i)];
+    cuda.atomicAddF32(&dE[@intCast(@as(i64, byte) * D + d)], g);
+    cuda.atomicAddF32(&dP[@intCast(j * D + d)], g);
+    const prev: i32 = if (j != 0) ids[@intCast(b * M + j - 1)] else -1;
+    if (prev >= 0) cuda.atomicAddF32(&dEprev[@intCast(@as(i64, prev) * D + d)], g);
+}
+
+/// One thread per (stream, head, position): masked softmax over the slots, o = P V.
+export fn mem_attn_fwd(Q: cuda.ConstGlobal(bf16), K: cuda.ConstGlobal(bf16), V: cuda.ConstGlobal(bf16),
+                       ids: cuda.ConstGlobal(i32), P: cuda.Global(f32), O: cuda.Global(bf16),
+                       B: i32, T: i32, M: i32, H: i32, dh: i32, scale: f32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * H * T) return;
+    const t = @rem(i, T);
+    const bh = @divTrunc(i, T);
+    const h = @rem(bh, H);
+    const b = @divTrunc(bh, H);
+    const HD = H * dh;
+    const q = Q + @as(usize, @intCast((b * T + t) * HD + h * dh));
+    const p = P + @as(usize, @intCast(i * M));
+    var mx: f32 = -1e30;
+    var j: i64 = 0;
+    while (j < M) : (j += 1) {
+        if (ids[@intCast(b * M + j)] < 0) {
+            p[@intCast(j)] = -1e30;
+            continue;
+        }
+        const k = K + @as(usize, @intCast((b * M + j) * HD + h * dh));
+        var s: f32 = 0;
+        for (0..@intCast(dh)) |d| s += cuda.bf2f(q[d]) * cuda.bf2f(k[d]);
+        p[@intCast(j)] = s * scale;
+        mx = cuda.__nv_fmaxf(mx, p[@intCast(j)]);
+    }
+    var sum: f32 = 0;
+    j = 0;
+    while (j < M) : (j += 1) {
+        p[@intCast(j)] = if (p[@intCast(j)] > -1e29) cuda.__nv_fast_expf(p[@intCast(j)] - mx) else 0;
+        sum += p[@intCast(j)];
+    }
+    const inv: f32 = if (sum > 0) cuda.frcp(sum) else 0;
+    j = 0;
+    while (j < M) : (j += 1) p[@intCast(j)] *= inv;
+    const o = O + @as(usize, @intCast((b * T + t) * HD + h * dh));
+    for (0..@intCast(dh)) |d| {
+        var acc: f32 = 0;
+        j = 0;
+        while (j < M) : (j += 1) {
+            if (p[@intCast(j)] != 0)
+                acc += p[@intCast(j)] * cuda.bf2f(V[@intCast((b * M + j) * HD + h * dh + @as(i64, @intCast(d)))]);
+        }
+        o[d] = cuda.f2bf(acc);
+    }
+}
+
+/// Backward part 1: dS = P (dP - <P, dP>) and dQ.
+export fn mem_attn_bwd_q(dO: cuda.ConstGlobal(bf16), K: cuda.ConstGlobal(bf16), V: cuda.ConstGlobal(bf16),
+                         P: cuda.ConstGlobal(f32), dS: cuda.Global(f32), dQ: cuda.Global(bf16),
+                         B: i32, T: i32, M: i32, H: i32, dh: i32, scale: f32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * H * T) return;
+    const t = @rem(i, T);
+    const bh = @divTrunc(i, T);
+    const h = @rem(bh, H);
+    const b = @divTrunc(bh, H);
+    const HD = H * dh;
+    const g = dO + @as(usize, @intCast((b * T + t) * HD + h * dh));
+    const p = P + @as(usize, @intCast(i * M));
+    const s = dS + @as(usize, @intCast(i * M));
+    var dot: f32 = 0;
+    var j: i64 = 0;
+    while (j < M) : (j += 1) {
+        var dp: f32 = 0;
+        if (p[@intCast(j)] != 0) {
+            const v = V + @as(usize, @intCast((b * M + j) * HD + h * dh));
+            for (0..@intCast(dh)) |d| dp += cuda.bf2f(g[d]) * cuda.bf2f(v[d]);
+        }
+        s[@intCast(j)] = dp;
+        dot += p[@intCast(j)] * dp;
+    }
+    j = 0;
+    while (j < M) : (j += 1) s[@intCast(j)] = p[@intCast(j)] * (s[@intCast(j)] - dot);
+    const dq = dQ + @as(usize, @intCast((b * T + t) * HD + h * dh));
+    for (0..@intCast(dh)) |d| {
+        var acc: f32 = 0;
+        j = 0;
+        while (j < M) : (j += 1) {
+            if (s[@intCast(j)] != 0)
+                acc += s[@intCast(j)] * cuda.bf2f(K[@intCast((b * M + j) * HD + h * dh + @as(i64, @intCast(d)))]);
+        }
+        dq[d] = cuda.f2bf(acc * scale);
+    }
+}
+
+/// Backward part 2: dK_j = scale * sum_t dS q_t, dV_j = sum_t P dO_t.
+export fn mem_attn_bwd_kv(Q: cuda.ConstGlobal(bf16), dO: cuda.ConstGlobal(bf16), P: cuda.ConstGlobal(f32),
+                          dS: cuda.ConstGlobal(f32), dK: cuda.Global(bf16), dV: cuda.Global(bf16),
+                          B: i32, T: i32, M: i32, H: i32, dh: i32, scale: f32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * H * M) return;
+    const j = @rem(i, M);
+    const bh = @divTrunc(i, M);
+    const h = @rem(bh, H);
+    const b = @divTrunc(bh, H);
+    const HD = H * dh;
+    const dk = dK + @as(usize, @intCast((b * M + j) * HD + h * dh));
+    const dv = dV + @as(usize, @intCast((b * M + j) * HD + h * dh));
+    for (0..@intCast(dh)) |d| {
+        var ak: f32 = 0;
+        var av: f32 = 0;
+        var t: i64 = 0;
+        while (t < T) : (t += 1) {
+            const pt: usize = @intCast((bh * T + t) * M + j);
+            const qt: usize = @intCast((b * T + t) * HD + h * dh + @as(i64, @intCast(d)));
+            ak += dS[pt] * cuda.bf2f(Q[qt]);
+            av += P[pt] * cuda.bf2f(dO[qt]);
+        }
+        dk[d] = cuda.f2bf(ak * scale);
+        dv[d] = cuda.f2bf(av);
+    }
+}
+
+export fn mem_add_bf16(a: cuda.Global(bf16), b: cuda.ConstGlobal(bf16), n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i < n) a[@intCast(i)] = cuda.f2bf(cuda.bf2f(a[@intCast(i)]) + cuda.bf2f(b[@intCast(i)]));
+}
+
+/// enc = enc0 + state (the causal recurrence over the fact bytes).
+export fn mem_sum(e: cuda.ConstGlobal(bf16), s: cuda.ConstGlobal(f32), out: cuda.Global(bf16), n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i < n) out[@intCast(i)] = cuda.f2bf(cuda.bf2f(e[@intCast(i)]) + s[@intCast(i)]);
+}

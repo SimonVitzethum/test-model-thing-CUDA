@@ -167,6 +167,13 @@ pub extern fn tmt_ref_scatter_add(dXg: *const anyopaque, slot_of: [*]const c_int
 pub extern fn tmt_ref_aux_sum(probs: [*]const f32, sum_p: [*]f32, N: c_int, E: c_int) c_int;
 pub extern fn tmt_ref_zloss(logits: [*]const f32, out: [*]f32, N: c_int, E: c_int) c_int;
 pub extern fn tmt_ref_dense_activation(pre: *const anyopaque, grad: ?*const anyopaque, out: *anyopaque, beta: f32, n: c_long) c_int;
+pub extern fn tmt_ref_mem_encode(E: *const anyopaque, Eprev: *const anyopaque, P: *const anyopaque, ids: [*]const c_int, enc: *anyopaque, B: c_int, M: c_int, D: c_int) c_int;
+pub extern fn tmt_ref_mem_encode_bwd(dEnc: [*]const f32, ids: [*]const c_int, dE: [*]f32, dEprev: [*]f32, dP: [*]f32, B: c_int, M: c_int, D: c_int) c_int;
+pub extern fn tmt_ref_mem_attn_fwd(scale: f32, Q: *const anyopaque, K: *const anyopaque, V: *const anyopaque, ids: [*]const c_int, P: [*]f32, O: *anyopaque, B: c_int, T: c_int, M: c_int, H: c_int, dh: c_int) c_int;
+pub extern fn tmt_ref_mem_attn_bwd_q(scale: f32, dO: *const anyopaque, K: *const anyopaque, V: *const anyopaque, P: [*]const f32, dS: [*]f32, dQ: *anyopaque, B: c_int, T: c_int, M: c_int, H: c_int, dh: c_int) c_int;
+pub extern fn tmt_ref_mem_attn_bwd_kv(scale: f32, Q: *const anyopaque, dO: *const anyopaque, P: [*]const f32, dS: [*]const f32, dK: *anyopaque, dV: *anyopaque, B: c_int, T: c_int, M: c_int, H: c_int, dh: c_int) c_int;
+pub extern fn tmt_ref_mem_add_bf16(a: *anyopaque, b: *const anyopaque, n: c_long) c_int;
+pub extern fn tmt_ref_mem_sum(e: *const anyopaque, s: [*]const f32, out: *anyopaque, n: c_long) c_int;
 pub extern fn tmt_ref_add_f32(acc: [*]f32, x: [*]const f32, n: c_long) c_int;
 pub extern fn tmt_ref_ln_fwd(X: *const anyopaque, gamma: [*]const f32, beta: [*]const f32, Y: *anyopaque, mean: [*]f32, rstd: [*]f32, N: c_int, D: c_int) c_int;
 pub extern fn tmt_ref_ln_bwd(X: *const anyopaque, dY: *const anyopaque, gamma: [*]const f32, mean: [*]const f32, rstd: [*]const f32, dX: *anyopaque, dGamma: [*]f32, dBeta: [*]f32, N: c_int, D: c_int) c_int;

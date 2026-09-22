@@ -122,6 +122,20 @@ int tmt_ref_scatter_add(const void* dXg, const int* slot_of, void* dX, int N, in
 int tmt_ref_aux_sum(const float* probs, float* sum_p, int N, int E);
 int tmt_ref_zloss(const float* logits, float* out, int N, int E);
 int tmt_ref_dense_activation(const void* pre, const void* grad, void* out, float beta, long n);
+/* Fact-memory reference kernels (src/memory.cu); `scale` comes first so it
+   never lands after a long run of pointer arguments. */
+int tmt_ref_mem_encode(const void* E, const void* Eprev, const void* P, const int* ids, void* enc,
+                       int B, int M, int D);
+int tmt_ref_mem_encode_bwd(const float* dEnc, const int* ids, float* dE, float* dEprev, float* dP,
+                           int B, int M, int D);
+int tmt_ref_mem_attn_fwd(float scale, const void* Q, const void* K, const void* V, const int* ids,
+                         float* P, void* O, int B, int T, int M, int H, int dh);
+int tmt_ref_mem_attn_bwd_q(float scale, const void* dO, const void* K, const void* V, const float* P,
+                           float* dS, void* dQ, int B, int T, int M, int H, int dh);
+int tmt_ref_mem_attn_bwd_kv(float scale, const void* Q, const void* dO, const float* P, const float* dS,
+                            void* dK, void* dV, int B, int T, int M, int H, int dh);
+int tmt_ref_mem_add_bf16(void* a, const void* b, long n);
+int tmt_ref_mem_sum(const void* e, const float* s, void* out, long n);
 int tmt_ref_add_f32(float* acc, const float* x, long n);
 int tmt_ref_ln_fwd(const void* X, const float* gamma, const float* beta, void* Y,
                    float* mean, float* rstd, int N, int D);
