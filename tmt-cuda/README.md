@@ -32,9 +32,17 @@ make check-zig            # compares the Zig binaries against the C++ ones
 zig build -Darch=sm_89    # other GPU (default sm_120a)
 ```
 
-Still C++: the kernels and the model orchestration in `src/*.cu`, plus the
-development tools `architecture_test`, `bench` and `roofline`, which measure
-and check the kernels themselves.
+Every CUDA kernel also exists in Zig (`zig/kernels/`). `build.zig` compiles
+them to PTX through LLVM (Zig IR, then `llvm-link` with libdevice, `opt` and
+`llc`), embeds the module in the host binary and loads it through the driver
+API. `./zig-out/bin/ktest`, part of `make check-zig`, runs every Zig kernel
+against its C++ twin on the same device buffers: almost all of them agree bit
+for bit, the rest stay within the spread that the atomic adds produce between
+two runs of the C++ kernel itself.
+
+Still C++: the model orchestration in `src/*.cu` (which kernel runs when, and
+the cuBLAS calls), plus the development tools `architecture_test`, `bench` and
+`roofline`, which measure and check the kernels themselves.
 
 `make check` requires a GPU but neither Python nor PyTorch. It checks:
 

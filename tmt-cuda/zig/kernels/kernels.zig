@@ -147,7 +147,7 @@ export fn ce_fwd(logits: cuda.ConstGlobal(bf16), tgt: cuda.ConstGlobal(i32), pro
     for (1..256) |i| mx = cuda.__nv_fmaxf(mx, cuda.bf2f(L[i]));
     var se: f32 = 0;
     for (0..256) |i| se += cuda.__nv_fast_expf(cuda.bf2f(L[i]) - mx);
-    const lse = cuda.__nv_fast_logf(se) + mx;
+    const lse = @mulAdd(f32, cuda.lg2(se), cuda.ln2, mx);
     for (0..256) |i| probs[@as(usize, r) * 256 + i] = cuda.fdiv(cuda.__nv_fast_expf(cuda.bf2f(L[i]) - mx), se);
     loss_out[r] = if (tgt[r] < 0) 0 else lse - cuda.bf2f(L[@intCast(tgt[r])]);
 }
@@ -374,7 +374,7 @@ export fn emb_trace(X: cuda.ConstGlobal(bf16), S: cuda.ConstGlobal(f32), initial
         const x = cuda.bf2f(X[idx]);
         const a = cellA(o, decay[d], gate, d, x, b, T, t);
         const prev = if (t != 0) S[idx - dim] else initial[bd];
-        const k = (1.0 - a) + if (gate) |g| (prev - x) * a * (1.0 - a) * g[d] else 0;
+        const k = if (gate) |g| @mulAdd(f32, (prev - x) * a * (1.0 - a), g[d], 1.0 - a) else 1.0 - a;
         e[@as(usize, @intCast(o.ids.?[@intCast(@as(i32, @intCast(b)) * T + t)])) * dim] += suffix * k;
         suffix *= o.gamma * a;
     }
@@ -901,4 +901,394 @@ export fn mem_add_bf16(a: cuda.Global(bf16), b: cuda.ConstGlobal(bf16), n: i64) 
 export fn mem_sum(e: cuda.ConstGlobal(bf16), s: cuda.ConstGlobal(f32), out: cuda.Global(bf16), n: i64) callconv(.nvptx_kernel) void {
     const i: i64 = @intCast(cuda.globalIdX());
     if (i < n) out[@intCast(i)] = cuda.f2bf(cuda.bf2f(e[@intCast(i)]) + s[@intCast(i)]);
+}
+
+// ---- src/mla.cu (long-range latent cache) ----
+// mla_f2b, f32_to_bf16 and add_bf16_kernel_mla are the same functions as
+// copy_bf16 and mem_add_bf16 above and reuse those kernels; so does
+// nh_to_bhnt_bf16, which is to_bhnt.
+
+/// RoPE over the first R features, in place of the pair (even, odd).
+export fn rope(x: cuda.ConstGlobal(bf16), y: cuda.Global(bf16), pos: cuda.ConstGlobal(i64),
+               N: i32, H: i32, F: i32, R: i32, theta: f32, neg: bool) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, N) * H * F) return;
+    const f = @rem(i, F);
+    const tmp = @divTrunc(i, F);
+    const r = @divTrunc(tmp, H);
+    const v = cuda.bf2f(x[@intCast(i)]);
+    if (f < R) {
+        const p2 = @divTrunc(f, 2);
+        var ang = @as(f32, @floatFromInt(pos[@intCast(r)])) /
+            cuda.__nv_fast_powf(theta, @as(f32, @floatFromInt(2 * p2)) / @as(f32, @floatFromInt(R)));
+        if (neg) ang = -ang;
+        const co = cuda.__nv_fast_cosf(ang);
+        const si = cuda.__nv_fast_sinf(ang);
+        const u = cuda.bf2f(x[@intCast(i ^ 1)]);
+        const sgn: f32 = if (@rem(f, 2) == 0) -1.0 else 1.0;
+        y[@intCast(i)] = cuda.f2bf(v * co + sgn * u * si);
+    } else y[@intCast(i)] = x[@intCast(i)];
+}
+
+/// Write one window of latents and rotated keys into the ring cache.
+export fn cache_write(latw: cuda.ConstGlobal(bf16), krw: cuda.ConstGlobal(bf16), lat: cuda.Global(bf16),
+                      kr: cuda.Global(bf16), head: i64, N: i32, Cmax: i32, L: i32, R: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    const LR = L + R;
+    if (i >= @as(i64, N) * LR) return;
+    const row = @divTrunc(i, LR);
+    const f = @rem(i, LR);
+    const dst = @rem(head + row, Cmax);
+    if (f < L) lat[@intCast(dst * L + f)] = latw[@intCast(row * L + f)]
+    else kr[@intCast(dst * R + (f - L))] = krw[@intCast(row * R + (f - L))];
+}
+
+/// Split the query into its compressed and its rotary half.
+export fn qsplit(q: cuda.ConstGlobal(bf16), qc: cuda.Global(bf16), qr: cuda.Global(bf16),
+                 N: i32, H: i32, dh: i32, R: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    const W = dh + R;
+    if (i >= @as(i64, N) * H * W) return;
+    const fr = @rem(i, W);
+    const tmp = @divTrunc(i, W);
+    const h = @rem(tmp, H);
+    const r = @divTrunc(tmp, H);
+    if (fr < dh) qc[@intCast((r * H + h) * dh + fr)] = q[@intCast(i)]
+    else qr[@intCast((r * H + h) * R + (fr - dh))] = q[@intCast(i)];
+}
+
+export fn qjoin(dqc: cuda.ConstGlobal(bf16), dqr: cuda.ConstGlobal(bf16), dq: cuda.Global(bf16),
+                N: i32, H: i32, dh: i32, R: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    const W = dh + R;
+    if (i >= @as(i64, N) * H * W) return;
+    const fr = @rem(i, W);
+    const tmp = @divTrunc(i, W);
+    const h = @rem(tmp, H);
+    const r = @divTrunc(tmp, H);
+    dq[@intCast(i)] = if (fr < dh) dqc[@intCast((r * H + h) * dh + fr)] else dqr[@intCast((r * H + h) * R + (fr - dh))];
+}
+
+/// Online softmax update for one cache chunk (one query block).
+export fn online_update(S: cuda.ConstGlobal(f32), Vc: cuda.ConstGlobal(bf16), O: cuda.Global(f32),
+                        m: cuda.Global(f32), l: cuda.Global(f32), Qc: i32, Cc: i32, dh: i32,
+                        scale: f32) callconv(.nvptx_kernel) void {
+    _ = scale;
+    const q = cuda.blockIdxX();
+    if (q >= @as(u32, @bitCast(Qc))) return;
+    const s = S + @as(usize, q) * @as(usize, @intCast(Cc));
+    var mx = s[0];
+    for (1..@intCast(Cc)) |c| mx = cuda.__nv_fmaxf(mx, s[c]);
+    const m_old = m[q];
+    const m_new = cuda.__nv_fmaxf(m_old, mx);
+    const alpha = cuda.__nv_fast_expf(m_old - m_new);
+    const l_new = l[q] * alpha;
+    const o = O + @as(usize, q) * @as(usize, @intCast(dh));
+    var d = cuda.threadIdxX();
+    while (d < @as(u32, @bitCast(dh))) : (d += cuda.blockDimX()) {
+        var acc = o[d] * alpha;
+        for (0..@intCast(Cc)) |c| acc += cuda.__nv_fast_expf(s[c] - m_new) * cuda.bf2f(Vc[c * @as(usize, @intCast(dh)) + d]);
+        o[d] = acc;
+    }
+    cuda.syncThreads();
+    if (cuda.threadIdxX() == 0) {
+        var ps: f32 = 0;
+        for (0..@intCast(Cc)) |c| ps += cuda.__nv_fast_expf(s[c] - m_new);
+        l[q] = l_new + ps;
+        m[q] = m_new;
+    }
+}
+
+/// The same update over all (stream, head, position) rows.
+export fn online_update_batched(S: cuda.ConstGlobal(f32), Vc: cuda.ConstGlobal(bf16), O: cuda.Global(f32),
+                                m: cuda.Global(f32), l: cuda.Global(f32), T: i32, Cc: i32, dh: i32,
+                                BH: i64) callconv(.nvptx_kernel) void {
+    const qb: i64 = @intCast(cuda.blockIdxX());
+    if (qb >= BH * T) return;
+    const bh = @divTrunc(qb, T);
+    const q = @rem(qb, T);
+    const s = S + @as(usize, @intCast((bh * T + q) * Cc));
+    var mx = s[0];
+    for (1..@intCast(Cc)) |c| mx = cuda.__nv_fmaxf(mx, s[c]);
+    const m_old = m[@intCast(qb)];
+    const m_new = cuda.__nv_fmaxf(m_old, mx);
+    const alpha = cuda.__nv_fast_expf(m_old - m_new);
+    const l_new = l[@intCast(qb)] * alpha;
+    const vc = Vc + @as(usize, @intCast(bh * Cc * dh));
+    const o = O + @as(usize, @intCast(qb * dh));
+    var d = cuda.threadIdxX();
+    while (d < @as(u32, @bitCast(dh))) : (d += cuda.blockDimX()) {
+        var acc = o[d] * alpha;
+        for (0..@intCast(Cc)) |c| acc += cuda.__nv_fast_expf(s[c] - m_new) * cuda.bf2f(vc[c * @as(usize, @intCast(dh)) + d]);
+        o[d] = acc;
+    }
+    cuda.syncThreads();
+    if (cuda.threadIdxX() == 0) {
+        var ps: f32 = 0;
+        for (0..@intCast(Cc)) |c| ps += cuda.__nv_fast_expf(s[c] - m_new);
+        l[@intCast(qb)] = l_new + ps;
+        m[@intCast(qb)] = m_new;
+    }
+}
+
+export fn norm_out(O: cuda.Global(f32), l: cuda.ConstGlobal(f32), rows: i64, dh: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= rows * dh) return;
+    O[@intCast(i)] = cuda.fdiv(O[@intCast(i)], l[@intCast(@divTrunc(i, dh))]);
+}
+
+/// Softmax over one chunk plus the blend factors of the online pass.
+export fn softmax_scale(S: cuda.ConstGlobal(f32), P: cuda.Global(bf16), m: cuda.Global(f32),
+                        l: cuda.Global(f32), alpha: cuda.Global(f32), LSE: cuda.Global(f32),
+                        rows: i64, Cc: i32, last: bool) callconv(.nvptx_kernel) void {
+    const r: i64 = @intCast(cuda.blockIdxX());
+    if (r >= rows) return;
+    const s = S + @as(usize, @intCast(r * Cc));
+    var mx = s[0];
+    for (1..@intCast(Cc)) |c| mx = cuda.__nv_fmaxf(mx, s[c]);
+    const m_old = m[@intCast(r)];
+    const m_new = cuda.__nv_fmaxf(m_old, mx);
+    const al = cuda.__nv_fast_expf(m_old - m_new);
+    var ps: f32 = 0;
+    var c = cuda.threadIdxX();
+    while (c < @as(u32, @bitCast(Cc))) : (c += cuda.blockDimX()) {
+        const p = cuda.__nv_fast_expf(s[c] - m_new);
+        P[@intCast(r * Cc + c)] = cuda.f2bf(p);
+        ps += p;
+    }
+    const t = cuda.threadIdxX();
+    ln_buf[t] = ps;
+    cuda.syncThreads();
+    var half: u32 = 128;
+    while (half > 0) : (half >>= 1) {
+        if (t < half) ln_buf[t] += ln_buf[t + half];
+        cuda.syncThreads();
+    }
+    if (t == 0) {
+        l[@intCast(r)] = l[@intCast(r)] * al + ln_buf[0];
+        m[@intCast(r)] = m_new;
+        alpha[@intCast(r)] = al;
+        // nvcc fuses log(l)*ln2 + m into one instruction here.
+        if (last) LSE[@intCast(r)] = @mulAdd(f32, cuda.lg2(l[@intCast(r)]), cuda.ln2, m_new);
+    }
+}
+
+export fn scale_rows(O: cuda.Global(f32), alpha: cuda.ConstGlobal(f32), rows: i64, dh: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= rows * dh) return;
+    O[@intCast(i)] *= alpha[@intCast(@divTrunc(i, dh))];
+}
+
+/// Softmax Jacobian; the dot product runs over all key chunks.
+export fn softmax_bwd(S: cuda.ConstGlobal(f32), dP: cuda.ConstGlobal(f32), LSE: cuda.ConstGlobal(f32),
+                      dS: cuda.Global(bf16), P: cuda.Global(bf16), rows: i32, Cc: i32,
+                      dO: cuda.ConstGlobal(f32), O: cuda.ConstGlobal(bf16), H: i32, T: i32,
+                      dh: i32, scale: f32) callconv(.nvptx_kernel) void {
+    const row = cuda.blockIdxX();
+    if (row >= @as(u32, @bitCast(rows))) return;
+    const t = @rem(@as(i32, @intCast(row)), T);
+    const h = @rem(@divTrunc(@as(i32, @intCast(row)), T), H);
+    const b = @divTrunc(@as(i32, @intCast(row)), T * H);
+    const out: usize = @intCast((@as(i64, b) * T + t) * H * dh + h * dh);
+    var dot: f32 = 0;
+    for (0..@intCast(dh)) |d| dot += dO[@as(usize, row) * @as(usize, @intCast(dh)) + d] * cuda.bf2f(O[out + d]);
+    var c = cuda.threadIdxX();
+    while (c < @as(u32, @bitCast(Cc))) : (c += cuda.blockDimX()) {
+        const i: usize = @as(usize, row) * @as(usize, @intCast(Cc)) + c;
+        const p = cuda.__nv_fast_expf(S[i] - LSE[row]);
+        P[i] = cuda.f2bf(p);
+        dS[i] = cuda.f2bf(scale * p * (dP[i] - dot));
+    }
+}
+
+/// (N,H,F) -> (B,H,T,F); also serves nh_to_bhnt_bf16.
+export fn to_bhnt(s: cuda.ConstGlobal(bf16), d: cuda.Global(bf16), B: i32, H: i32, T: i32, F: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * H * T * F) return;
+    const f = @rem(i, F);
+    const tmp = @divTrunc(i, F);
+    const t = @rem(tmp, T);
+    const h = @rem(@divTrunc(tmp, T), H);
+    const b = @divTrunc(tmp, @as(i64, T) * H);
+    d[@intCast(i)] = s[@intCast(((b * T + t) * H + h) * F + f)];
+}
+
+export fn to_nh(s: cuda.ConstGlobal(bf16), d: cuda.Global(bf16), B: i32, H: i32, T: i32, F: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * H * T * F) return;
+    const f = @rem(i, F);
+    const tmp = @divTrunc(i, F);
+    const h = @rem(tmp, H);
+    const r = @divTrunc(tmp, H);
+    d[@intCast((r * H + h) * F + f)] = s[@intCast(i)];
+}
+
+/// Gather one cache chunk, wrapping around the ring.
+export fn cache_gather(lat: cuda.ConstGlobal(bf16), kr: cuda.ConstGlobal(bf16), clat: cuda.Global(bf16),
+                       ckr: cuda.Global(bf16), head: i64, c0: i32, Cc: i32, Cmax: i32,
+                       L: i32, R: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    const LR = L + R;
+    if (i >= @as(i64, Cc) * LR) return;
+    const f = @rem(i, LR);
+    const c = @divTrunc(i, LR);
+    const slot = @rem(head + c0 + c, Cmax);
+    if (f < L) clat[@intCast(c * L + f)] = lat[@intCast(slot * L + f)]
+    else ckr[@intCast(c * R + (f - L))] = kr[@intCast(slot * R + (f - L))];
+}
+
+/// Scatter a chunk gradient back into the window (only slots inside it).
+export fn masked_scatter(dC: cuda.ConstGlobal(f32), dW: cuda.Global(f32), base0: i64, H0: i64,
+                         B: i32, T: i32, Cc: i32, F: i32, c0: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * Cc * F) return;
+    const f = @rem(i, F);
+    const tmp = @divTrunc(i, F);
+    const c = @rem(tmp, Cc);
+    const b = @divTrunc(tmp, Cc);
+    const pos = base0 + c0 + c;
+    const w0 = base0 + H0;
+    const w1 = w0 + T;
+    if (pos < w0 or pos >= w1) return;
+    const t = pos - w0;
+    dW[@intCast((b * T + t) * F + f)] += dC[@intCast((b * Cc + c) * F + f)];
+}
+
+/// fp32 (B,H,T,F) -> bf16 (N,H*F), heads concatenated; the same function as
+/// bhnt_to_flat_bf16_kernel, which reuses this kernel.
+export fn o_to_flat(s: cuda.ConstGlobal(f32), d: cuda.Global(bf16), B: i32, H: i32, T: i32, dh: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * H * T * dh) return;
+    const f = @rem(i, dh);
+    const tmp = @divTrunc(i, dh);
+    const t = @rem(tmp, T);
+    const h = @rem(@divTrunc(tmp, T), H);
+    const b = @divTrunc(tmp, @as(i64, T) * H);
+    d[@intCast(((b * T + t) * H + h) * dh + f)] = cuda.f2bf(s[@intCast(i)]);
+}
+
+export fn causal_mask(S: cuda.Global(f32), key_base: i64, c0: i32, q_base: i64, B: i32, H: i32,
+                      T: i32, Cc: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * H * T * Cc) return;
+    const c = @rem(i, Cc);
+    const tmp = @divTrunc(i, Cc);
+    const t = @rem(tmp, T);
+    if (key_base + c0 + c > q_base + t) S[@intCast(i)] = -1e30;
+}
+
+export fn fill_f32(a: cuda.Global(f32), v: f32, n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i < n) a[@intCast(i)] = v;
+}
+
+/// Replicate the rotary keys of a chunk for every head.
+export fn rep_hr(s: cuda.ConstGlobal(bf16), d: cuda.Global(bf16), B: i32, H: i32, Cc: i32, R: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * H * Cc * R) return;
+    const f = @rem(i, R);
+    const tmp = @divTrunc(i, R);
+    const c = @rem(tmp, Cc);
+    const b = @divTrunc(tmp, @as(i64, Cc) * H);
+    d[@intCast(i)] = s[@intCast((b * Cc + c) * R + f)];
+}
+
+/// (B,H,Cc,F) -> (B*Cc,H*F), heads concatenated.
+export fn bhn_to_flat(s: cuda.ConstGlobal(f32), d: cuda.Global(f32), B: i32, H: i32, Cc: i32, F: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * Cc * H * F) return;
+    const f = @rem(i, F);
+    const tmp = @divTrunc(i, F);
+    const h = @rem(tmp, H);
+    const bc = @divTrunc(tmp, H);
+    d[@intCast(i)] = s[@intCast((bc * H + h) * F + f)];
+}
+
+/// RoPE backward: rotation by -angle(pos).
+export fn rope_bwd(s: cuda.ConstGlobal(f32), d: cuda.Global(f32), base: i64, c0: i32, B: i32,
+                   Cc: i32, R: i32, theta: f32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * Cc * R) return;
+    const f = @rem(i, R);
+    const tmp = @divTrunc(i, R);
+    const c = @rem(tmp, Cc);
+    const ang = -@as(f32, @floatFromInt(base + c0 + c)) /
+        cuda.__nv_fast_powf(theta, @as(f32, @floatFromInt(2 * @divTrunc(f, 2))) / @as(f32, @floatFromInt(R)));
+    const co = cuda.__nv_fast_cosf(ang);
+    const si = cuda.__nv_fast_sinf(ang);
+    const u = s[@intCast(i ^ 1)];
+    const sgn: f32 = if (@rem(f, 2) == 0) -1.0 else 1.0;
+    d[@intCast(i)] = s[@intCast(i)] * co + sgn * u * si;
+}
+
+/// fp32 (B,H,T,F) -> bf16 (N,H*F) with the inverse RoPE on the rotary half.
+export fn dq_join(dQc: cuda.ConstGlobal(f32), dQr: cuda.ConstGlobal(f32), dq: cuda.Global(bf16),
+                  B: i32, H: i32, T: i32, dh: i32, R: i32, pos: cuda.ConstGlobal(i64),
+                  theta: f32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    const W = dh + R;
+    if (i >= @as(i64, B) * T * H * W) return;
+    const f = @rem(i, W);
+    const tmp = @divTrunc(i, W);
+    const h = @rem(tmp, H);
+    const r = @divTrunc(tmp, H);
+    const b = @divTrunc(r, T);
+    const t = @rem(r, T);
+    if (f < dh) {
+        dq[@intCast(i)] = cuda.f2bf(dQc[@intCast((b * H + h) * T * dh + t * dh + f)]);
+    } else {
+        const j = f - dh;
+        const base = (b * H + h) * @as(i64, T) * R + t * R;
+        const angle = @as(f32, @floatFromInt(pos[@intCast(r)])) /
+            cuda.__nv_fast_powf(theta, @as(f32, @floatFromInt(2 * @divTrunc(j, 2))) / @as(f32, @floatFromInt(R)));
+        const sign: f32 = if (@rem(j, 2) == 0) 1.0 else -1.0;
+        dq[@intCast(i)] = cuda.f2bf(dQr[@intCast(base + j)] * cuda.__nv_fast_cosf(angle) +
+            sign * dQr[@intCast(base + (j ^ 1))] * cuda.__nv_fast_sinf(angle));
+    }
+}
+
+/// Evict the oldest prefix when a new window would exceed the capacity.
+export fn compact_cache(data: cuda.Global(bf16), B: i32, capacity: i32, F: i32, drop: i32, keep: i32) callconv(.nvptx_kernel) void {
+    const i = cuda.globalIdX();
+    if (i >= @as(u32, @bitCast(B * F))) return;
+    const b: i64 = @intCast(i / @as(u32, @bitCast(F)));
+    const f: i64 = @intCast(i % @as(u32, @bitCast(F)));
+    var c: i64 = 0;
+    while (c < keep) : (c += 1)
+        data[@intCast((b * capacity + c) * F + f)] = data[@intCast((b * capacity + c + drop) * F + f)];
+}
+
+export fn do_to_bhnt(s: cuda.ConstGlobal(bf16), d: cuda.Global(f32), B: i32, H: i32, T: i32, dh: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * H * T * dh) return;
+    const f = @rem(i, dh);
+    const tmp = @divTrunc(i, dh);
+    const t = @rem(tmp, T);
+    const h = @rem(@divTrunc(tmp, T), H);
+    const b = @divTrunc(tmp, @as(i64, T) * H);
+    d[@intCast(i)] = cuda.bf2f(s[@intCast(((b * T + t) * H + h) * dh + f)]);
+}
+
+/// Zero the columns [cce, Cc) of a (rows, Cc) matrix.
+export fn zero_tail(A: cuda.Global(f32), rows: i64, cce: i32, Cc: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    const w = Cc - cce;
+    if (i >= rows * w or cce >= Cc) return;
+    const c = @rem(i, w);
+    const r = @divTrunc(i, w);
+    A[@intCast(r * Cc + cce + c)] = 0;
+}
+
+/// Sum over the heads: (B,H,Cc,F) -> (B*Cc,F).
+export fn sum_heads(s: cuda.ConstGlobal(f32), d: cuda.Global(f32), B: i32, H: i32, Cc: i32, F: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, B) * Cc * F) return;
+    const f = @rem(i, F);
+    const tmp = @divTrunc(i, F);
+    const c = @rem(tmp, Cc);
+    const b = @divTrunc(tmp, Cc);
+    var acc: f32 = 0;
+    var h: i64 = 0;
+    while (h < H) : (h += 1) acc += s[@intCast((b * H + h) * @as(i64, Cc) * F + c * F + f)];
+    d[@intCast((b * Cc + c) * F + f)] = acc;
 }

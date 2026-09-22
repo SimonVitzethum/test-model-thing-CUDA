@@ -136,6 +136,23 @@ int tmt_ref_mem_attn_bwd_kv(float scale, const void* Q, const void* dO, const fl
                             void* dK, void* dV, int B, int T, int M, int H, int dh);
 int tmt_ref_mem_add_bf16(void* a, const void* b, long n);
 int tmt_ref_mem_sum(const void* e, const float* s, void* out, long n);
+/* MLA reference kernels (src/mla.cu); scalars first, pointers after. */
+int tmt_ref_rope(float theta, int neg, const void* x, void* y, const long* pos, int N, int H, int F, int R);
+int tmt_ref_online_update_batched(const float* S, const void* Vc, float* O, float* m, float* l,
+                                  int T, int Cc, int dh, long BH);
+int tmt_ref_softmax_scale(int last, const float* S, void* P, float* m, float* l, float* alpha,
+                          float* LSE, long rows, int Cc);
+int tmt_ref_softmax_bwd(float scale, const float* S, const float* dP, const float* LSE, void* dS,
+                        void* P, int rows, int Cc, const float* dO, const void* O, int H, int T, int dh);
+int tmt_ref_rope_bwd(float theta, long base, int c0, const float* s, float* d, int B, int Cc, int R);
+int tmt_ref_dq_join(float theta, const float* dQc, const float* dQr, void* dq, const long* pos,
+                    int B, int H, int T, int dh, int R);
+int tmt_ref_mla_move(int which, const void* src, void* dst, int B, int H, int T, int F);
+int tmt_ref_sum_heads(const float* s, float* d, int B, int H, int Cc, int F);
+int tmt_ref_masked_scatter(const float* dC, float* dW, long base0, long H0, int B, int T, int Cc,
+                           int F, int c0);
+int tmt_ref_cache_roundtrip(const void* latw, const void* krw, void* lat, void* kr, void* clat,
+                            void* ckr, long head, int N, int Cmax, int L, int R, int Cc, int c0);
 int tmt_ref_add_f32(float* acc, const float* x, long n);
 int tmt_ref_ln_fwd(const void* X, const float* gamma, const float* beta, void* Y,
                    float* mean, float* rstd, int N, int D);

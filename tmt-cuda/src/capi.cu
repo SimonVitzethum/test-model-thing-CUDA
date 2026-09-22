@@ -539,6 +539,91 @@ int tmt_ref_mem_sum(const void* e, const float* s, void* out, long n) {
         CUDA_CHECK(cudaDeviceSynchronize());
     });
 }
+int tmt_ref_rope(float theta, int neg, const void* x, void* y, const long* pos, int N, int H, int F, int R) {
+    return guard([&] {
+        long n = (long)N * H * F;
+        rope_kernel<<<(n + 255) / 256, 256>>>((const bf16*)x, (bf16*)y, pos, N, H, F, R, theta, neg != 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_online_update_batched(const float* S, const void* Vc, float* O, float* m, float* l,
+                                  int T, int Cc, int dh, long BH) {
+    return guard([&] {
+        online_update_batched_kernel<<<BH * T, 256>>>(S, (const bf16*)Vc, O, m, l, T, Cc, dh, BH);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_softmax_scale(int last, const float* S, void* P, float* m, float* l, float* alpha,
+                          float* LSE, long rows, int Cc) {
+    return guard([&] {
+        softmax_scale_kernel<<<rows, 256>>>(S, (bf16*)P, m, l, alpha, LSE, rows, Cc, last != 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_softmax_bwd(float scale, const float* S, const float* dP, const float* LSE, void* dS,
+                        void* P, int rows, int Cc, const float* dO, const void* O, int H, int T, int dh) {
+    return guard([&] {
+        softmax_bwd_kernel<<<rows, 256>>>(S, dP, LSE, (bf16*)dS, (bf16*)P, rows, Cc, dO,
+                                          (const bf16*)O, H, T, dh, scale);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_rope_bwd(float theta, long base, int c0, const float* s, float* d, int B, int Cc, int R) {
+    return guard([&] {
+        long n = (long)B * Cc * R;
+        rope_bwd_kernel<<<(n + 255) / 256, 256>>>(s, d, base, c0, B, Cc, R, theta);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_dq_join(float theta, const float* dQc, const float* dQr, void* dq, const long* pos,
+                    int B, int H, int T, int dh, int R) {
+    return guard([&] {
+        long n = (long)B * T * H * (dh + R);
+        dq_join_kernel<<<(n + 255) / 256, 256>>>(dQc, dQr, (bf16*)dq, B, H, T, dh, R, pos, theta);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+/* 0: to_bhnt, 1: to_nh, 2: o_to_flat (fp32 in), 3: do_to_bhnt, 4: rep_hr, 5: bhn_to_flat (fp32) */
+int tmt_ref_mla_move(int which, const void* src, void* dst, int B, int H, int T, int F) {
+    return guard([&] {
+        long n = (long)B * H * T * F;
+        int blocks = (int)((n + 255) / 256);
+        if (which == 0) to_bhnt_kernel<<<blocks, 256>>>((const bf16*)src, (bf16*)dst, B, H, T, F);
+        else if (which == 1) to_nh_kernel<<<blocks, 256>>>((const bf16*)src, (bf16*)dst, B, H, T, F);
+        else if (which == 2) o_to_flat_kernel<<<blocks, 256>>>((const float*)src, (bf16*)dst, B, H, T, F);
+        else if (which == 3) do_to_bhnt_kernel<<<blocks, 256>>>((const bf16*)src, (float*)dst, B, H, T, F);
+        else if (which == 4) rep_hr_kernel<<<blocks, 256>>>((const bf16*)src, (bf16*)dst, B, H, T, F);
+        else bhn_to_flat_kernel<<<blocks, 256>>>((const float*)src, (float*)dst, B, H, T, F);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_sum_heads(const float* s, float* d, int B, int H, int Cc, int F) {
+    return guard([&] {
+        long n = (long)B * Cc * F;
+        sum_heads_kernel<<<(n + 255) / 256, 256>>>(s, d, B, H, Cc, F);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_masked_scatter(const float* dC, float* dW, long base0, long H0, int B, int T, int Cc,
+                           int F, int c0) {
+    return guard([&] {
+        long n = (long)B * Cc * F;
+        masked_scatter_kernel<<<(n + 255) / 256, 256>>>(dC, dW, base0, H0, B, T, Cc, F, c0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_cache_roundtrip(const void* latw, const void* krw, void* lat, void* kr, void* clat,
+                            void* ckr, long head, int N, int Cmax, int L, int R, int Cc, int c0) {
+    return guard([&] {
+        long n = (long)N * (L + R);
+        cache_write_kernel<<<(n + 255) / 256, 256>>>((const bf16*)latw, (const bf16*)krw, (bf16*)lat,
+                                                     (bf16*)kr, head, N, Cmax, L, R);
+        long g = (long)Cc * (L + R);
+        cache_gather_kernel<<<(g + 255) / 256, 256>>>((const bf16*)lat, (const bf16*)kr, (bf16*)clat,
+                                                      (bf16*)ckr, head, c0, Cc, Cmax, L, R);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
 int tmt_ref_copy_bf16(const float* src, void* dst, long n) {
     return guard([&] {
         copy_bf16_kernel<<<(n + 255) / 256, 256>>>(src, (bf16*)dst, n);

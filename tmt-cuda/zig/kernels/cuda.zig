@@ -100,6 +100,15 @@ pub inline fn frcp(a: f32) f32 {
         : [r] "=f" (-> f32),
         : [x] "f" (a));
 }
+/// log2 as the fast-math logf uses it internally, for the places where nvcc
+/// fuses the following multiply-add into one instruction.
+pub inline fn lg2(a: f32) f32 {
+    return asm ("lg2.approx.ftz.f32 %[r], %[x];"
+        : [r] "=f" (-> f32),
+        : [x] "f" (a));
+}
+pub const ln2: f32 = 0.693147182;
+
 pub inline fn frsqrt(a: f32) f32 {
     return asm ("rsqrt.approx.ftz.f32 %[r], %[x];"
         : [r] "=f" (-> f32),
@@ -146,3 +155,7 @@ pub inline fn shflDown(mask: u32, val: f32, delta: u32) f32 {
 pub inline fn bf2x2(bits: u32) [2]f32 {
     return .{ bf2f(@truncate(bits)), bf2f(@truncate(bits >> 16)) };
 }
+
+pub extern fn __nv_fast_sinf(x: f32) f32;
+pub extern fn __nv_fast_cosf(x: f32) f32;
+pub extern fn __nv_fast_powf(x: f32, y: f32) f32;

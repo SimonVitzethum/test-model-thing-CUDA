@@ -227,13 +227,7 @@ pub fn main(init: std.process.Init) !u8 {
             pdiff = @max(pdiff, @abs(v - w));
         }
         for (ref_l, my_l) |v, w| ldiff = @max(ldiff, @abs(v - w));
-        // The probabilities carry the gradient and must be identical; the
-        // reported loss is a scalar and ends up one unit in the last place
-        // apart, because nvcc computes log(se) + mx in a different register
-        // order than LLVM does.
-        var cbuf: [160]u8 = undefined;
-        const cdetail = std.fmt.bufPrint(&cbuf, "probs identical, loss within {e:.1} (1 ulp)", .{ldiff}) catch "";
-        report("ce_fwd", npdiff == 0 and pdiff == 0 and ldiff < 1e-5, cdetail);
+        report("ce_fwd", npdiff == 0 and pdiff == 0 and ldiff == 0, "");
 
         const ref_d = try gpa.alloc(u16, R * 256);
         const my_d = try gpa.alloc(u16, R * 256);
@@ -980,6 +974,247 @@ pub fn main(init: std.process.Init) !u8 {
             try Dev.down(bytesOf(u16, if (run == 0) hA else hB), d_enc);
         }
         report("memory helpers", std.mem.eql(u16, hA, hB), "");
+    }
+
+    // ---- MLA: rotary embedding, online softmax, cache, reshuffling ----
+    {
+        const B = 2;
+        const T = 8;
+        const H = 2;
+        const dh = 16;
+        const Rr = 8;
+        const L = 24;
+        const Cc = 12;
+        const Cmax = 32;
+        const Nm = B * T;
+        const theta: f32 = 10000;
+        // A wide source of test values; several of these buffers are larger
+        // than one window.
+        const wide = try gpa.alloc(f32, 8192);
+        fill(wide, 113);
+        const pos = try gpa.alloc(i64, Nm);
+        for (pos, 0..) |*p, i| p.* = @intCast(i * 3 + 1);
+        const d_pos = try Dev.alloc(Nm * 8);
+        try Dev.up(d_pos, std.mem.sliceAsBytes(pos));
+
+        // rotary embedding, forward and with the negated angle
+        const F = dh + Rr;
+        const d_qin = try Dev.alloc(Nm * H * F * 2);
+        const d_qout = try Dev.alloc(Nm * H * F * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_qin, Nm * H * F) != 0) return error.Ref;
+        const ropeA = try gpa.alloc(u16, 2 * Nm * H * F);
+        const ropeB = try gpa.alloc(u16, 2 * Nm * H * F);
+        for ([_]u8{ 0, 1 }) |run| {
+            const dst = if (run == 0) ropeA else ropeB;
+            for ([_]c_int{ 0, 1 }, 0..) |neg, k| {
+                if (run == 0) {
+                    if (tmt.tmt_ref_rope(theta, neg, d_qin, d_qout, @ptrCast(@alignCast(d_pos)), N, H, F, Rr) != 0) return error.Ref;
+                } else try (try mod.get("rope")).launch((Nm * H * F + 255) / 256, 256,
+                    .{ d_qin, d_qout, d_pos, @as(i32, Nm), @as(i32, H), @as(i32, F), @as(i32, Rr), theta, neg != 0 });
+                try Dev.down(bytesOf(u16, dst[k * Nm * H * F ..][0 .. Nm * H * F]), d_qout);
+            }
+        }
+        report("rotary embedding", std.mem.eql(u16, ropeA, ropeB), "");
+
+        // online softmax update and the chunk softmax with its blend factors
+        const rows = B * H * T;
+        const d_S = try Dev.alloc(rows * Cc * 4);
+        const d_O = try Dev.alloc(rows * dh * 4);
+        const d_m = try Dev.alloc(rows * 4);
+        const d_l = try Dev.alloc(rows * 4);
+        const d_al = try Dev.alloc(rows * 4);
+        const d_LSE = try Dev.alloc(rows * 4);
+        const d_Pb = try Dev.alloc(rows * Cc * 2);
+        const d_Vc = try Dev.alloc(B * H * Cc * dh * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_Vc, B * H * Cc * dh) != 0) return error.Ref;
+        const sdata = try gpa.alloc(f32, rows * Cc);
+        const odata = try gpa.alloc(f32, rows * dh);
+        const mdata = try gpa.alloc(f32, rows);
+        const ldata = try gpa.alloc(f32, rows);
+        fill(sdata, 103);
+        fill(odata, 107);
+        fill(mdata, 109);
+        for (sdata) |*v| v.* *= 6;
+        for (ldata) |*v| v.* = 1;
+        const onA = try gpa.alloc(f32, rows * dh + 2 * rows);
+        const onB = try gpa.alloc(f32, rows * dh + 2 * rows);
+        try Dev.up(d_S, bytesOf(f32, sdata));
+        for ([_]u8{ 0, 1 }) |run| {
+            try Dev.up(d_O, bytesOf(f32, odata));
+            try Dev.up(d_m, bytesOf(f32, mdata));
+            try Dev.up(d_l, bytesOf(f32, ldata));
+            if (run == 0) {
+                if (tmt.tmt_ref_online_update_batched(@ptrCast(@alignCast(d_S)), d_Vc, @ptrCast(@alignCast(d_O)),
+                    @ptrCast(@alignCast(d_m)), @ptrCast(@alignCast(d_l)), T, Cc, dh, B * H) != 0) return error.Ref;
+            } else try (try mod.get("online_update_batched")).launch(B * H * T, 256,
+                .{ d_S, d_Vc, d_O, d_m, d_l, @as(i32, T), @as(i32, Cc), @as(i32, dh), @as(i64, B * H) });
+            const dst = if (run == 0) onA else onB;
+            try Dev.down(bytesOf(f32, dst[0 .. rows * dh]), d_O);
+            try Dev.down(bytesOf(f32, dst[rows * dh ..][0..rows]), d_m);
+            try Dev.down(bytesOf(f32, dst[rows * dh + rows ..]), d_l);
+        }
+        report("online softmax update", std.mem.eql(f32, onA, onB), "");
+
+        const scA = try gpa.alloc(f32, 3 * rows);
+        const scB = try gpa.alloc(f32, 3 * rows);
+        const pbA = try gpa.alloc(u16, rows * Cc);
+        const pbB = try gpa.alloc(u16, rows * Cc);
+        for ([_]u8{ 0, 1 }) |run| {
+            try Dev.up(d_m, bytesOf(f32, mdata));
+            try Dev.up(d_l, bytesOf(f32, ldata));
+            if (run == 0) {
+                if (tmt.tmt_ref_softmax_scale(1, @ptrCast(@alignCast(d_S)), d_Pb, @ptrCast(@alignCast(d_m)),
+                    @ptrCast(@alignCast(d_l)), @ptrCast(@alignCast(d_al)), @ptrCast(@alignCast(d_LSE)), rows, Cc) != 0) return error.Ref;
+            } else try (try mod.get("softmax_scale")).launch(rows, 256,
+                .{ d_S, d_Pb, d_m, d_l, d_al, d_LSE, @as(i64, rows), @as(i32, Cc), true });
+            const dst = if (run == 0) scA else scB;
+            try Dev.down(bytesOf(f32, dst[0..rows]), d_l);
+            try Dev.down(bytesOf(f32, dst[rows..][0..rows]), d_al);
+            try Dev.down(bytesOf(f32, dst[2 * rows ..]), d_LSE);
+            try Dev.down(bytesOf(u16, if (run == 0) pbA else pbB), d_Pb);
+        }
+        report("chunk softmax", std.mem.eql(f32, scA, scB) and std.mem.eql(u16, pbA, pbB), "");
+
+        // softmax backward (needs O in bf16 and dO in fp32)
+        const d_Ob = try Dev.alloc(Nm * H * dh * 2);
+        const d_dO = try Dev.alloc(rows * dh * 4);
+        const d_dP = try Dev.alloc(rows * Cc * 4);
+        const d_dSb = try Dev.alloc(rows * Cc * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_acc)), d_Ob, Nm * H * dh) != 0) return error.Ref;
+        try Dev.up(d_dO, bytesOf(f32, odata));
+        try Dev.up(d_dP, bytesOf(f32, sdata));
+        const bwA = try gpa.alloc(u16, 2 * rows * Cc);
+        const bwB = try gpa.alloc(u16, 2 * rows * Cc);
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_softmax_bwd(0.25, @ptrCast(@alignCast(d_S)), @ptrCast(@alignCast(d_dP)),
+                    @ptrCast(@alignCast(d_LSE)), d_dSb, d_Pb, rows, Cc, @ptrCast(@alignCast(d_dO)), d_Ob, H, T, dh) != 0) return error.Ref;
+            } else try (try mod.get("softmax_bwd")).launch(rows, 256,
+                .{ d_S, d_dP, d_LSE, d_dSb, d_Pb, @as(i32, rows), @as(i32, Cc), d_dO, d_Ob,
+                   @as(i32, H), @as(i32, T), @as(i32, dh), @as(f32, 0.25) });
+            const dst = if (run == 0) bwA else bwB;
+            try Dev.down(bytesOf(u16, dst[0 .. rows * Cc]), d_dSb);
+            try Dev.down(bytesOf(u16, dst[rows * Cc ..]), d_Pb);
+        }
+        report("softmax backward", std.mem.eql(u16, bwA, bwB), "");
+
+        // rotary backward and the query join with the inverse rotation
+        const d_f1 = try Dev.alloc(B * Cc * Rr * 4);
+        const d_f2 = try Dev.alloc(B * Cc * Rr * 4);
+        try Dev.up(d_f1, bytesOf(f32, wide[0 .. B * Cc * Rr]));
+        const rbA = try gpa.alloc(f32, B * Cc * Rr);
+        const rbB = try gpa.alloc(f32, B * Cc * Rr);
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_rope_bwd(theta, 5, 2, @ptrCast(@alignCast(d_f1)), @ptrCast(@alignCast(d_f2)), B, Cc, Rr) != 0) return error.Ref;
+            } else try (try mod.get("rope_bwd")).launch((B * Cc * Rr + 255) / 256, 256,
+                .{ d_f1, d_f2, @as(i64, 5), @as(i32, 2), @as(i32, B), @as(i32, Cc), @as(i32, Rr), theta });
+            try Dev.down(bytesOf(f32, if (run == 0) rbA else rbB), d_f2);
+        }
+        const d_dQc = try Dev.alloc(B * H * T * dh * 4);
+        const d_dQr = try Dev.alloc(B * H * T * Rr * 4);
+        const d_dq = try Dev.alloc(Nm * H * F * 2);
+        try Dev.up(d_dQc, bytesOf(f32, wide[3072..][0 .. B * H * T * dh]));
+        try Dev.up(d_dQr, bytesOf(f32, wide[2048..][0 .. B * H * T * Rr]));
+        const jA = try gpa.alloc(u16, Nm * H * F);
+        const jB = try gpa.alloc(u16, Nm * H * F);
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_dq_join(theta, @ptrCast(@alignCast(d_dQc)), @ptrCast(@alignCast(d_dQr)),
+                    d_dq, @ptrCast(@alignCast(d_pos)), B, H, T, dh, Rr) != 0) return error.Ref;
+            } else try (try mod.get("dq_join")).launch((Nm * H * F + 255) / 256, 256,
+                .{ d_dQc, d_dQr, d_dq, @as(i32, B), @as(i32, H), @as(i32, T), @as(i32, dh), @as(i32, Rr), d_pos, theta });
+            try Dev.down(bytesOf(u16, if (run == 0) jA else jB), d_dq);
+        }
+        report("rotary backward + query join", std.mem.eql(f32, rbA, rbB) and std.mem.eql(u16, jA, jB), "");
+
+        // ring cache: write a window, then gather a chunk across the wrap
+        const d_latw = try Dev.alloc(Nm * L * 2);
+        const d_krw = try Dev.alloc(Nm * Rr * 2);
+        const d_lat = try Dev.alloc(Cmax * L * 2);
+        const d_kr = try Dev.alloc(Cmax * Rr * 2);
+        const d_clat = try Dev.alloc(Cc * L * 2);
+        const d_ckr = try Dev.alloc(Cc * Rr * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_latw, Nm * L) != 0) return error.Ref;
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_acc)), d_krw, Nm * Rr) != 0) return error.Ref;
+        const cA = try gpa.alloc(u16, Cmax * L + Cmax * Rr + Cc * L + Cc * Rr);
+        const cB = try gpa.alloc(u16, Cmax * L + Cmax * Rr + Cc * L + Cc * Rr);
+        const head: i64 = Cmax - 4; // forces the wrap
+        for ([_]u8{ 0, 1 }) |run| {
+            try Dev.up(d_lat, &[_]u8{0} ** 8);
+            if (run == 0) {
+                if (tmt.tmt_ref_cache_roundtrip(d_latw, d_krw, d_lat, d_kr, d_clat, d_ckr, head, Nm, Cmax, L, Rr, Cc, 3) != 0) return error.Ref;
+            } else {
+                try (try mod.get("cache_write")).launch((Nm * (L + Rr) + 255) / 256, 256,
+                    .{ d_latw, d_krw, d_lat, d_kr, head, @as(i32, Nm), @as(i32, Cmax), @as(i32, L), @as(i32, Rr) });
+                try (try mod.get("cache_gather")).launch((Cc * (L + Rr) + 255) / 256, 256,
+                    .{ d_lat, d_kr, d_clat, d_ckr, head, @as(i32, 3), @as(i32, Cc), @as(i32, Cmax), @as(i32, L), @as(i32, Rr) });
+            }
+            const dst = if (run == 0) cA else cB;
+            try Dev.down(bytesOf(u16, dst[0 .. Cmax * L]), d_lat);
+            try Dev.down(bytesOf(u16, dst[Cmax * L ..][0 .. Cmax * Rr]), d_kr);
+            try Dev.down(bytesOf(u16, dst[Cmax * L + Cmax * Rr ..][0 .. Cc * L]), d_clat);
+            try Dev.down(bytesOf(u16, dst[Cmax * L + Cmax * Rr + Cc * L ..]), d_ckr);
+        }
+        report("ring cache write + gather", std.mem.eql(u16, cA, cB), "");
+
+        // the reshuffling kernels and the head sum
+        const moves = [_]struct { []const u8, c_int }{
+            .{ "to_bhnt", 0 }, .{ "to_nh", 1 }, .{ "o_to_flat", 2 }, .{ "do_to_bhnt", 3 },
+            .{ "rep_hr", 4 }, .{ "bhn_to_flat", 5 },
+        };
+        const elems = B * H * T * dh;
+        const wide_elems = @max(elems, B * H * Cc * dh);
+        const d_src = try Dev.alloc(wide_elems * 4);
+        const d_dst = try Dev.alloc(wide_elems * 4);
+        const mvA = try gpa.alloc(u8, elems * 4);
+        const mvB = try gpa.alloc(u8, elems * 4);
+        var moves_ok = true;
+        for (moves) |mv| {
+            const fp32_in = mv[1] == 2 or mv[1] == 5;
+            if (fp32_in) try Dev.up(d_src, bytesOf(f32, odata[0..elems]))
+            else if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_src, elems) != 0) return error.Ref;
+            for ([_]u8{ 0, 1 }) |run| {
+                try Dev.up(d_dst, &[_]u8{0} ** 8);
+                if (run == 0) {
+                    if (tmt.tmt_ref_mla_move(mv[1], d_src, d_dst, B, H, T, dh) != 0) return error.Ref;
+                } else try (try mod.get(@ptrCast(mv[0]))).launch((elems + 255) / 256, 256,
+                    .{ d_src, d_dst, @as(i32, B), @as(i32, H), @as(i32, T), @as(i32, dh) });
+                try Dev.down(if (run == 0) mvA else mvB, d_dst);
+            }
+            if (!std.mem.eql(u8, mvA, mvB)) {
+                say("  {s} differs\n", .{mv[0]});
+                moves_ok = false;
+            }
+        }
+        const d_sh = try Dev.alloc(B * Cc * dh * 4);
+        const shA = try gpa.alloc(f32, B * Cc * dh);
+        const shB = try gpa.alloc(f32, B * Cc * dh);
+        try Dev.up(d_src, bytesOf(f32, wide[0 .. B * H * Cc * dh]));
+        for ([_]u8{ 0, 1 }) |run| {
+            if (run == 0) {
+                if (tmt.tmt_ref_sum_heads(@ptrCast(@alignCast(d_src)), @ptrCast(@alignCast(d_sh)), B, H, Cc, dh) != 0) return error.Ref;
+            } else try (try mod.get("sum_heads")).launch((B * Cc * dh + 255) / 256, 256,
+                .{ d_src, d_sh, @as(i32, B), @as(i32, H), @as(i32, Cc), @as(i32, dh) });
+            try Dev.down(bytesOf(f32, if (run == 0) shA else shB), d_sh);
+        }
+        report("reshuffling + head sum", moves_ok and std.mem.eql(f32, shA, shB), "");
+
+        // masked scatter of a chunk gradient back into the window
+        const d_dC = try Dev.alloc(B * Cc * L * 4);
+        const d_dW = try Dev.alloc(Nm * L * 4);
+        try Dev.up(d_dC, bytesOf(f32, wide[0 .. B * Cc * L]));
+        const msA = try gpa.alloc(f32, Nm * L);
+        const msB = try gpa.alloc(f32, Nm * L);
+        for ([_]u8{ 0, 1 }) |run| {
+            try Dev.up(d_dW, bytesOf(f32, wide[1024..][0 .. Nm * L]));
+            if (run == 0) {
+                if (tmt.tmt_ref_masked_scatter(@ptrCast(@alignCast(d_dC)), @ptrCast(@alignCast(d_dW)), 4, 2, B, T, Cc, L, 1) != 0) return error.Ref;
+            } else try (try mod.get("masked_scatter")).launch((B * Cc * L + 255) / 256, 256,
+                .{ d_dC, d_dW, @as(i64, 4), @as(i64, 2), @as(i32, B), @as(i32, T), @as(i32, Cc), @as(i32, L), @as(i32, 1) });
+            try Dev.down(bytesOf(f32, if (run == 0) msA else msB), d_dW);
+        }
+        report("masked scatter", std.mem.eql(f32, msA, msB), "");
     }
 
     if (failures == 0) say("ALL KERNEL COMPARISONS PASSED\n", .{});

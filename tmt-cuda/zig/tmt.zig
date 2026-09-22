@@ -174,6 +174,16 @@ pub extern fn tmt_ref_mem_attn_bwd_q(scale: f32, dO: *const anyopaque, K: *const
 pub extern fn tmt_ref_mem_attn_bwd_kv(scale: f32, Q: *const anyopaque, dO: *const anyopaque, P: [*]const f32, dS: [*]const f32, dK: *anyopaque, dV: *anyopaque, B: c_int, T: c_int, M: c_int, H: c_int, dh: c_int) c_int;
 pub extern fn tmt_ref_mem_add_bf16(a: *anyopaque, b: *const anyopaque, n: c_long) c_int;
 pub extern fn tmt_ref_mem_sum(e: *const anyopaque, s: [*]const f32, out: *anyopaque, n: c_long) c_int;
+pub extern fn tmt_ref_rope(theta: f32, neg: c_int, x: *const anyopaque, y: *anyopaque, pos: [*]const i64, N: c_int, H: c_int, F: c_int, R: c_int) c_int;
+pub extern fn tmt_ref_online_update_batched(S: [*]const f32, Vc: *const anyopaque, O: [*]f32, m: [*]f32, l: [*]f32, T: c_int, Cc: c_int, dh: c_int, BH: c_long) c_int;
+pub extern fn tmt_ref_softmax_scale(last: c_int, S: [*]const f32, P: *anyopaque, m: [*]f32, l: [*]f32, alpha: [*]f32, LSE: [*]f32, rows: c_long, Cc: c_int) c_int;
+pub extern fn tmt_ref_softmax_bwd(scale: f32, S: [*]const f32, dP: [*]const f32, LSE: [*]const f32, dS: *anyopaque, P: *anyopaque, rows: c_int, Cc: c_int, dO: [*]const f32, O: *const anyopaque, H: c_int, T: c_int, dh: c_int) c_int;
+pub extern fn tmt_ref_rope_bwd(theta: f32, base: c_long, c0: c_int, s: [*]const f32, d: [*]f32, B: c_int, Cc: c_int, R: c_int) c_int;
+pub extern fn tmt_ref_dq_join(theta: f32, dQc: [*]const f32, dQr: [*]const f32, dq: *anyopaque, pos: [*]const i64, B: c_int, H: c_int, T: c_int, dh: c_int, R: c_int) c_int;
+pub extern fn tmt_ref_mla_move(which: c_int, src: *const anyopaque, dst: *anyopaque, B: c_int, H: c_int, T: c_int, F: c_int) c_int;
+pub extern fn tmt_ref_sum_heads(s: [*]const f32, d: [*]f32, B: c_int, H: c_int, Cc: c_int, F: c_int) c_int;
+pub extern fn tmt_ref_masked_scatter(dC: [*]const f32, dW: [*]f32, base0: c_long, H0: c_long, B: c_int, T: c_int, Cc: c_int, F: c_int, c0: c_int) c_int;
+pub extern fn tmt_ref_cache_roundtrip(latw: *const anyopaque, krw: *const anyopaque, lat: *anyopaque, kr: *anyopaque, clat: *anyopaque, ckr: *anyopaque, head: c_long, N: c_int, Cmax: c_int, L: c_int, R: c_int, Cc: c_int, c0: c_int) c_int;
 pub extern fn tmt_ref_add_f32(acc: [*]f32, x: [*]const f32, n: c_long) c_int;
 pub extern fn tmt_ref_ln_fwd(X: *const anyopaque, gamma: [*]const f32, beta: [*]const f32, Y: *anyopaque, mean: [*]f32, rstd: [*]f32, N: c_int, D: c_int) c_int;
 pub extern fn tmt_ref_ln_bwd(X: *const anyopaque, dY: *const anyopaque, gamma: [*]const f32, mean: [*]const f32, rstd: [*]const f32, dX: *anyopaque, dGamma: [*]f32, dBeta: [*]f32, N: c_int, D: c_int) c_int;
