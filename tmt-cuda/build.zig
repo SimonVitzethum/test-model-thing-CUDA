@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "chat", .cuda = true },
         .{ .name = "train", .cuda = true },
         .{ .name = "gradcheck", .cuda = true },
+        .{ .name = "kgtrain", .cuda = true },
     };
     for (tools) |t| {
         const mod = b.createModule(.{

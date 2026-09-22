@@ -62,6 +62,23 @@ int tmt_model_param_count(const tmt_model* m);
 long tmt_model_param_size(const tmt_model* m, int j);
 const char* tmt_model_param_group(const tmt_model* m, int j);
 int tmt_model_param_grad(tmt_model* m, int j, float* out);
+int tmt_model_param_master(const tmt_model* m, int j, float* out);
+int tmt_model_param_set_grad(tmt_model* m, int j, const float* in);
+/* Gradient accumulator over several passes of one step (kgtrain). */
+int tmt_model_acc_zero(tmt_model* m);
+int tmt_model_acc_add(tmt_model* m, int j);   /* j < 0: every parameter */
+int tmt_model_acc_store(tmt_model* m);        /* gradients := accumulator */
+/* Index of the stage-2 retrieval heads (which: 0 = query, 1 = key), -1 if absent. */
+int tmt_model_retrieval_param(const tmt_model* m, int which);
+/* Forward with memory bytes (batch*mem_len, -1 = padding) and a state reset. */
+int tmt_model_forward_mem(tmt_model* m, const int* ids, const int* targets, const int* mem,
+                          float* loss, float* ce);
+/* Backward with an external gradient on the representation (batch*seqlen*dim), or NULL. */
+int tmt_model_backward_ext(tmt_model* m, const float* dX);
+/* Representation rows at (b, last[b]) of the last forward; last[b] < 0 leaves the row as is. */
+int tmt_model_read_rows(tmt_model* m, const int* last, float* out /* batch*dim */);
+/* Logits of the last forward as float (batch*seqlen*256). */
+int tmt_model_logits(tmt_model* m, float* out);
 int tmt_synchronize(void);
 
 /* SIGINT/SIGTERM set a flag instead of terminating. */

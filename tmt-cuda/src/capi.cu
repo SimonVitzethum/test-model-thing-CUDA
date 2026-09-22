@@ -56,6 +56,8 @@ struct tmt_model {
     Model m;
     StreamState state;
     std::vector<float> host;  // staging for diagnostics
+    std::vector<float*> acc;  // gradient accumulator (kgtrain), lazily allocated
+    float* dXext = nullptr;
 };
 
 tmt_cfg* tmt_cfg_new(void) { return new tmt_cfg{}; }
@@ -198,6 +200,98 @@ int tmt_model_param_grad(tmt_model* m, int j, float* out) {
     return guard([&] {
         const Par& p = m->m.params.values.at(j);
         CUDA_CHECK(cudaMemcpy(out, p.grad, p.n * 4, cudaMemcpyDeviceToHost));
+    });
+}
+int tmt_model_param_master(const tmt_model* h, int j, float* out) {
+    return guard([&] {
+        const Par& p = h->m.params.values.at(j);
+        CUDA_CHECK(cudaMemcpy(out, p.master, p.n * 4, cudaMemcpyDeviceToHost));
+    });
+}
+int tmt_model_param_set_grad(tmt_model* h, int j, const float* in) {
+    return guard([&] {
+        const Par& p = h->m.params.values.at(j);
+        CUDA_CHECK(cudaMemcpy(p.grad, in, p.n * 4, cudaMemcpyHostToDevice));
+    });
+}
+static void ensure_acc(tmt_model* h) {
+    if (!h->acc.empty()) return;
+    h->acc.resize(h->m.params.values.size());
+    for (size_t j = 0; j < h->acc.size(); ++j) h->m.memory.allocate(h->acc[j], h->m.params.at(j).n * 4);
+}
+int tmt_model_acc_zero(tmt_model* h) {
+    return guard([&] {
+        ensure_acc(h);
+        for (size_t j = 0; j < h->acc.size(); ++j)
+            CUDA_CHECK(cudaMemset(h->acc[j], 0, h->m.params.at(j).n * 4));
+    });
+}
+int tmt_model_acc_add(tmt_model* h, int j) {
+    return guard([&] {
+        ensure_acc(h);
+        size_t first = j < 0 ? 0 : (size_t)j, last = j < 0 ? h->acc.size() : (size_t)j + 1;
+        for (size_t i = first; i < last; ++i) {
+            long n = h->m.params.at(i).n;
+            add_f32_kernel<<<(n + 255) / 256, 256>>>(h->acc[i], h->m.params.at(i).grad, n);
+        }
+    });
+}
+int tmt_model_acc_store(tmt_model* h) {
+    return guard([&] {
+        ensure_acc(h);
+        for (size_t j = 0; j < h->acc.size(); ++j)
+            CUDA_CHECK(cudaMemcpy(h->m.params.at(j).grad, h->acc[j], h->m.params.at(j).n * 4, cudaMemcpyDeviceToDevice));
+    });
+}
+int tmt_model_retrieval_param(const tmt_model* h, int which) {
+    if (!h->m.c.mem || h->m.c.mem_rdim <= 0) return -1;
+    return (int)(which == 0 ? h->m.MS.rq : h->m.MS.rk);
+}
+int tmt_model_forward_mem(tmt_model* h, const int* ids, const int* targets, const int* mem,
+                          float* loss, float* ce) {
+    return guard([&] {
+        Model& m = h->m;
+        long N = (long)m.c.batch * m.c.seqlen;
+        std::vector<int> end(N, 0);
+        CUDA_CHECK(cudaMemcpy(m.ids, ids, N * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.nxt, targets, N * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.end, end.data(), N * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(m.MS.ids, mem, (long)m.c.batch * m.c.mem_len * 4, cudaMemcpyHostToDevice));
+        reset_state(h->state, m.c);
+        forward_window(m, h->state, *loss, *ce);
+    });
+}
+int tmt_model_backward_ext(tmt_model* h, const float* dX) {
+    return guard([&] {
+        Model& m = h->m;
+        long N = (long)m.c.batch * m.c.seqlen * m.c.dim;
+        if (dX) {
+            if (!h->dXext) m.memory.allocate(h->dXext, N * 4);
+            CUDA_CHECK(cudaMemcpy(h->dXext, dX, N * 4, cudaMemcpyHostToDevice));
+            m.dXext = h->dXext;
+        }
+        backward_window(m, h->state);
+        m.dXext = nullptr;
+        release_window(m);
+    });
+}
+int tmt_model_read_rows(tmt_model* h, const int* last, float* out) {
+    return guard([&] {
+        Model& m = h->m; int T = m.c.seqlen, D = m.c.dim;
+        std::vector<bf16> row(D);
+        for (int b = 0; b < m.c.batch; ++b) {
+            if (last[b] < 0) continue;
+            CUDA_CHECK(cudaMemcpy(row.data(), m.X + ((long)b * T + last[b]) * D, D * 2, cudaMemcpyDeviceToHost));
+            for (int d = 0; d < D; ++d) out[(long)b * D + d] = bf2f(row[d]);
+        }
+    });
+}
+int tmt_model_logits(tmt_model* h, float* out) {
+    return guard([&] {
+        Model& m = h->m; long N = (long)m.c.batch * m.c.seqlen;
+        std::vector<bf16> v((size_t)N * 256);
+        CUDA_CHECK(cudaMemcpy(v.data(), m.logits, v.size() * 2, cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < v.size(); ++i) out[i] = bf2f(v[i]);
     });
 }
 int tmt_synchronize(void) { return guard([&] { CUDA_CHECK(cudaDeviceSynchronize()); }); }

@@ -4,7 +4,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 Z=zig-out/bin
-for t in dialogprep kgprep sample chat train gradcheck; do
+for t in dialogprep kgprep sample chat train gradcheck kgtrain; do
     test -x "$Z/$t" || { echo "missing $Z/$t (run: zig build)"; exit 1; }
     test -x "./$t" || { echo "missing ./$t (run: make)"; exit 1; }
 done
@@ -76,6 +76,41 @@ cmp "$work/c.gc" "$work/z.gc"
 $Z/gradcheck "$work/data" "$work/c.ckpt" len=100 window=64 > "$work/z.gc" 2>&1 || true
 cmp "$work/c.gc" "$work/z.gc"
 
+# ---- fact memory: identical training, evaluation and retrieval ----
+cat > "$work/qa.tsv" <<'EOF'
+What is the capital of France?	Paris	France capital Paris; France continent Europe	Q1
+What is the continent of France?	Europe	France capital Paris; France continent Europe	Q1
+What is the capital of Germany?	Berlin	Germany capital Berlin	Q7
+What is the capital of Spain?	Madrid	Spain capital Madrid	Q8
+EOF
+cat > "$work/nodes.tsv" <<'EOF'
+Q1	France	France capital Paris; France continent Europe
+Q7	Germany	Germany capital Berlin
+Q8	Spain	Spain capital Madrid
+Q2	Paris	
+EOF
+KG="dim=16 layers=2 batch=2 seqlen=48 mem_len=64 mem_heads=2 mem_dh=4"
+./kgtrain train "$work/qa.tsv" "$work/ckg.ckpt" $KG steps=40 saveevery=0 > "$work/c.kg" 2>&1
+$Z/kgtrain train "$work/qa.tsv" "$work/zkg.ckpt" $KG steps=40 saveevery=0 > "$work/z.kg" 2>&1
+cmp "$work/c.kg" "$work/z.kg"
+./architecture_test --compare "$work/ckg.ckpt" "$work/zkg.ckpt" > /dev/null
+for mode in on off shuffled; do
+    ./kgtrain eval "$work/qa.tsv" "$work/ckg.ckpt" memory=$mode > "$work/c.kge" 2>&1
+    $Z/kgtrain eval "$work/qa.tsv" "$work/ckg.ckpt" memory=$mode > "$work/z.kge" 2>&1
+    cmp "$work/c.kge" "$work/z.kge"
+done
+# Stage 2: retrieval heads (host math in zig/retrieval.zig), index and ask demo.
+./kgtrain train "$work/qa.tsv" "$work/cr.ckpt" nodes="$work/nodes.tsv" $KG mem_rdim=8 steps=20 saveevery=0 > "$work/c.kgr" 2>&1
+$Z/kgtrain train "$work/qa.tsv" "$work/zr.ckpt" nodes="$work/nodes.tsv" $KG mem_rdim=8 steps=20 saveevery=0 > "$work/z.kgr" 2>&1
+cmp "$work/c.kgr" "$work/z.kgr"
+./architecture_test --compare "$work/cr.ckpt" "$work/zr.ckpt" > /dev/null
+./kgtrain eval "$work/qa.tsv" "$work/cr.ckpt" nodes="$work/nodes.tsv" memory=retrieved > "$work/c.kgr" 2>&1
+$Z/kgtrain eval "$work/qa.tsv" "$work/cr.ckpt" nodes="$work/nodes.tsv" memory=retrieved > "$work/z.kgr" 2>&1
+cmp "$work/c.kgr" "$work/z.kgr"
+./kgtrain ask "$work/cr.ckpt" nodes="$work/nodes.tsv" "What is the capital of France?" top=3 maxlen=6 > "$work/c.ask" 2>&1
+$Z/kgtrain ask "$work/cr.ckpt" nodes="$work/nodes.tsv" "What is the capital of France?" top=3 maxlen=6 > "$work/z.ask" 2>&1
+cmp "$work/c.ask" "$work/z.ask"
+
 # ---- generation: identical bytes ----
 for args in "temp=0 maxlen=40" "temp=0.8 maxlen=60 seed=5"; do
     ./sample "$work/c.ckpt" "abc" $args > "$work/c.out" 2>&1
@@ -86,4 +121,4 @@ printf 'hello\n/temp 0.4\nmore\n/reset\nagain\n' > "$work/chat.in"
 ./chat "$work/c.ckpt" maxlen=30 seed=2 < "$work/chat.in" > "$work/c.chat" 2>&1
 $Z/chat "$work/c.ckpt" maxlen=30 seed=2 < "$work/chat.in" > "$work/z.chat" 2>&1
 cmp "$work/c.chat" "$work/z.chat"
-echo 'PASS Zig: data tools byte-identical, training log/checkpoint, resume, eval, errors, gradcheck, sample and chat match the C++ build'
+echo 'PASS Zig: data tools byte-identical, training log/checkpoint, resume, eval, errors, gradcheck, kgtrain (both stages), sample and chat match the C++ build'
