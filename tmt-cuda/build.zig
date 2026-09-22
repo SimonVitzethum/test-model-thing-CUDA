@@ -96,11 +96,12 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run the Zig unit tests");
-    for ([_][]const u8{ "json", "stdrand" }) |name| {
+    for ([_][]const u8{ "json", "stdrand", "model/config" }) |name| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("zig/{s}.zig", .{name})),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }) });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }

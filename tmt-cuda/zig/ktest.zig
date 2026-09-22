@@ -6,6 +6,7 @@
 const std = @import("std");
 const tmt = @import("tmt.zig");
 const ptx = @import("ptx.zig");
+const config = @import("model/config.zig");
 
 const kernels_ptx = @embedFile("kernels.ptx");
 
@@ -1215,6 +1216,58 @@ pub fn main(init: std.process.Init) !u8 {
             try Dev.down(bytesOf(f32, if (run == 0) msA else msB), d_dW);
         }
         report("masked scatter", std.mem.eql(f32, msA, msB), "");
+    }
+
+    // ---- the configuration in Zig must match the C++ one ----
+    {
+        const overrides = [_][2][:0]const u8{
+            .{ "dim", "512" },          .{ "lr", "3e-4" },        .{ "trace_decay", "0.97" },
+            .{ "mla", "1" },            .{ "mla_theta", "50000" }, .{ "docsep", "10" },
+            .{ "ematau", "0.9995" },    .{ "half_max", "1024" },  .{ "mem", "1" },
+        };
+        const c = tmt.tmt_cfg_new().?;
+        defer tmt.tmt_cfg_free(c);
+        var z = config.Cfg{};
+        var ok = true;
+        for (overrides) |kv| {
+            if (tmt.tmt_cfg_set(c, kv[0].ptr, kv[1].ptr) != 0) return error.Ref;
+            config.set(&z, kv[0], kv[1]) catch {
+                ok = false;
+            };
+            const theirs = std.mem.span(tmt.tmt_cfg_text(c));
+            const mine = try config.text(gpa, z);
+            if (!std.mem.eql(u8, theirs, mine)) {
+                say("  configuration text differs after {s}={s}\n", .{ kv[0], kv[1] });
+                ok = false;
+            }
+        }
+        // Rejected keys, values and constraints must say the same thing.
+        const bad = [_][2][:0]const u8{
+            .{ "bogus", "1" }, .{ "dim", "x" }, .{ "lr", "1e40" }, .{ "topk", "99" },
+            .{ "layers", "0" }, .{ "mla_R", "3" },
+        };
+        for (bad) |kv| {
+            const copy = tmt.tmt_cfg_copy(c).?;
+            defer tmt.tmt_cfg_free(copy);
+            var zc = z;
+            const their_rc = tmt.tmt_cfg_set(copy, kv[0].ptr, kv[1].ptr);
+            const their_msg = if (their_rc != 0) tmt.lastError() else blk: {
+                _ = tmt.tmt_cfg_validate(copy);
+                break :blk tmt.lastError();
+            };
+            var my_msg: []const u8 = "";
+            config.set(&zc, kv[0], kv[1]) catch {
+                my_msg = config.lastError();
+            };
+            if (my_msg.len == 0) config.validate(zc) catch {
+                my_msg = config.lastError();
+            };
+            if (!std.mem.eql(u8, their_msg, my_msg)) {
+                say("  message differs for {s}={s}: C++ \"{s}\", Zig \"{s}\"\n", .{ kv[0], kv[1], their_msg, my_msg });
+                ok = false;
+            }
+        }
+        report("configuration", ok, "");
     }
 
     if (failures == 0) say("ALL KERNEL COMPARISONS PASSED\n", .{});
