@@ -391,6 +391,8 @@ pub const MTParams = extern struct {
     grad: cuda.Global(cuda.Global(f32)),
     work: cuda.Global(cuda.Global(bf16)),
     flags: cuda.Global(u8), // bit 0: in the gradient norm, bit 1: updated by AdamW
+    /// Per-parameter factor on the learning rate; 1 unless mup scales it.
+    lrmul: cuda.Global(f32),
     chunks: cuda.Global(MTChunk),
     nchunks: i32,
     sumsq: cuda.Global(f64), // global squared gradient norm
@@ -432,6 +434,7 @@ export fn mt_adam(P: MTParams, clip: f32, lr: f32, b1: f32, b2: f32, eps: f32, w
     const v = P.v[@intCast(c.param)] + at;
     const grad = P.grad[@intCast(c.param)] + at;
     const work = P.work[@intCast(c.param)] + at;
+    const step_lr = lr * P.lrmul[@intCast(c.param)];
     var i = cuda.threadIdxX();
     while (i < @as(u32, @bitCast(c.len))) : (i += cuda.blockDimX()) {
         const g = grad[i] * scale;
@@ -439,7 +442,7 @@ export fn mt_adam(P: MTParams, clip: f32, lr: f32, b1: f32, b2: f32, eps: f32, w
         const nv = b2 * v[i] + (1.0 - b2) * g * g;
         m[i] = nm;
         v[i] = nv;
-        const w = master[i] - lr * (cuda.fdiv(cuda.fdiv(nm, bc1), cuda.fsqrt(cuda.fdiv(nv, bc2)) + eps) + wd * master[i]);
+        const w = master[i] - step_lr * (cuda.fdiv(cuda.fdiv(nm, bc1), cuda.fsqrt(cuda.fdiv(nv, bc2)) + eps) + wd * master[i]);
         master[i] = w;
         work[i] = cuda.f2bf(w);
     }

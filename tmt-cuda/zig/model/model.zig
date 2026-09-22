@@ -46,6 +46,7 @@ pub const MTParams = extern struct {
     grad: u64 = 0,
     work: u64 = 0,
     flags: u64 = 0,
+    lrmul: u64 = 0,
     chunks: u64 = 0,
     nchunks: i32 = 0,
     sumsq: u64 = 0,
@@ -406,6 +407,26 @@ fn fill(m: *Model, p: *anyopaque, value: u8, bytes: usize) !void {
     if (cudaMemset(p, value, bytes) != 0) return error.Cuda;
 }
 
+/// Under mup the attention logits scale with 1/d rather than 1/sqrt(d), so
+/// their size stays constant as the head dimension grows.
+fn attnScale(c: Cfg, dh: i32) f32 {
+    const d: f32 = @floatFromInt(dh);
+    return if (c.mup != 0) 1.0 / d else 1.0 / params.sqrtf(d);
+}
+
+/// Maximal update parametrization: with Adam the learning rate of a hidden
+/// weight scales as 1/fan_in, so that a rate tuned at `mup_base` transfers to
+/// a wider model. The embedding, the output heads and every vector keep the
+/// plain rate, and the initialization is already 1/sqrt(fan_in).
+fn mupScale(m: *const Model, j: usize) f32 {
+    if (m.c.mup == 0) return 1;
+    if (j == m.emb or j == m.tgt or j == m.dec or j == m.stop) return 1;
+    for (m.dec_mtp) |p| if (j == p) return 1;
+    const p = m.store.at(j);
+    if (p.rows <= 1 or p.cols <= 1) return 1;
+    return @as(f32, @floatFromInt(m.c.mup_base)) / @as(f32, @floatFromInt(p.cols));
+}
+
 /// Muon orthogonalizes the hidden weight matrices; the embedding, the output
 /// head and every vector keep AdamW, as the published recipe prescribes.
 fn isMuonParam(m: *const Model, j: usize) bool {
@@ -447,8 +468,10 @@ fn buildOptTable(m: *Model) !void {
     const grad = try gpa.alloc(u64, P);
     const work = try gpa.alloc(u64, P);
     const flags = try gpa.alloc(u8, P);
+    const lrmul = try gpa.alloc(f32, P);
     defer inline for (.{ master, mm, vv, grad, work }) |x| gpa.free(x);
     defer gpa.free(flags);
+    defer gpa.free(lrmul);
     var chunks: std.ArrayList(MTChunk) = .empty;
     defer chunks.deinit(gpa);
     for (0..P) |i| {
@@ -463,6 +486,7 @@ fn buildOptTable(m: *Model) !void {
         // Muon weights still count towards the gradient norm, but AdamW skips them.
         const adam = !frozen and !unused_stop and !isMuonParam(m, i);
         flags[i] = (if (frozen) @as(u8, 0) else 1) | (if (adam) @as(u8, 2) else 0);
+        lrmul[i] = mupScale(m, i);
         var s: i64 = 0;
         while (s < p.n) : (s += MT_CHUNK) {
             try chunks.append(gpa, .{ .param = @intCast(i), .len = @intCast(@min(MT_CHUNK, p.n - s)), .start = s });
@@ -476,6 +500,7 @@ fn buildOptTable(m: *Model) !void {
         }
     }.f;
     m.opt = .{
+        .lrmul = try up(m, std.mem.sliceAsBytes(lrmul)),
         .master = try up(m, std.mem.sliceAsBytes(master)),
         .m = try up(m, std.mem.sliceAsBytes(mm)),
         .v = try up(m, std.mem.sliceAsBytes(vv)),
@@ -623,7 +648,7 @@ pub fn forwardWindow(m: *Model, s: *StreamState) !Losses {
             try gpu.copyDevice(ml.Xsnap, m.X, ND * 2);
             try ops.layernormFwd(k, m.X, m.store.at(ml.p.gamma).master, m.store.at(ml.p.beta).master,
                 m.H, ml.mmean, ml.mrstd, @intCast(N), c.dim);
-            const sc = 1.0 / @sqrt(@as(f32, @floatFromInt(c.mla_dh)));
+            const sc = attnScale(c, c.mla_dh);
             try mla.forward(k, m.H, @intCast(N), m.store.at(ml.p.q).work, m.store.at(ml.p.dkv).work,
                 m.store.at(ml.p.kr).work, m.store.at(ml.p.uk).work, m.store.at(ml.p.uv).work,
                 m.store.at(ml.p.o).work, &s.cache[l], &ml.keep, &m.MW, m.M, m.pos,
@@ -635,7 +660,8 @@ pub fn forwardWindow(m: *Model, s: *StreamState) !Losses {
             const me = &m.MEM[l];
             try memory.forward(k, m.X, me, &m.MS, m.store.at(me.gamma).master, m.store.at(me.beta).master,
                 m.store.at(me.wq).work, m.store.at(me.wk).work, m.store.at(me.wv).work,
-                m.store.at(me.wo).work, m.M, c.batch, c.seqlen, c.mem_len, c.mem_heads, c.mem_dh, c.dim);
+                m.store.at(me.wo).work, m.M, c.batch, c.seqlen, c.mem_len, c.mem_heads, c.mem_dh, c.dim,
+                attnScale(c, c.mem_dh));
         }
         const gy: u32 = @intCast(@divTrunc(c.dim + 255, 256));
         try (try k.get("extract_carry")).launchGrid(@intCast(B), gy, 256,
@@ -768,12 +794,12 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
                 m.store.at(me.wq).work, m.store.at(me.wk).work, m.store.at(me.wv).work, m.store.at(me.wo).work,
                 m.store.at(me.gamma).grad, m.store.at(me.beta).grad, m.store.at(me.wq).grad,
                 m.store.at(me.wk).grad, m.store.at(me.wv).grad, m.store.at(me.wo).grad,
-                c.batch, c.seqlen, c.mem_len, c.mem_heads, c.mem_dh, c.dim);
+                c.batch, c.seqlen, c.mem_len, c.mem_heads, c.mem_dh, c.dim, attnScale(c, c.mem_dh));
         }
         if (c.mla != 0 and m.ML[l].use) {
             const ml = &m.ML[l];
             try gpu.copyDevice(m.dM, m.dXs, ND * 2);
-            const sc = 1.0 / @sqrt(@as(f32, @floatFromInt(c.mla_dh)));
+            const sc = attnScale(c, c.mla_dh);
             try mla.backward(k, m.dM, @intCast(N), m.store.at(ml.p.q).work, m.store.at(ml.p.dkv).work,
                 m.store.at(ml.p.kr).work, m.store.at(ml.p.uk).work, m.store.at(ml.p.uv).work,
                 m.store.at(ml.p.o).work, m.store.at(ml.p.q).grad, m.store.at(ml.p.dkv).grad,

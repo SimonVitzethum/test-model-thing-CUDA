@@ -67,7 +67,7 @@ pub fn encode(k: *gpu.Kernels, E: [*]const bf16, Eprev: [*]const bf16, P: [*]con
 /// x is updated in place: x += o Wo^T.
 pub fn forward(k: *gpu.Kernels, X: [*]bf16, L: *Layer, s: *Shared, gamma: [*]const f32, beta: [*]const f32,
                Wq: [*]const bf16, Wk: [*]const bf16, Wv: [*]const bf16, Wo: [*]const bf16, Y: [*]bf16,
-               B: i32, T: i32, M: i32, H: i32, dh: i32, D: i32) !void {
+               B: i32, T: i32, M: i32, H: i32, dh: i32, D: i32, scale: f32) !void {
     const N = B * T;
     const HD = H * dh;
     const ND: usize = @intCast(@as(i64, N) * D);
@@ -76,7 +76,6 @@ pub fn forward(k: *gpu.Kernels, X: [*]bf16, L: *Layer, s: *Shared, gamma: [*]con
     try linalg.linearFwd(N, HD, D, L.Hn, Wq, L.Q);
     try linalg.linearFwd(B * M, HD, D, s.enc, Wk, L.K);
     try linalg.linearFwd(B * M, HD, D, s.enc, Wv, L.V);
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dh)));
     try (try k.get("mem_attn_fwd")).launch(blocks(@intCast(@as(i64, B) * H * T)), 256,
         .{ L.Q, L.K, L.V, s.ids, L.P, L.O, B, T, M, H, dh, scale });
     try linalg.linearFwd(N, D, HD, L.O, Wo, Y);
@@ -87,11 +86,10 @@ pub fn forward(k: *gpu.Kernels, X: [*]bf16, L: *Layer, s: *Shared, gamma: [*]con
 pub fn backward(k: *gpu.Kernels, dX: [*]bf16, L: *Layer, s: *Shared, gamma: [*]const f32,
                 Wq: [*]const bf16, Wk: [*]const bf16, Wv: [*]const bf16, Wo: [*]const bf16,
                 gGamma: [*]f32, gBeta: [*]f32, gWq: [*]f32, gWk: [*]f32, gWv: [*]f32, gWo: [*]f32,
-                B: i32, T: i32, M: i32, H: i32, dh: i32, D: i32) !void {
+                B: i32, T: i32, M: i32, H: i32, dh: i32, D: i32, scale: f32) !void {
     const N = B * T;
     const HD = H * dh;
     const ND: usize = @intCast(@as(i64, N) * D);
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dh)));
     try linalg.linearDW(N, D, HD, dX, L.O, gWo, 0);
     try linalg.linearDX(N, D, HD, dX, Wo, s.dO, 0);
     try (try k.get("mem_attn_bwd_q")).launch(blocks(@intCast(@as(i64, B) * H * T)), 256,
