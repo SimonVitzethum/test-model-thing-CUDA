@@ -4,6 +4,22 @@
 #include <cublas_v2.h>
 #include <vector>
 
+#include <cstdlib>
+#include <cstring>
+
+// How the host thread waits for the GPU (set before the first CUDA call).
+// TMT_CUDA_WAIT=yield (default): polls but yields the core to other processes;
+// same speed as spin. block: sleeps until the GPU is done, ~1/3 of a core
+// instead of a full one, measured ~5% slower. spin: CUDA's busy wait.
+static const int tmt_cuda_wait_mode = [] {
+    const char* v = getenv("TMT_CUDA_WAIT");
+    unsigned flag = cudaDeviceScheduleYield;
+    if (v && !strcmp(v, "spin")) flag = cudaDeviceScheduleSpin;
+    else if (v && !strcmp(v, "block")) flag = cudaDeviceScheduleBlockingSync;
+    cudaSetDeviceFlags(flag);
+    return (int)flag;
+}();
+
 inline cublasHandle_t cublas_handle() {
     static cublasHandle_t h = nullptr;
     if (!h) {

@@ -39,6 +39,12 @@ compute-sanitizer --tool memcheck --error-exitcode 99 ./architecture_test
 `bench` measures only the recurrent cell. It is not a throughput benchmark of the
 entire training run. Its bandwidth figure is computed from estimated data traffic.
 
+The training process keeps one CPU core busy while it waits for the GPU; that
+is polling, not work (the host side needs about a third of a core). The default
+`TMT_CUDA_WAIT=yield` gives the core to other processes when they need it;
+`TMT_CUDA_WAIT=block` sleeps instead (~5% slower, useful on battery),
+`TMT_CUDA_WAIT=spin` is CUDA's plain busy wait.
+
 ## Model and architecture decisions
 
 ```text
