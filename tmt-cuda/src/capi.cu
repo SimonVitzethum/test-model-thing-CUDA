@@ -359,6 +359,33 @@ int tmt_ref_cast_add(const void* s, float* d, long n) {
         CUDA_CHECK(cudaDeviceSynchronize());
     });
 }
+int tmt_ref_cell_forward(const void* X, float* S, const float* decay, float* mean, float* rstd,
+                         void* Y, int B, int T, int D) {
+    return guard([&] {
+        cell_forward((const bf16*)X, S, decay, mean, rstd, (bf16*)Y, B, T, D);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_state_bwd(const void* dS, const float* S, const float* decay, float* dX, float* dDec,
+                      int B, int T, int D, const void* X, const float* initial, const float* gate,
+                      float* dGate, const void* opt) {
+    return guard([&] {
+        CellOpt o; std::memcpy(&o, opt, sizeof(CellOpt));
+        dim3 grid(B, (D + 255) / 256);
+        state_bwd_kernel<<<grid, 256>>>((const bf16*)dS, S, decay, dX, dDec, B, T, D,
+                                        (const bf16*)X, initial, gate, dGate, o);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
+int tmt_ref_emb_trace(const void* X, const float* S, const float* initial, const float* decay,
+                      const float* gate, float* trEmb, float* dEmb, int B, int T, int D,
+                      const void* opt) {
+    return guard([&] {
+        CellOpt o; std::memcpy(&o, opt, sizeof(CellOpt));
+        emb_trace((const bf16*)X, S, initial, decay, gate, trEmb, dEmb, B, T, D, o);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    });
+}
 int tmt_ref_copy_bf16(const float* src, void* dst, long n) {
     return guard([&] {
         copy_bf16_kernel<<<(n + 255) / 256, 256>>>(src, (bf16*)dst, n);

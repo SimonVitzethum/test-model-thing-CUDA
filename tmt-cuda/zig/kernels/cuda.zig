@@ -86,6 +86,14 @@ pub inline fn fsqrt(a: f32) f32 {
         : [r] "=f" (-> f32),
         : [x] "f" (a));
 }
+/// A multiply that must stay a separate instruction: nvcc fuses a multiply
+/// and an add only where its own code generator does, so the kernels use this
+/// wherever the C++ PTX keeps mul and add apart.
+pub inline fn mulNoFma(a: f32, b: f32) f32 {
+    return asm ("mul.rn.ftz.f32 %[r], %[x], %[y];"
+        : [r] "=f" (-> f32),
+        : [x] "f" (a), [y] "f" (b));
+}
 pub inline fn frsqrt(a: f32) f32 {
     return asm ("rsqrt.approx.ftz.f32 %[r], %[x];"
         : [r] "=f" (-> f32),

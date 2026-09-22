@@ -82,7 +82,7 @@ export fn ln_fwd(X: cuda.ConstGlobal(bf16), gamma: cuda.ConstGlobal(f32), beta: 
     cuda.syncThreads();
     const total_sq = blockSum(sq);
     if (t == 0) {
-        const v = cuda.fdiv(total_sq, @floatFromInt(D)) - ln_m * ln_m;
+        const v = cuda.fdiv(total_sq, @floatFromInt(D)) - cuda.mulNoFma(ln_m, ln_m);
         mean[r] = ln_m;
         ln_rs = cuda.frsqrt(v + 1e-5);
         rstd[r] = ln_rs;
@@ -207,4 +207,174 @@ export fn var_bwd(x: cuda.ConstGlobal(f32), dX: cuda.Global(f32), mean: f32, scl
 export fn cast_add(s: cuda.ConstGlobal(bf16), d: cuda.Global(f32), n: i64) callconv(.nvptx_kernel) void {
     const i: i64 = @intCast(cuda.globalIdX());
     if (i < n) d[@intCast(i)] += cuda.bf2f(s[@intCast(i)]);
+}
+
+// ---- src/cell.cu ----
+/// Options of the recurrence kernels, same layout as the C++ CellOpt.
+pub const CellOpt = extern struct {
+    ids: ?cuda.ConstGlobal(i32) = null, // (B,T) input bytes, for the document reset
+    docsep: i32 = -1,
+    gamma: f32 = 1, // trace decay per byte (1: exact traces)
+    trDec: ?cuda.Global(f32) = null,
+    trGate: ?cuda.Global(f32) = null,
+    lam: ?cuda.Global(f32) = null,
+    prod: ?cuda.Global(f32) = null,
+    logDec: ?cuda.Global(f32) = null,
+    logGate: ?cuda.Global(f32) = null,
+    logEmb: ?cuda.Global(f32) = null,
+};
+
+/// a = sigmoid(decay + gate*x), or 0 at a document separator (s_t = x_t).
+inline fn cellA(o: CellOpt, decay: f32, gate: ?cuda.ConstGlobal(f32), d: u32, x: f32, b: u32, T: i32, t: i32) f32 {
+    if (o.docsep >= 0 and o.ids.?[@intCast(@as(i32, @intCast(b)) * T + t)] == o.docsep) return 0;
+    return cuda.sigmoid(decay + if (gate) |g| g[d] * x else 0);
+}
+
+/// Pass 1: the time loop, one thread per (stream, channel).
+export fn state_pass(X: cuda.ConstGlobal(bf16), S: cuda.Global(f32), decay: cuda.ConstGlobal(f32),
+                     carry: ?cuda.ConstGlobal(f32), B: i32, T: i32, D: i32,
+                     gate: ?cuda.ConstGlobal(f32), o: CellOpt) callconv(.nvptx_kernel) void {
+    const b = cuda.blockIdxX();
+    const d = cuda.blockIdxY() * cuda.blockDimX() + cuda.threadIdxX();
+    if (b >= @as(u32, @bitCast(B)) or d >= @as(u32, @bitCast(D))) return;
+    var state: f32 = if (carry) |c| c[b * @as(u32, @bitCast(D)) + d] else 0;
+    var t: i32 = 0;
+    while (t < T) : (t += 1) {
+        const idx: u32 = @bitCast((@as(i32, @intCast(b)) * T + t) * D + @as(i32, @intCast(d)));
+        const x = cuda.bf2f(X[idx]);
+        const dec = cellA(o, decay[d], gate, d, x, b, T, t);
+        state = dec * state + (1.0 - dec) * x;
+        S[idx] = state;
+    }
+}
+
+/// Pass 2: one block per (stream, position) reduces mean and rstd over D.
+export fn stats_pass(S: cuda.ConstGlobal(f32), mean: cuda.Global(f32), rstd: cuda.Global(f32),
+                     B: i32, T: i32, D: i32) callconv(.nvptx_kernel) void {
+    const row = cuda.blockIdxX();
+    if (row >= @as(u32, @bitCast(B * T))) return;
+    const base = row * @as(u32, @bitCast(D));
+    const t = cuda.threadIdxX();
+    const step = cuda.blockDimX();
+    var sum: f32 = 0;
+    var sq: f32 = 0;
+    var d = t;
+    while (d < @as(u32, @bitCast(D))) : (d += step) {
+        const v = S[base + d];
+        sum += v;
+        sq += v * v;
+    }
+    const total = blockSum(sum);
+    if (t == 0) ln_m = total;
+    cuda.syncThreads();
+    const total_sq = blockSum(sq);
+    if (t == 0) {
+        const m = cuda.fdiv(ln_m, @floatFromInt(D));
+        const v = cuda.fdiv(total_sq, @floatFromInt(D)) - cuda.mulNoFma(m, m);
+        mean[row] = m;
+        rstd[row] = cuda.frsqrt(v + 1e-5);
+    }
+}
+
+/// Pass 3: normalize, SiLU, residual.
+export fn out_pass(X: cuda.ConstGlobal(bf16), S: cuda.ConstGlobal(f32), mean: cuda.ConstGlobal(f32),
+                   rstd: cuda.ConstGlobal(f32), Y: cuda.Global(bf16), B: i32, T: i32, D: i32) callconv(.nvptx_kernel) void {
+    const b = cuda.blockIdxX();
+    const d = cuda.blockIdxY() * cuda.blockDimX() + cuda.threadIdxX();
+    if (b >= @as(u32, @bitCast(B)) or d >= @as(u32, @bitCast(D))) return;
+    var t: i32 = 0;
+    while (t < T) : (t += 1) {
+        const row: u32 = @bitCast(@as(i32, @intCast(b)) * T + t);
+        const idx: u32 = @bitCast(@as(i32, @bitCast(row)) * D + @as(i32, @intCast(d)));
+        const h = (S[idx] - mean[row]) * rstd[row];
+        Y[idx] = cuda.f2bf(cuda.silu(h) + cuda.bf2f(X[idx]));
+    }
+}
+
+/// Exact within-window derivative, plus the hybrid traces across the window
+/// boundary (see the comment in src/cell.cu).
+export fn state_bwd(dS: cuda.ConstGlobal(bf16), S: cuda.ConstGlobal(f32), decay: cuda.ConstGlobal(f32),
+                    dX: cuda.Global(f32), dDec: cuda.Global(f32), B: i32, T: i32, D: i32,
+                    X: cuda.ConstGlobal(bf16), initial: ?cuda.ConstGlobal(f32),
+                    gate: ?cuda.ConstGlobal(f32), dGate: ?cuda.Global(f32), o: CellOpt) callconv(.nvptx_kernel) void {
+    const b = cuda.blockIdxX();
+    const d = cuda.blockIdxY() * cuda.blockDimX() + cuda.threadIdxX();
+    if (b >= @as(u32, @bitCast(B)) or d >= @as(u32, @bitCast(D))) return;
+    var future: f32 = 0;
+    var gd: f32 = 0;
+    var gg: f32 = 0;
+    var suffix: f32 = 1;
+    var ld: f32 = 0;
+    var lg: f32 = 0;
+    var t: i32 = T - 1;
+    while (t >= 0) : (t -= 1) {
+        const idx: usize = @intCast((@as(i64, b) * T + t) * D + @as(i64, d));
+        const x = cuda.bf2f(X[idx]);
+        const a = cellA(o, decay[d], gate, d, x, b, T, t);
+        const total = cuda.bf2f(dS[idx]) + future;
+        const prev = if (t != 0) S[idx - @as(usize, @intCast(D))] else if (initial) |i| i[@as(usize, b) * @as(usize, @intCast(D)) + d] else 0;
+        const local = (prev - x) * a * (1.0 - a);
+        const gz = total * local;
+        dX[idx] = total * (1.0 - a) + if (gate) |g| gz * g[d] else 0;
+        gd += gz;
+        gg += gz * x;
+        future = total * a;
+        ld += cuda.mulNoFma(suffix, local);
+        lg += suffix * local * x;
+        suffix *= o.gamma * a;
+    }
+    const bd: usize = @as(usize, b) * @as(usize, @intCast(D)) + d;
+    if (o.trDec) |tr| {
+        const e = tr[bd];
+        const part = future * e;
+        gd += part;
+        if (o.logDec) |l| cuda.atomicAddF32(&l[d], part);
+        tr[bd] = suffix * e + ld;
+    }
+    if (o.trGate) |tr| if (gate != null) {
+        const e = tr[bd];
+        const part = future * e;
+        gg += part;
+        if (o.logGate) |l| cuda.atomicAddF32(&l[d], part);
+        tr[bd] = suffix * e + lg;
+    };
+    if (o.lam) |lam| {
+        lam[bd] = future;
+        o.prod.?[bd] = suffix;
+    }
+    cuda.atomicAddF32(&dDec[d], gd);
+    if (dGate) |dg| if (gate != null) cuda.atomicAddF32(&dg[d], gg);
+}
+
+/// Embedding trace e[b][r][d] = ds_d/dEmb[r][d], using lambda and P from state_bwd.
+export fn emb_trace(X: cuda.ConstGlobal(bf16), S: cuda.ConstGlobal(f32), initial: cuda.ConstGlobal(f32),
+                    decay: cuda.ConstGlobal(f32), gate: ?cuda.ConstGlobal(f32), trEmb: cuda.Global(f32),
+                    dEmb: cuda.Global(f32), B: i32, T: i32, D: i32, o: CellOpt) callconv(.nvptx_kernel) void {
+    const b = cuda.blockIdxX();
+    const d = cuda.blockIdxY() * cuda.blockDimX() + cuda.threadIdxX();
+    if (b >= @as(u32, @bitCast(B)) or d >= @as(u32, @bitCast(D))) return;
+    const dim: usize = @intCast(D);
+    const bd: usize = @as(usize, b) * dim + d;
+    const l = o.lam.?[bd];
+    const P = o.prod.?[bd];
+    const e = trEmb + @as(usize, b) * 256 * dim + d;
+    for (0..256) |r| {
+        const v = e[r * dim];
+        if (v != 0) {
+            cuda.atomicAddF32(&dEmb[r * dim + d], l * v);
+            if (o.logEmb) |le| cuda.atomicAddF32(&le[r * dim + d], l * v);
+        }
+        e[r * dim] = P * v;
+    }
+    var suffix: f32 = 1;
+    var t: i32 = T - 1;
+    while (t >= 0) : (t -= 1) {
+        const idx: usize = @intCast((@as(i64, b) * T + t) * D + @as(i64, d));
+        const x = cuda.bf2f(X[idx]);
+        const a = cellA(o, decay[d], gate, d, x, b, T, t);
+        const prev = if (t != 0) S[idx - dim] else initial[bd];
+        const k = (1.0 - a) + if (gate) |g| (prev - x) * a * (1.0 - a) * g[d] else 0;
+        e[@as(usize, @intCast(o.ids.?[@intCast(@as(i32, @intCast(b)) * T + t)])) * dim] += suffix * k;
+        suffix *= o.gamma * a;
+    }
 }

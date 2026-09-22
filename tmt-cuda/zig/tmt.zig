@@ -150,6 +150,9 @@ pub extern fn tmt_ref_ce_bwd(probs: [*]const f32, tgt: [*]const c_int, dLogits: 
 pub extern fn tmt_ref_stop_fwd(s: *const anyopaque, end: [*]const c_int, loss: [*]f32, pos_w: f32, N: c_int) c_int;
 pub extern fn tmt_ref_stop_bwd(s: *const anyopaque, end: [*]const c_int, ds: *anyopaque, pos_w: f32, w: f32, N: c_int) c_int;
 pub extern fn tmt_ref_cast_add(s: *const anyopaque, d: [*]f32, n: c_long) c_int;
+pub extern fn tmt_ref_cell_forward(X: *const anyopaque, S: [*]f32, decay: [*]const f32, mean: [*]f32, rstd: [*]f32, Y: *anyopaque, B: c_int, T: c_int, D: c_int) c_int;
+pub extern fn tmt_ref_state_bwd(dS: *const anyopaque, S: [*]const f32, decay: [*]const f32, dX: [*]f32, dDec: [*]f32, B: c_int, T: c_int, D: c_int, X: *const anyopaque, initial: ?[*]const f32, gate: ?[*]const f32, dGate: ?[*]f32, opt: *const anyopaque) c_int;
+pub extern fn tmt_ref_emb_trace(X: *const anyopaque, S: [*]const f32, initial: [*]const f32, decay: [*]const f32, gate: ?[*]const f32, trEmb: [*]f32, dEmb: [*]f32, B: c_int, T: c_int, D: c_int, opt: *const anyopaque) c_int;
 pub extern fn tmt_ref_add_f32(acc: [*]f32, x: [*]const f32, n: c_long) c_int;
 pub extern fn tmt_ref_ln_fwd(X: *const anyopaque, gamma: [*]const f32, beta: [*]const f32, Y: *anyopaque, mean: [*]f32, rstd: [*]f32, N: c_int, D: c_int) c_int;
 pub extern fn tmt_ref_ln_bwd(X: *const anyopaque, dY: *const anyopaque, gamma: [*]const f32, mean: [*]const f32, rstd: [*]const f32, dX: *anyopaque, dGamma: [*]f32, dBeta: [*]f32, N: c_int, D: c_int) c_int;

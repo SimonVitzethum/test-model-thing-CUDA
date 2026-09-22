@@ -9,6 +9,21 @@ const ptx = @import("ptx.zig");
 
 const kernels_ptx = @embedFile("kernels.ptx");
 
+/// Host view of the CellOpt the recurrence kernels take (device pointers as
+/// plain addresses); same layout as the struct in zig/kernels/kernels.zig.
+const CellOpt = extern struct {
+    ids: u64 = 0,
+    docsep: i32 = -1,
+    gamma: f32 = 1,
+    trDec: u64 = 0,
+    trGate: u64 = 0,
+    lam: u64 = 0,
+    prod: u64 = 0,
+    logDec: u64 = 0,
+    logGate: u64 = 0,
+    logEmb: u64 = 0,
+};
+
 var failures: usize = 0;
 
 /// Deterministic test data, independent of the platform's RNG.
@@ -318,6 +333,199 @@ pub fn main(init: std.process.Init) !u8 {
         var buf: [128]u8 = undefined;
         const detail = std.fmt.bufPrint(&buf, "dGamma/dBeta difference {e:.1} (atomic order)", .{worst}) catch "";
         report("ln_bwd", std.mem.eql(u16, ref_dx, my_dx) and worst < 1e-5, detail);
+    }
+
+    // ---- the recurrence: forward, exact backward, hybrid traces ----
+    {
+        const B = 4;
+        const T = 32;
+        const Dc = 128;
+        const NT = B * T * Dc;
+        const opt_ids = try gpa.alloc(i32, B * T);
+        fillIds(opt_ids, 43, 0, 256);
+        opt_ids[5] = 10; // a document separator must reset the state
+        opt_ids[T + 9] = 10;
+        const decay = try gpa.alloc(f32, Dc);
+        const gate = try gpa.alloc(f32, Dc);
+        const carry = try gpa.alloc(f32, B * Dc);
+        fill(decay, 47);
+        fill(gate, 53);
+        fill(carry, 59);
+        const d_dec = try Dev.alloc(Dc * 4);
+        const d_gate = try Dev.alloc(Dc * 4);
+        const d_carry = try Dev.alloc(B * Dc * 4);
+        const d_cids = try Dev.alloc(B * T * 4);
+        try Dev.up(d_dec, bytesOf(f32, decay));
+        try Dev.up(d_gate, bytesOf(f32, gate));
+        try Dev.up(d_carry, bytesOf(f32, carry));
+        try Dev.up(d_cids, bytesOf(i32, opt_ids));
+        const d_xc = try Dev.alloc(NT * 2);
+        const d_dsc = try Dev.alloc(NT * 2);
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_x)), d_xc, NT) != 0) return error.Ref;
+        try Dev.up(d_acc, bytesOf(f32, a));
+        if (tmt.tmt_ref_copy_bf16(@ptrCast(@alignCast(d_acc)), d_dsc, NT) != 0) return error.Ref;
+        const d_S = try Dev.alloc(NT * 4);
+        const d_mean = try Dev.alloc(B * T * 4);
+        const d_rstd = try Dev.alloc(B * T * 4);
+        const d_Y = try Dev.alloc(NT * 2);
+
+        // forward, the three passes exactly as cell_forward runs them
+        if (tmt.tmt_ref_cell_forward(d_xc, @ptrCast(@alignCast(d_S)), @ptrCast(@alignCast(d_dec)),
+                                     @ptrCast(@alignCast(d_mean)), @ptrCast(@alignCast(d_rstd)), d_Y, B, T, Dc) != 0) return error.Ref;
+        const ref_S = try gpa.alloc(f32, NT);
+        const ref_stat = try gpa.alloc(f32, 2 * B * T);
+        const ref_Y = try gpa.alloc(u16, NT);
+        try Dev.down(bytesOf(f32, ref_S), d_S);
+        try Dev.down(bytesOf(f32, ref_stat[0 .. B * T]), d_mean);
+        try Dev.down(bytesOf(f32, ref_stat[B * T ..]), d_rstd);
+        try Dev.down(bytesOf(u16, ref_Y), d_Y);
+        const zero_opt = CellOpt{};
+        const grid_y = (Dc + 255) / 256;
+        try (try mod.get("state_pass")).launchGrid(B, grid_y, 256, .{ d_xc, d_S, d_dec, @as(u64, 0), @as(i32, B), @as(i32, T), @as(i32, Dc), @as(u64, 0), zero_opt });
+        try (try mod.get("stats_pass")).launch(B * T, 256, .{ d_S, d_mean, d_rstd, @as(i32, B), @as(i32, T), @as(i32, Dc) });
+        try (try mod.get("out_pass")).launchGrid(B, grid_y, 256, .{ d_xc, d_S, d_mean, d_rstd, d_Y, @as(i32, B), @as(i32, T), @as(i32, Dc) });
+        const my_S = try gpa.alloc(f32, NT);
+        const my_stat = try gpa.alloc(f32, 2 * B * T);
+        const my_Y = try gpa.alloc(u16, NT);
+        try Dev.down(bytesOf(f32, my_S), d_S);
+        try Dev.down(bytesOf(f32, my_stat[0 .. B * T]), d_mean);
+        try Dev.down(bytesOf(f32, my_stat[B * T ..]), d_rstd);
+        try Dev.down(bytesOf(u16, my_Y), d_Y);
+        var fb: [160]u8 = undefined;
+        var nS: usize = 0;  // the three passes must agree exactly
+        var nst: usize = 0;
+        var nY: usize = 0;
+        var wS: f32 = 0;
+        for (ref_S, my_S) |v, w| if (v != w) {
+            nS += 1;
+            wS = @max(wS, @abs(v - w));
+        };
+        for (ref_stat, my_stat) |v, w| if (v != w) {
+            nst += 1;
+        };
+        for (ref_Y, my_Y) |v, w| if (v != w) {
+            nY += 1;
+        };
+        report("cell forward", nS == 0 and nst == 0 and nY == 0,
+            std.fmt.bufPrint(&fb, "S {d} (max {e:.1}), mean/rstd {d}, Y {d} differ", .{ nS, wS, nst, nY }) catch "");
+
+        // backward with document resets and hybrid traces
+        const traces = try gpa.alloc(f32, B * Dc);
+        fill(traces, 61);
+        const d_dX = try Dev.alloc(NT * 4);
+        const d_dDec = try Dev.alloc(Dc * 4);
+        const d_dGate = try Dev.alloc(Dc * 4);
+        const d_trD = try Dev.alloc(B * Dc * 4);
+        const d_trG = try Dev.alloc(B * Dc * 4);
+        const d_lam = try Dev.alloc(B * Dc * 4);
+        const d_prod = try Dev.alloc(B * Dc * 4);
+        const zeroDc = try gpa.alloc(f32, Dc);
+        @memset(zeroDc, 0);
+        const ref_b = try gpa.alloc(f32, NT + 2 * Dc + 4 * B * Dc);
+        const my_b = try gpa.alloc(f32, NT + 2 * Dc + 4 * B * Dc);
+        const gamma: f32 = 0.9;
+        // One options struct for both builds: the C++ reference takes a pointer
+        // to it, the Zig kernel takes it by value.
+        const bwd_opt = CellOpt{ .ids = @intFromPtr(d_cids), .docsep = 10, .gamma = gamma,
+            .trDec = @intFromPtr(d_trD), .trGate = @intFromPtr(d_trG),
+            .lam = @intFromPtr(d_lam), .prod = @intFromPtr(d_prod) };
+        for ([_][]f32{ ref_b, my_b }, 0..) |dst, run| {
+            try Dev.up(d_dDec, bytesOf(f32, zeroDc));
+            try Dev.up(d_dGate, bytesOf(f32, zeroDc));
+            try Dev.up(d_trD, bytesOf(f32, traces));
+            try Dev.up(d_trG, bytesOf(f32, traces));
+            if (run == 0) {
+                if (tmt.tmt_ref_state_bwd(d_dsc, @ptrCast(@alignCast(d_S)), @ptrCast(@alignCast(d_dec)),
+                    @ptrCast(@alignCast(d_dX)), @ptrCast(@alignCast(d_dDec)), B, T, Dc, d_xc,
+                    @ptrCast(@alignCast(d_carry)), @ptrCast(@alignCast(d_gate)), @ptrCast(@alignCast(d_dGate)),
+                    &bwd_opt) != 0) return error.Ref;
+            } else try (try mod.get("state_bwd")).launchGrid(B, grid_y, 256, .{ d_dsc, d_S, d_dec, d_dX, d_dDec,
+                @as(i32, B), @as(i32, T), @as(i32, Dc), d_xc, d_carry, d_gate, d_dGate, bwd_opt });
+            try Dev.down(bytesOf(f32, dst[0..NT]), d_dX);
+            try Dev.down(bytesOf(f32, dst[NT .. NT + Dc]), d_dDec);
+            try Dev.down(bytesOf(f32, dst[NT + Dc .. NT + 2 * Dc]), d_dGate);
+            try Dev.down(bytesOf(f32, dst[NT + 2 * Dc ..][0 .. B * Dc]), d_trD);
+            try Dev.down(bytesOf(f32, dst[NT + 2 * Dc + B * Dc ..][0 .. B * Dc]), d_trG);
+            try Dev.down(bytesOf(f32, dst[NT + 2 * Dc + 2 * B * Dc ..][0 .. B * Dc]), d_lam);
+            try Dev.down(bytesOf(f32, dst[NT + 2 * Dc + 3 * B * Dc ..][0 .. B * Dc]), d_prod);
+        }
+        // dX, traces, lambda and the decay product are per thread (no atomics)
+        // and must be identical; only dDec/dGate are accumulated atomically.
+        const atomic_from = NT;
+        const atomic_to = NT + 2 * Dc;
+        const parts = [_]struct { []const u8, usize, usize }{
+            .{ "dX", 0, NT },
+            .{ "trDec", atomic_to, atomic_to + B * Dc },
+            .{ "trGate", atomic_to + B * Dc, atomic_to + 2 * B * Dc },
+            .{ "lambda", atomic_to + 2 * B * Dc, atomic_to + 3 * B * Dc },
+            .{ "prod", atomic_to + 3 * B * Dc, atomic_to + 4 * B * Dc },
+        };
+        var bit_ok = true;
+        for (parts) |part| {
+            const same = std.mem.eql(f32, ref_b[part[1]..part[2]], my_b[part[1]..part[2]]);
+            if (!same) {
+                var n: usize = 0;
+                var wd: f32 = 0;
+                for (ref_b[part[1]..part[2]], my_b[part[1]..part[2]]) |v, w| if (v != w) {
+                    n += 1;
+                    wd = @max(wd, @abs(v - w));
+                };
+                say("  {s}: {d} of {d} differ, max {e:.1}; first ref={d:.6} mine={d:.6}\n", .{ part[0], n, part[2] - part[1], wd, ref_b[part[1]], my_b[part[1]] });
+            }
+            bit_ok = bit_ok and same;
+        }
+        var scale: f32 = 1e-30;
+        var worst: f32 = 0;
+        for (ref_b[atomic_from..atomic_to]) |v| scale = @max(scale, @abs(v));
+        for (ref_b[atomic_from..atomic_to], my_b[atomic_from..atomic_to]) |v, w| worst = @max(worst, @abs(v - w) / scale);
+        var cb: [128]u8 = undefined;
+        report("cell backward + traces", bit_ok and worst < 1e-5,
+            std.fmt.bufPrint(&cb, "dDecay/dGate within {e:.1} (atomic order)", .{worst}) catch "");
+
+        // embedding trace
+        {
+            const d_trE = try Dev.alloc(B * 256 * Dc * 4);
+            const d_dEmb = try Dev.alloc(256 * Dc * 4);
+            const trE = try gpa.alloc(f32, B * 256 * Dc);
+            fill(trE, 67);
+            const zeroE = try gpa.alloc(f32, 256 * Dc);
+            @memset(zeroE, 0);
+            const ref_e = try gpa.alloc(f32, B * 256 * Dc + 256 * Dc);
+            const my_e = try gpa.alloc(f32, B * 256 * Dc + 256 * Dc);
+            for ([_][]f32{ ref_e, my_e }, 0..) |dst, run| {
+                try Dev.up(d_trE, bytesOf(f32, trE));
+                try Dev.up(d_dEmb, bytesOf(f32, zeroE));
+                const eo = CellOpt{ .ids = @intFromPtr(d_cids), .docsep = 10, .gamma = gamma,
+                    .lam = @intFromPtr(d_lam), .prod = @intFromPtr(d_prod) };
+                if (run == 0) {
+                    if (tmt.tmt_ref_emb_trace(d_xc, @ptrCast(@alignCast(d_S)), @ptrCast(@alignCast(d_carry)),
+                        @ptrCast(@alignCast(d_dec)), @ptrCast(@alignCast(d_gate)), @ptrCast(@alignCast(d_trE)),
+                        @ptrCast(@alignCast(d_dEmb)), B, T, Dc, &eo) != 0) return error.Ref;
+                } else try (try mod.get("emb_trace")).launchGrid(B, grid_y, 256, .{ d_xc, d_S, d_carry, d_dec,
+                    d_gate, d_trE, d_dEmb, @as(i32, B), @as(i32, T), @as(i32, Dc), eo });
+                try Dev.down(bytesOf(f32, dst[0 .. B * 256 * Dc]), d_trE);
+                try Dev.down(bytesOf(f32, dst[B * 256 * Dc ..]), d_dEmb);
+            }
+            const split = B * 256 * Dc;
+            var s2: f32 = 1e-30;
+            var w2: f32 = 0;
+            for (ref_e[split..]) |v| s2 = @max(s2, @abs(v));
+            for (ref_e[split..], my_e[split..]) |v, w| w2 = @max(w2, @abs(v - w) / s2);
+            var eb: [128]u8 = undefined;
+            var nE: usize = 0;
+            var wE: f32 = 0;
+            var sE: f32 = 1e-30;
+            for (ref_e[0..split]) |v| sE = @max(sE, @abs(v));
+            for (ref_e[0..split], my_e[0..split]) |v, w| if (v != w) {
+                nE += 1;
+                wE = @max(wE, @abs(v - w) / sE);
+            };
+            // The trace itself is a long fp32 accumulation; a few of its
+            // entries end up one unit in the last place apart because nvcc
+            // fuses a multiply and an add here that LLVM keeps separate.
+            report("embedding trace", wE < 1e-6 and w2 < 1e-5,
+                std.fmt.bufPrint(&eb, "trace within {e:.1} (1 ulp), dEmb within {e:.1} (atomic order)", .{ wE, w2 }) catch "");
+        }
     }
 
     if (failures == 0) say("ALL KERNEL COMPARISONS PASSED\n", .{});

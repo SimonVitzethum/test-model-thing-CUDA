@@ -63,6 +63,10 @@ pub const Kernel = struct {
     /// Launch with `grid` blocks of `block` threads; `args` is a tuple of the
     /// kernel's arguments, in order.
     pub fn launch(k: Kernel, grid: u32, block: u32, args: anytype) Error!void {
+        return k.launchGrid(grid, 1, block, args);
+    }
+    /// Two-dimensional grid, as the recurrence kernels use it (stream, channel).
+    pub fn launchGrid(k: Kernel, gx: u32, gy: u32, block: u32, args: anytype) Error!void {
         // The driver copies each argument by the size in the kernel's
         // signature, so it gets a pointer to the value itself.
         const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
@@ -74,7 +78,7 @@ pub const Kernel = struct {
             copy[i] = @field(args, f.name);
             storage[i] = @ptrCast(&copy[i]);
         }
-        try check(cuLaunchKernel(k.f, grid, 1, 1, block, 1, 1, 0, null, &storage, null), "cuLaunchKernel");
+        try check(cuLaunchKernel(k.f, gx, gy, 1, block, 1, 1, 0, null, &storage, null), "cuLaunchKernel");
         try check(cuCtxSynchronize(), "cuCtxSynchronize");
     }
 };

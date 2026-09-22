@@ -91,6 +91,15 @@ int tmt_ref_ce_bwd(const float* probs, const int* tgt, void* dLogits, float w, i
 int tmt_ref_stop_fwd(const void* s, const int* end, float* loss, float pos_w, int N);
 int tmt_ref_stop_bwd(const void* s, const int* end, void* ds, float pos_w, float w, int N);
 int tmt_ref_cast_add(const void* s, float* d, long n);
+int tmt_ref_cell_forward(const void* X, float* S, const float* decay, float* mean, float* rstd,
+                         void* Y, int B, int T, int D);
+/* `opt` points at a CellOpt (src/cell.cu), filled by the caller. */
+int tmt_ref_state_bwd(const void* dS, const float* S, const float* decay, float* dX, float* dDec,
+                      int B, int T, int D, const void* X, const float* initial, const float* gate,
+                      float* dGate, const void* opt);
+int tmt_ref_emb_trace(const void* X, const float* S, const float* initial, const float* decay,
+                      const float* gate, float* trEmb, float* dEmb, int B, int T, int D,
+                      const void* opt);
 int tmt_ref_add_f32(float* acc, const float* x, long n);
 int tmt_ref_ln_fwd(const void* X, const float* gamma, const float* beta, void* Y,
                    float* mean, float* rstd, int N, int D);
