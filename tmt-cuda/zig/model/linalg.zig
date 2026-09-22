@@ -88,11 +88,12 @@ pub const Batched = struct {
     ldc: i32,
     strideC: i64,
     batch: i32,
+    /// The MLA folds the attention scale into the score GEMM.
+    alpha: f32 = 1,
     beta: f32 = 0,
 };
 pub fn batched(g: Batched) !void {
-    const al: f32 = 1;
     try check(cublasGemmStridedBatchedEx(try h(), if (g.transa) OP_T else OP_N, if (g.transb) OP_T else OP_N,
-        g.m, g.n, g.k, &al, g.A, R_16BF, g.lda, g.strideA, g.B, R_16BF, g.ldb, g.strideB,
+        g.m, g.n, g.k, &g.alpha, g.A, R_16BF, g.lda, g.strideA, g.B, R_16BF, g.ldb, g.strideB,
         &g.beta, g.C, R_32F, g.ldc, g.strideC, g.batch, COMPUTE_32F, GEMM_DEFAULT_TENSOR_OP), "batched GEMM");
 }

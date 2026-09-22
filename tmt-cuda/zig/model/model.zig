@@ -497,3 +497,277 @@ pub fn reset(s: *StreamState, c: Cfg) !void {
     if (s.temb) |t| try gpu.zero(t, 256 * bd);
     s.position = 0;
 }
+
+const linalg = @import("linalg.zig");
+const ops = @import("ops.zig");
+
+fn blocks(n: usize) u32 {
+    return @intCast((n + 255) / 256);
+}
+
+/// Sum of a device vector, accumulated in double on the host.
+fn hostSum(gpa: std.mem.Allocator, d: [*]const f32, n: usize) !f32 {
+    const h = try gpa.alloc(f32, n);
+    defer gpa.free(h);
+    try gpu.download(std.mem.sliceAsBytes(h), d);
+    var s: f64 = 0;
+    for (h) |v| s += v;
+    return @floatCast(s);
+}
+
+pub const Losses = struct { total: f32, ce: f32 };
+
+/// One window: embedding, the layer stack, the decoder and the losses.
+pub fn forwardWindow(m: *Model, s: *StreamState) !Losses {
+    const c = m.c;
+    const B: usize = @intCast(c.batch);
+    const T: usize = @intCast(c.seqlen);
+    const D: usize = @intCast(c.dim);
+    const E: usize = @intCast(c.experts);
+    const N = B * T;
+    const ND = N * D;
+    const k = m.kernels;
+
+    try ops.embForward(k, m.store.at(m.emb).work, m.ids, m.enc, @intCast(N), c.dim);
+    try gpu.copyDevice(m.X, m.enc, ND * 2);
+    if (c.mem != 0)
+        try memory.encode(k, m.store.at(m.emb).work, m.store.at(m.MS.eprev).work,
+            m.store.at(m.MS.pos).work, m.store.at(m.MS.decay).master, m.store.at(m.MS.gate).master,
+            &m.MS, c.batch, c.mem_len, c.dim);
+    if (c.mla != 0) { // positions advance in lockstep across the streams
+        const hp = try m.gpa.alloc(i64, N);
+        defer m.gpa.free(hp);
+        for (0..B) |b| for (0..T) |t| {
+            hp[b * T + t] = s.position + @as(i64, @intCast(t));
+        };
+        try gpu.upload(m.pos, std.mem.sliceAsBytes(hp));
+    }
+    var aux_acc: f32 = 0;
+    var z_acc: f32 = 0;
+    var Wx: [16][*]bf16 = undefined;
+    for (m.L, 0..) |*ly, l| {
+        try gpu.copyDevice(ly.input, m.X, ND * 2);
+        try gpu.copyDevice(ly.initial, s.carry[l], B * D * 4);
+        const opt = ops.CellOpt{ .ids = @intFromPtr(m.ids), .docsep = c.docsep };
+        const gate: u64 = if (c.gated != 0) @intFromPtr(m.store.at(ly.gate).master) else 0;
+        try ops.stateForward(k, ly.input, ly.S, m.store.at(ly.decay).master,
+            @intFromPtr(ly.initial), c.batch, c.seqlen, c.dim, gate, opt);
+        try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ ly.S, m.Sb, @as(i64, @intCast(ND)) });
+        try ops.layernormFwd(k, m.Sb, m.store.at(ly.gamma).master, m.store.at(ly.beta).master,
+            m.H, ly.mean, ly.rstd, @intCast(N), c.dim);
+        for (0..E) |e| Wx[e] = m.store.at(ly.exp[e]).work;
+        // The residual add is folded into the combine (beta = 1).
+        aux_acc += try moe.forward(k, m.H, m.store.at(ly.router).work, Wx[0..E], m.X,
+            &ly.mc, &m.moeW, N, E, @intCast(c.topk), D, 1.0);
+        if (c.mla != 0 and m.ML[l].use) {
+            const ml = &m.ML[l];
+            try gpu.copyDevice(ml.Xsnap, m.X, ND * 2);
+            try ops.layernormFwd(k, m.X, m.store.at(ml.p.gamma).master, m.store.at(ml.p.beta).master,
+                m.H, ml.mmean, ml.mrstd, @intCast(N), c.dim);
+            const sc = 1.0 / @sqrt(@as(f32, @floatFromInt(c.mla_dh)));
+            try mla.forward(k, m.H, @intCast(N), m.store.at(ml.p.q).work, m.store.at(ml.p.dkv).work,
+                m.store.at(ml.p.kr).work, m.store.at(ml.p.uk).work, m.store.at(ml.p.uv).work,
+                m.store.at(ml.p.o).work, &s.cache[l], &ml.keep, &m.MW, m.M, m.pos,
+                c.batch, c.seqlen, c.mla_heads, c.mla_dh, c.mla_L, c.mla_R, c.mla_cc,
+                c.mla_cache, c.mla_theta, sc, c.dim);
+            try (try k.get("mem_add_bf16")).launch(blocks(ND), 256, .{ m.X, m.M, @as(i64, @intCast(ND)) });
+        }
+        if (c.mem != 0 and m.MEM[l].use) {
+            const me = &m.MEM[l];
+            try memory.forward(k, m.X, me, &m.MS, m.store.at(me.gamma).master, m.store.at(me.beta).master,
+                m.store.at(me.wq).work, m.store.at(me.wk).work, m.store.at(me.wv).work,
+                m.store.at(me.wo).work, m.M, c.batch, c.seqlen, c.mem_len, c.mem_heads, c.mem_dh, c.dim);
+        }
+        const gy: u32 = @intCast(@divTrunc(c.dim + 255, 256));
+        try (try k.get("extract_carry")).launchGrid(@intCast(B), gy, 256,
+            .{ ly.S, s.carry[l], c.batch, c.seqlen, c.dim });
+    }
+    s.position += @intCast(T);
+    if (E > 1) { // one host read for the router statistics of every layer
+        const hs = try m.gpa.alloc(f32, m.L.len * 17);
+        defer m.gpa.free(hs);
+        try gpu.download(std.mem.sliceAsBytes(hs), m.moe_stats.?);
+        for (m.L, 0..) |*ly, l| {
+            aux_acc += moe.auxFrom(&ly.mc, hs[l * 17 ..][0 .. E + 1]);
+            z_acc += ly.mc.zloss;
+        }
+    }
+    try linalg.linearFwd(@intCast(N), 256, c.dim, m.X, m.store.at(m.dec).work, m.logits);
+    try (try k.get("ce_fwd")).launch(blocks(N), 256, .{ m.logits, m.nxt, m.probs, m.losstmp, @as(i32, @intCast(N)) });
+    const ce_out = try hostSum(m.gpa, m.losstmp, N) / @as(f32, @floatFromInt(N));
+
+    // The optional terms each cost one host synchronization and only run when enabled.
+    var stop_mean: f32 = 0;
+    var var_loss: f32 = 0;
+    var mse: f32 = 0;
+    if (c.stop > 0) {
+        try linalg.linearFwd(@intCast(N), 1, c.dim, m.X, m.store.at(m.stop).work, m.stoplog);
+        try (try k.get("stop_fwd")).launch(blocks(N), 256, .{ m.stoplog, m.end, m.losstmp, c.stopposw, @as(i32, @intCast(N)) });
+        stop_mean = try hostSum(m.gpa, m.losstmp, N) / @as(f32, @floatFromInt(N));
+    }
+    if (c.latent > 0) { // against the EMA target embedding of the next byte
+        try ops.embForward(k, m.store.at(m.tgt).work, m.nxt, m.tgtX, @intCast(N), c.dim);
+        try (try k.get("to_f32")).launch(blocks(ND), 256, .{ m.X, m.dXres, @as(i64, @intCast(ND)) });
+        try (try k.get("to_f32")).launch(blocks(ND), 256, .{ m.tgtX, m.dEnc, @as(i64, @intCast(ND)) });
+        try (try k.get("mse_mean")).launch(1, 256, .{ m.dXres, m.dEnc, m.mv, @as(i64, @intCast(ND)) });
+        try gpu.download(std.mem.asBytes(&mse), m.mv);
+    }
+    if (c.@"var" > 0) {
+        var hmv: [2]f32 = undefined;
+        try (try k.get("meanvar")).launch(1, 256, .{ m.X, m.mv, @as(i64, @intCast(ND)) });
+        try gpu.download(std.mem.sliceAsBytes(hmv[0..2]), m.mv);
+        var_loss = @max(0.0, 1.0 - params.sqrtf(hmv[1] + 1e-4));
+    }
+    const total = c.@"var" * var_loss + c.latent * mse + c.ce * ce_out + c.stop * stop_mean +
+        (c.aux * aux_acc + c.zloss * z_acc) / @as(f32, @floatFromInt(m.L.len));
+    try gpu.checkLaunch();
+    return .{ .total = total, .ce = ce_out };
+}
+
+/// The backward pass of the window the forward just computed. With traces=1
+/// it also advances the stream's traces, which only training does.
+pub fn backwardWindow(m: *Model, s: *StreamState) !void {
+    const c = m.c;
+    const B: usize = @intCast(c.batch);
+    const T: usize = @intCast(c.seqlen);
+    const D: usize = @intCast(c.dim);
+    const N = B * T;
+    const ND = N * D;
+    const k = m.kernels;
+    const nd_i64: i64 = @intCast(ND);
+
+    try (try k.get("mt_zero")).launch(@intCast(m.opt.nchunks), 256, .{m.opt}); // all gradients at once
+    const logging = m.log_traces and m.trlog != null;
+    if (logging) try gpu.zero(m.trlog.?, (2 * @as(usize, @intCast(c.layers)) + 256) * D * 4);
+
+    // Rebuild the loss auxiliaries from the activations the forward left.
+    var hmv = [2]f32{ 0, 1 };
+    if (c.@"var" > 0) {
+        try (try k.get("meanvar")).launch(1, 256, .{ m.X, m.mv, nd_i64 });
+        try gpu.download(std.mem.sliceAsBytes(hmv[0..2]), m.mv);
+    }
+    if (c.latent > 0) try (try k.get("to_f32")).launch(blocks(ND), 256, .{ m.tgtX, m.dEnc, nd_i64 });
+
+    try gpu.zero(m.dXres, ND * 4);
+    try (try k.get("ce_bwd")).launch(blocks(N), 256, .{ m.probs, m.nxt, m.dlogits, c.ce, @as(i32, @intCast(N)) });
+    try linalg.linearDW(@intCast(N), 256, c.dim, m.dlogits, m.X, m.store.at(m.dec).grad, 0);
+    try linalg.linearDX(@intCast(N), 256, c.dim, m.dlogits, m.store.at(m.dec).work, m.dXs, 0);
+    try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dXres, nd_i64 });
+    if (m.dXext) |ext| try (try k.get("add_f32")).launch(blocks(ND), 256, .{ m.dXres, ext, nd_i64 });
+    if (c.stop > 0) {
+        try (try k.get("stop_bwd")).launch(blocks(N), 256,
+            .{ m.stoplog, m.end, m.dstop, c.stopposw, c.stop, @as(i32, @intCast(N)) });
+        try linalg.linearDW(@intCast(N), 1, c.dim, m.dstop, m.X, m.store.at(m.stop).grad, 0);
+        try linalg.linearDX(@intCast(N), 1, c.dim, m.dstop, m.store.at(m.stop).work, m.dXs, 0);
+        try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dXres, nd_i64 });
+    }
+    if (c.latent > 0 or c.@"var" > 0)
+        try (try k.get("to_f32")).launch(blocks(ND), 256, .{ m.X, m.dEncTmp, nd_i64 });
+    if (c.latent > 0)
+        try (try k.get("latent_bwd")).launch(blocks(ND), 256, .{ m.dEncTmp, m.dEnc, m.dXres, c.latent, nd_i64 });
+    if (c.@"var" > 0) { // the hinge is active only below unit variance
+        const scl: f32 = if (hmv[1] + 1e-4 >= 1.0) 0.0 else -0.5 / params.sqrtf(hmv[1] + 1e-4) * c.@"var";
+        try (try k.get("var_bwd")).launch(blocks(ND), 256, .{ m.dEncTmp, m.dXres, hmv[0], scl, nd_i64 });
+    }
+    try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ m.dXres, m.dXs, nd_i64 });
+    try gpu.zero(m.dEnc, ND * 4);
+    if (c.mem != 0) try gpu.zero(m.MS.dEnc, B * @as(usize, @intCast(c.mem_len)) * D * 4);
+
+    var Wx: [16][*]bf16 = undefined;
+    var dWx: [16][*]f32 = undefined;
+    var l: usize = m.L.len;
+    while (l > 0) {
+        l -= 1;
+        const ly = &m.L[l];
+        // The memory came last in the forward, so it goes first here.
+        if (c.mem != 0 and m.MEM[l].use) {
+            const me = &m.MEM[l];
+            try memory.backward(k, m.dXs, me, &m.MS, m.store.at(me.gamma).master,
+                m.store.at(me.wq).work, m.store.at(me.wk).work, m.store.at(me.wv).work, m.store.at(me.wo).work,
+                m.store.at(me.gamma).grad, m.store.at(me.beta).grad, m.store.at(me.wq).grad,
+                m.store.at(me.wk).grad, m.store.at(me.wv).grad, m.store.at(me.wo).grad,
+                c.batch, c.seqlen, c.mem_len, c.mem_heads, c.mem_dh, c.dim);
+        }
+        if (c.mla != 0 and m.ML[l].use) {
+            const ml = &m.ML[l];
+            try gpu.copyDevice(m.dM, m.dXs, ND * 2);
+            const sc = 1.0 / @sqrt(@as(f32, @floatFromInt(c.mla_dh)));
+            try mla.backward(k, m.dM, @intCast(N), m.store.at(ml.p.q).work, m.store.at(ml.p.dkv).work,
+                m.store.at(ml.p.kr).work, m.store.at(ml.p.uk).work, m.store.at(ml.p.uv).work,
+                m.store.at(ml.p.o).work, m.store.at(ml.p.q).grad, m.store.at(ml.p.dkv).grad,
+                m.store.at(ml.p.kr).grad, m.store.at(ml.p.uk).grad, m.store.at(ml.p.uv).grad,
+                m.store.at(ml.p.o).grad, &s.cache[l], &ml.keep, &m.MW, m.dH, ml.keep.Xq, m.pos,
+                c.batch, c.seqlen, c.mla_heads, c.mla_dh, c.mla_L, c.mla_R, c.mla_cc,
+                c.mla_theta, sc, c.dim);
+            try ops.layernormBwd(k, ml.Xsnap, m.dH, m.store.at(ml.p.gamma).master, ml.mmean, ml.mrstd,
+                m.dSnorm, m.store.at(ml.p.gamma).grad, m.store.at(ml.p.beta).grad, @intCast(N), c.dim);
+            try (try k.get("mem_add_bf16")).launch(blocks(ND), 256, .{ m.dXs, m.dSnorm, nd_i64 });
+        }
+        // The residual passthrough stays in dXs while the block works on a copy.
+        try gpu.copyDevice(m.dM, m.dXs, ND * 2);
+        const E: usize = @intCast(c.experts);
+        for (0..E) |e| {
+            Wx[e] = m.store.at(ly.exp[e]).work;
+            dWx[e] = m.store.at(ly.exp[e]).grad;
+        }
+        const layers_f: f32 = @floatFromInt(c.layers);
+        try moe.backward(k, m.dM, Wx[0..E], m.store.at(ly.router).work, m.store.at(ly.router).grad,
+            dWx[0..E], m.dH, &ly.mc, &m.moeW, c.aux / layers_f, c.zloss / layers_f);
+        try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ ly.S, m.Sb, nd_i64 });
+        try ops.layernormBwd(k, m.Sb, m.dH, m.store.at(ly.gamma).master, ly.mean, ly.rstd, m.dSnorm,
+            m.store.at(ly.gamma).grad, m.store.at(ly.beta).grad, @intCast(N), c.dim);
+        const gate: u64 = if (c.gated != 0) @intFromPtr(m.store.at(ly.gate).master) else 0;
+        var opt = ops.CellOpt{ .ids = @intFromPtr(m.ids), .docsep = c.docsep, .gamma = c.trace_decay };
+        if (c.traces != 0) {
+            opt.trDec = @intFromPtr(s.tdec[l]);
+            opt.trGate = @intFromPtr(s.tgate[l]);
+            if (l == 0) {
+                opt.lam = @intFromPtr(m.lam);
+                opt.prod = @intFromPtr(m.prod);
+            }
+            if (logging) {
+                opt.logDec = @intFromPtr(m.trlog.? + l * D);
+                opt.logGate = @intFromPtr(m.trlog.? + (@as(usize, @intCast(c.layers)) + l) * D);
+                opt.logEmb = @intFromPtr(m.trlog.? + 2 * @as(usize, @intCast(c.layers)) * D);
+            }
+        }
+        try ops.cellBackward(k, m.dSnorm, ly.S, m.store.at(ly.decay).master, m.dEncTmp,
+            m.store.at(ly.decay).grad, c.batch, c.seqlen, c.dim, ly.input, @intFromPtr(ly.initial),
+            gate, @intFromPtr(m.store.at(ly.gate).grad), opt);
+        if (c.traces != 0 and l == 0)
+            try ops.embTrace(k, ly.input, ly.S, ly.initial, m.store.at(ly.decay).master, gate,
+                s.temb.?, m.store.at(m.emb).grad, c.batch, c.seqlen, c.dim, opt);
+        // Chain into the previous layer, residual passthrough included.
+        try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dEncTmp, nd_i64 });
+        try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ m.dEncTmp, m.dXs, nd_i64 });
+    }
+    if (c.mem != 0)
+        try memory.encodeBackward(k, &m.MS, m.store.at(m.MS.decay).master, m.store.at(m.MS.gate).master,
+            m.store.at(m.MS.decay).grad, m.store.at(m.MS.gate).grad, m.store.at(m.emb).grad,
+            m.store.at(m.MS.eprev).grad, m.store.at(m.MS.pos).grad, c.batch, c.mem_len, c.dim);
+    try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dEnc, nd_i64 });
+    try ops.embBackward(k, m.dEnc, m.ids, m.store.at(m.emb).grad, @intCast(N), c.dim);
+    try gpu.checkLaunch();
+}
+
+/// AdamW over every parameter, with the gradient norm and the clipping
+/// computed on the device; the only host synchronization is the norm itself.
+pub fn optimizerStep(m: *Model, step: i32) !void {
+    const c = m.c;
+    const b1: f32 = 0.9;
+    const b2: f32 = 0.999;
+    const k = m.kernels;
+    try gpu.zeroAsync(@as(*anyopaque, @ptrFromInt(m.opt.sumsq)), 8);
+    try (try k.get("mt_sumsq")).launch(@intCast(m.opt.nchunks), 256, .{m.opt});
+    try (try k.get("mt_adam")).launch(@intCast(m.opt.nchunks), 256, .{
+        m.opt, c.gradclip, lrAt(c, step), b1, b2, @as(f32, 1e-8), @as(f32, 0.01),
+        1.0 - params.powf(b1, @floatFromInt(step + 1)), 1.0 - params.powf(b2, @floatFromInt(step + 1)),
+    });
+    const tgt = m.store.at(m.tgt);
+    const n = blocks(@intCast(tgt.n));
+    try (try k.get("ema")).launch(n, 256, .{ tgt.master, m.store.at(m.emb).master, c.ematau, tgt.n });
+    try (try k.get("copy_bf16")).launch(n, 256, .{ tgt.master, tgt.work, tgt.n });
+    var sumsq: f64 = 0;
+    try gpu.download(std.mem.asBytes(&sumsq), @as(*anyopaque, @ptrFromInt(m.opt.sumsq)));
+    if (!std.math.isFinite(sumsq)) return error.NonFiniteGradient;
+}

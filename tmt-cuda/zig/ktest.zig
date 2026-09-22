@@ -8,6 +8,7 @@ const tmt = @import("tmt.zig");
 const ptx = @import("ptx.zig");
 const config = @import("model/config.zig");
 const model = @import("model/model.zig");
+const checkpoint = @import("model/checkpoint.zig");
 const gpu = @import("model/gpu.zig");
 
 const kernels_ptx = @embedFile("kernels.ptx");
@@ -1272,6 +1273,9 @@ pub fn main(init: std.process.Init) !u8 {
         report("configuration", ok, "");
     }
 
+    // ---- checkpoints: both builds must read what the other wrote ----
+    // (runs after the weight comparison below, which builds the same model)
+
     // ---- the model built in Zig must have the C++ weights ----
     {
         var kernels = try gpu.Kernels.load(gpa, kernels_ptx);
@@ -1332,6 +1336,44 @@ pub fn main(init: std.process.Init) !u8 {
         var mb: [128]u8 = undefined;
         report("model weights", ok and worst == 0,
             std.fmt.bufPrint(&mb, "{d} parameters, largest difference {e:.1} (at {d})", .{ count, worst, worst_at }) catch "");
+
+        // The checkpoint each build writes must load in the other one.
+        var state = try model.buildState(gpa, &mine);
+        defer state.deinit();
+        const path = "zig-out/ktest.ckpt";
+        var pr = checkpoint.Progress{ .step = 5, .cursor = 100, .epoch = 2, .carried = 0,
+            .data_size = 1000, .data_hash = 0x1234 };
+        checkpoint.save(gpa, init.io, path, &mine, &state, &pr) catch |e| {
+            say("  saving failed: {s} ({s})\n", .{ @errorName(e), checkpoint.lastError() });
+            return 1;
+        };
+        // The C++ build loads it: progress and weights must come back unchanged.
+        var their_pr = tmt.Progress{};
+        var cross_ok = tmt.tmt_model_load(theirs, path, &their_pr) == 0;
+        if (!cross_ok) say("  the C++ build rejected the Zig checkpoint: {s}\n", .{tmt.lastError()});
+        cross_ok = cross_ok and their_pr.step == 5 and their_pr.cursor == 100 and
+            their_pr.epoch == 2 and their_pr.data_size == 1000 and their_pr.data_hash == 0x1234;
+        // ... and the other way round.
+        if (tmt.tmt_model_save(theirs, path, &their_pr) != 0) {
+            say("  the C++ build could not save: {s}\n", .{tmt.lastError()});
+            cross_ok = false;
+        }
+        var back = checkpoint.Progress{};
+        checkpoint.load(gpa, init.io, path, &mine, &state, &back) catch |e| {
+            say("  Zig rejected the C++ checkpoint: {s} ({s})\n", .{ @errorName(e), checkpoint.lastError() });
+            cross_ok = false;
+        };
+        cross_ok = cross_ok and back.step == 5 and back.cursor == 100 and back.data_hash == 0x1234;
+        // The configuration must also survive the round trip.
+        const stored = checkpoint.readConfig(gpa, init.io, path) catch |e| blk: {
+            say("  reading the configuration failed: {s}\n", .{@errorName(e)});
+            cross_ok = false;
+            break :blk config.Cfg{};
+        };
+        const a_text = try config.text(gpa, stored);
+        const b_text = try config.text(gpa, c);
+        cross_ok = cross_ok and std.mem.eql(u8, a_text, b_text);
+        report("checkpoint round trip", cross_ok, "written by each build, read by the other");
     }
 
     if (failures == 0) say("ALL KERNEL COMPARISONS PASSED\n", .{});

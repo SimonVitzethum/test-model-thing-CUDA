@@ -72,3 +72,138 @@ pub const Ws = struct {
         w.Xf = try mem.allocT(f32, N * D);
     }
 };
+
+const linalg = @import("linalg.zig");
+
+/// Auxiliary load-balancing loss from the statistics the forward deferred.
+pub fn auxFrom(k: *Keep, hsum: []const f32) f32 {
+    k.zloss = hsum[@intCast(k.E)];
+    var aux: f32 = 0;
+    for (0..@intCast(k.E)) |e|
+        aux += (hsum[e] / @as(f32, @floatFromInt(k.N))) *
+            (@as(f32, @floatFromInt(k.hcnt[e])) / @as(f32, @floatFromInt(k.N * k.K)));
+    return @as(f32, @floatFromInt(k.E)) * aux;
+}
+
+fn blocks(n: usize) u32 {
+    return @intCast((n + 255) / 256);
+}
+
+/// Top-k dispatch, the expert matmuls and the weighted combine. Returns the
+/// auxiliary loss unless the caller collects the statistics itself.
+pub fn forward(kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16, Wexp: []const [*]bf16,
+               Y: [*]bf16, k: *Keep, w: *Ws, N: usize, E: usize, K: usize, D: usize, beta: f32) !f32 {
+    k.N = @intCast(N);
+    k.E = @intCast(E);
+    k.K = @intCast(K);
+    k.D = @intCast(D);
+    const n = N * D;
+    try gpu.copyDevice(k.H, X, n * 2);
+    if (E == 1) {
+        try linalg.linearFwd(@intCast(N), @intCast(D), @intCast(D), X, Wexp[0], k.Yg);
+        try (try kern.get("dense_activation")).launch(blocks(n), 256,
+            .{ k.Yg, @as(u64, 0), Y, @as(i64, @intCast(n)), beta });
+        k.Tk = @intCast(N);
+        return 0;
+    }
+    try (try kern.get("router_topk")).launch(@intCast(N), 64,
+        .{ X, Wrouter, k.logits, k.probs, k.idx, w.w, @as(i32, @intCast(N)), @as(i32, @intCast(E)),
+           @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
+    try gpu.zero(k.counts, E * 4);
+    try (try kern.get("count_experts")).launch(blocks(N), 256,
+        .{ k.idx, k.counts, @as(i32, @intCast(N)), @as(i32, @intCast(K)) });
+    // The offsets are computed on the host; E is small, one synchronization.
+    try gpu.download(std.mem.sliceAsBytes(k.hcnt[0..E]), k.counts);
+    var tk: i32 = 0;
+    var ptk: i32 = 0;
+    for (0..E) |e| {
+        k.hoff[e] = tk;
+        tk += k.hcnt[e];
+    }
+    // Padded to blocks of 128, which keeps the GEMM shapes stable.
+    for (0..E) |e| {
+        k.phoff[e] = ptk;
+        ptk += @divTrunc(k.hcnt[e] + 127, 128) * 128;
+    }
+    k.Tk = tk;
+    k.Ptk = ptk;
+    try gpu.upload(w.cursor, std.mem.sliceAsBytes(k.phoff[0..E]));
+    try (try kern.get("fill_slots")).launch(blocks(N), 256,
+        .{ k.idx, w.w, w.cursor, k.perm, k.slotw, k.slot_of, @as(i32, @intCast(N)), @as(i32, @intCast(K)) });
+    try gpu.zero(w.Xg, @as(usize, @intCast(@max(ptk, 1))) * D * 2);
+    if (tk > 0) {
+        try (try kern.get("gather_slot")).launch(blocks(N * K * D), 256,
+            .{ X, k.slot_of, w.Xg, @as(i32, @intCast(N)), @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
+        for (0..E) |e| {
+            const pm = @divTrunc(k.hcnt[e] + 127, 128) * 128;
+            if (pm == 0) continue;
+            const off: usize = @as(usize, @intCast(k.phoff[e])) * D;
+            try linalg.linearFwd(pm, @intCast(D), @intCast(D), w.Xg + off, Wexp[e], k.Yg + off);
+        }
+    }
+    try (try kern.get("combine")).launch(blocks(N * D), 256,
+        .{ k.Yg, k.slotw, k.slot_of, Y, @as(i32, @intCast(N)), @as(i32, @intCast(K)),
+           @as(i32, @intCast(D)), beta });
+    try (try kern.get("aux_sum")).launch(1, @intCast(E), .{ k.probs, w.sum_p, @as(i32, @intCast(N)), @as(i32, @intCast(E)) });
+    try gpu.zero(w.sum_p + E, 4);
+    try (try kern.get("zloss")).launch(blocks(N), 256,
+        .{ k.logits, w.sum_p + E, @as(i32, @intCast(N)), @as(i32, @intCast(E)) });
+    if (k.stat) |stat| { // deferred: the owner reads every layer at once
+        try gpu.copyDevice(stat, w.sum_p, (E + 1) * 4);
+        k.zloss = 0;
+        return 0;
+    }
+    var hsum: [17]f32 = undefined;
+    try gpu.download(std.mem.sliceAsBytes(hsum[0 .. E + 1]), w.sum_p);
+    return auxFrom(k, hsum[0 .. E + 1]);
+}
+
+/// Backward through combine, the experts and the router, including the
+/// analytic gradients of the balancing terms.
+pub fn backward(kern: *gpu.Kernels, dY: [*]const bf16, Wexp: []const [*]bf16, Wrouter: [*]const bf16,
+                dWrouter: [*]f32, dWexp: []const [*]f32, dX: [*]bf16, k: *Keep, w: *Ws,
+                aux: f32, zcoef: f32) !void {
+    const N: usize = @intCast(k.N);
+    const E: usize = @intCast(k.E);
+    const K: usize = @intCast(k.K);
+    const D: usize = @intCast(k.D);
+    const n = N * D;
+    try gpu.zero(dX, n * 2);
+    try gpu.zero(dWrouter, E * D * 4);
+    if (E == 1) {
+        try (try kern.get("dense_activation")).launch(blocks(n), 256,
+            .{ k.Yg, dY, w.dXg, @as(i64, @intCast(n)), @as(f32, 0) });
+        try linalg.linearDW(@intCast(N), @intCast(D), @intCast(D), w.dXg, k.H, dWexp[0], 0);
+        try linalg.linearDX(@intCast(N), @intCast(D), @intCast(D), w.dXg, Wexp[0], dX, 0);
+        return;
+    }
+    if (k.Tk == 0) return;
+    // Recompute the gathered inputs from the kept layer input.
+    const padded: usize = @intCast(@max(k.Ptk, 1));
+    try gpu.zero(w.Xg, padded * D * 2);
+    try (try kern.get("gather_slot")).launch(blocks(N * K * D), 256,
+        .{ k.H, k.slot_of, w.Xg, @as(i32, @intCast(N)), @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
+    // The padded expert-output gradient is zeroed before combine fills it.
+    try gpu.zero(w.dYg, padded * D * 2);
+    try (try kern.get("combine_bwd")).launch(blocks(N * K * D), 256,
+        .{ dY, k.Yg, k.slotw, k.slot_of, w.dYg, @as(u64, 0), @as(i32, @intCast(N)),
+           @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
+    try (try kern.get("sdot")).launch(@intCast(N * K), 256,
+        .{ dY, k.Yg, k.slot_of, w.s_j, @as(i32, @intCast(N)), @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
+    try (try kern.get("router_bwd")).launch(blocks(N), 256,
+        .{ k.probs, k.idx, w.s_j, w.dlogits, @as(i32, @intCast(N)), @as(i32, @intCast(E)),
+           @as(i32, @intCast(K)), k.logits, k.counts, aux, zcoef });
+    try (try kern.get("copy_bf16")).launch(blocks(N * E), 256, .{ w.dlogits, w.dlog_b, @as(i64, @intCast(N * E)) });
+    try linalg.linearDW(@intCast(N), @intCast(E), @intCast(D), w.dlog_b, k.H, dWrouter, 0);
+    // The router's input gradient accumulates into dX.
+    try linalg.linearDX(@intCast(N), @intCast(E), @intCast(D), w.dlog_b, Wrouter, dX, 1);
+    for (0..E) |e| {
+        const pm = @divTrunc(k.hcnt[e] + 127, 128) * 128;
+        if (pm == 0) continue;
+        const off: usize = @as(usize, @intCast(k.phoff[e])) * D;
+        try linalg.linearDW(pm, @intCast(D), @intCast(D), w.dYg + off, w.Xg + off, dWexp[e], 0);
+        try linalg.linearDX(pm, @intCast(D), @intCast(D), w.dYg + off, Wexp[e], w.dXg + off, 0);
+    }
+    try (try kern.get("scatter_add")).launch(blocks(N * D), 256,
+        .{ w.dXg, k.slot_of, dX, @as(i32, @intCast(N)), @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
+}
