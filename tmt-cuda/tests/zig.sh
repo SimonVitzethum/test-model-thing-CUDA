@@ -4,7 +4,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 Z=zig-out/bin
-for t in dialogprep kgprep sample chat train; do
+for t in dialogprep kgprep sample chat train gradcheck; do
     test -x "$Z/$t" || { echo "missing $Z/$t (run: zig build)"; exit 1; }
     test -x "./$t" || { echo "missing ./$t (run: make)"; exit 1; }
 done
@@ -68,6 +68,14 @@ for args in "dim=999999999" "bogus=1" "steps=-2" "noequals"; do
     diff "$work/c.err" "$work/z.err"
 done
 
+# ---- gradient comparison: identical report ----
+./gradcheck "$work/data" "$work/c.ckpt" len=256 window=64 seqs=2 > "$work/c.gc" 2>&1
+$Z/gradcheck "$work/data" "$work/c.ckpt" len=256 window=64 seqs=2 > "$work/z.gc" 2>&1
+cmp "$work/c.gc" "$work/z.gc"
+./gradcheck "$work/data" "$work/c.ckpt" len=100 window=64 > "$work/c.gc" 2>&1 || true
+$Z/gradcheck "$work/data" "$work/c.ckpt" len=100 window=64 > "$work/z.gc" 2>&1 || true
+cmp "$work/c.gc" "$work/z.gc"
+
 # ---- generation: identical bytes ----
 for args in "temp=0 maxlen=40" "temp=0.8 maxlen=60 seed=5"; do
     ./sample "$work/c.ckpt" "abc" $args > "$work/c.out" 2>&1
@@ -78,4 +86,4 @@ printf 'hello\n/temp 0.4\nmore\n/reset\nagain\n' > "$work/chat.in"
 ./chat "$work/c.ckpt" maxlen=30 seed=2 < "$work/chat.in" > "$work/c.chat" 2>&1
 $Z/chat "$work/c.ckpt" maxlen=30 seed=2 < "$work/chat.in" > "$work/z.chat" 2>&1
 cmp "$work/c.chat" "$work/z.chat"
-echo 'PASS Zig: data tools byte-identical, training log/checkpoint, resume, eval, errors, sample and chat match the C++ build'
+echo 'PASS Zig: data tools byte-identical, training log/checkpoint, resume, eval, errors, gradcheck, sample and chat match the C++ build'

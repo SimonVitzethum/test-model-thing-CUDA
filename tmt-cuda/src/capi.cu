@@ -174,6 +174,32 @@ int tmt_model_state_buckets(tmt_model* h, double* sum, int64_t* count) {
         }
     });
 }
+int tmt_model_param_count(const tmt_model* m) { return (int)m->m.params.values.size(); }
+long tmt_model_param_size(const tmt_model* m, int j) { return m->m.params.values.at(j).n; }
+const char* tmt_model_param_group(const tmt_model* h, int j) {
+    const Model& m = h->m; size_t p = (size_t)j;
+    if (p == m.emb) return "embedding";
+    if (p == m.dec) return "decoder";
+    for (int l = 0; l < m.c.layers; ++l) {
+        const Layer& L = m.L[l];
+        if (p == L.decay) return "decay";
+        if (p == L.gate && m.c.gated) return "gate";
+        if (p == L.gamma || p == L.beta) return "norm";
+        if (p == L.router && m.c.experts > 1) return "router";
+        for (int e = 0; e < m.c.experts; ++e) if (p == L.exp[e]) return "experts";
+        if (m.ML[l].use) {
+            const MlaP& q = m.ML[l].p;
+            for (size_t id : {q.q, q.dkv, q.kr, q.uk, q.uv, q.o, q.gamma, q.beta}) if (p == id) return "mla";
+        }
+    }
+    return "";
+}
+int tmt_model_param_grad(tmt_model* m, int j, float* out) {
+    return guard([&] {
+        const Par& p = m->m.params.values.at(j);
+        CUDA_CHECK(cudaMemcpy(out, p.grad, p.n * 4, cudaMemcpyDeviceToHost));
+    });
+}
 int tmt_synchronize(void) { return guard([&] { CUDA_CHECK(cudaDeviceSynchronize()); }); }
 
 static volatile sig_atomic_t stop_flag = 0;

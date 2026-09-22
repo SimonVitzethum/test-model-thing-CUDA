@@ -56,6 +56,12 @@ int tmt_model_expert_counts(const tmt_model* m, int64_t* out /* layers*experts *
 int tmt_model_trace_stats(tmt_model* m, double* out);
 /* Mean |state| per half-life bucket (<16, <128, <1k, <8k, >=8k). */
 int tmt_model_state_buckets(tmt_model* m, double* sum /* 5 */, int64_t* count /* 5 */);
+/* Parameters, for the gradient comparison: `group` is one of decay, gate,
+   embedding, norm, router, experts, decoder, mla or "" (ungrouped). */
+int tmt_model_param_count(const tmt_model* m);
+long tmt_model_param_size(const tmt_model* m, int j);
+const char* tmt_model_param_group(const tmt_model* m, int j);
+int tmt_model_param_grad(tmt_model* m, int j, float* out);
 int tmt_synchronize(void);
 
 /* SIGINT/SIGTERM set a flag instead of terminating. */
