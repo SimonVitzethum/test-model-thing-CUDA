@@ -144,7 +144,7 @@ pub fn forward(kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16, Wex
     try (try kern.get("combine")).launch(blocks(N * D), 256,
         .{ k.Yg, k.slotw, k.slot_of, Y, @as(i32, @intCast(N)), @as(i32, @intCast(K)),
            @as(i32, @intCast(D)), beta });
-    try (try kern.get("aux_sum")).launch(1, @intCast(E), .{ k.probs, w.sum_p, @as(i32, @intCast(N)), @as(i32, @intCast(E)) });
+    try (try kern.get("aux_sum")).launch(@intCast(E), 256, .{ k.probs, w.sum_p, @as(i32, @intCast(N)), @as(i32, @intCast(E)) });
     try gpu.zero(w.sum_p + E, 4);
     try (try kern.get("zloss")).launch(blocks(N), 256,
         .{ k.logits, w.sum_p + E, @as(i32, @intCast(N)), @as(i32, @intCast(E)) });

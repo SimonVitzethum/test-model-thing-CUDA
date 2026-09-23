@@ -29,7 +29,7 @@ fn blocks(n: usize) u32 {
 }
 
 pub fn embForward(k: *gpu.Kernels, W: [*]const bf16, ids: [*]const i32, out: [*]bf16, N: i32, D: i32) !void {
-    try (try k.get("emb_gather")).launch(blocks(@intCast(N)), 256, .{ W, ids, out, N, D });
+    try (try k.get("emb_gather")).launch(blocks(@intCast(N * D)), 256, .{ W, ids, out, N, D });
 }
 /// The deterministic form: one thread per (byte, channel), summing the
 /// segment the host sorted for it.

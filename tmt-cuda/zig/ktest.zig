@@ -148,7 +148,7 @@ pub fn main(init: std.process.Init) !u8 {
         const ref = try gpa.alloc(u16, n);
         try Dev.down(bytesOf(u16, ref), d_emb);
         const k = try mod.get("emb_gather");
-        try k.launch((N + 255) / 256, 256, .{ d_tab_bf, d_ids, d_emb, @as(i32, N), @as(i32, D) });
+        try k.launch((N * D + 255) / 256, 256, .{ d_tab_bf, d_ids, d_emb, @as(i32, N), @as(i32, D) });
         const mine = try gpa.alloc(u16, n);
         try Dev.down(bytesOf(u16, mine), d_emb);
         report("emb_gather", std.mem.eql(u16, ref, mine), "");
@@ -837,7 +837,7 @@ pub fn main(init: std.process.Init) !u8 {
         const auxB = try gpa.alloc(f32, E);
         if (tmt.tmt_ref_aux_sum(@ptrCast(@alignCast(d_rp)), @ptrCast(@alignCast(d_sump)), R, E) != 0) return error.Ref;
         try Dev.down(bytesOf(f32, auxA), d_sump);
-        try (try mod.get("aux_sum")).launch(1, 32, .{ d_rp, d_sump, @as(i32, R), @as(i32, E) });
+        try (try mod.get("aux_sum")).launch(E, 256, .{ d_rp, d_sump, @as(i32, R), @as(i32, E) });
         try Dev.down(bytesOf(f32, auxB), d_sump);
         const d_z = try Dev.alloc(4);
         var zA: f32 = 0;
@@ -850,8 +850,13 @@ pub fn main(init: std.process.Init) !u8 {
         try Dev.down(std.mem.asBytes(&zB), d_z);
         var zb: [96]u8 = undefined;
         const zrel = @abs(zA - zB) / @max(@abs(zA), 1e-30);
-        report("aux sums + z-loss", std.mem.eql(f32, auxA, auxB) and zrel < 1e-6,
-            std.fmt.bufPrint(&zb, "z-loss within {e:.1} (atomic order)", .{zrel}) catch "");
+        // Both sums are reported values, not gradients: the auxiliary sum now
+        // reduces over a block instead of walking the window in one thread,
+        // and the z-loss ends in an atomic add.
+        var arel: f32 = 0;
+        for (auxA, auxB) |v, other| arel = @max(arel, @abs(v - other) / @max(@abs(v), 1e-30));
+        report("aux sums + z-loss", arel < 1e-5 and zrel < 1e-6,
+            std.fmt.bufPrint(&zb, "sums within {e:.1}, z-loss within {e:.1}", .{ arel, zrel }) catch "");
     }
 
     // ---- fact memory (cross-attention over the retrieved facts) ----

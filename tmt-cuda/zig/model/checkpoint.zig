@@ -165,7 +165,7 @@ fn header(f: *File, cfg: *cfgmod.Cfg) !void {
         } else if (!std.mem.eql(u8, key, "traces") and !std.mem.eql(u8, key, "trace_decay") and
             !std.mem.eql(u8, key, "docsep") and !std.mem.eql(u8, key, "dialog") and
             !std.mem.startsWith(u8, key, "mem") and !std.mem.startsWith(u8, key, "mtp") and
-            !std.mem.startsWith(u8, key, "muon") and !std.mem.startsWith(u8, key, "mup") and !std.mem.startsWith(u8, key, "patch"))
+            !std.mem.startsWith(u8, key, "muon") and !std.mem.startsWith(u8, key, "mup") and !std.mem.startsWith(u8, key, "patch") and !std.mem.eql(u8, key, "accum"))
         {
             return fail("checkpoint configuration schema mismatch", .{});
         }

@@ -134,6 +134,11 @@ pub const Model = struct {
     log_traces: bool = false,
     /// Optional external gradient on the final representation (retrieval loss).
     dXext: ?[*]f32 = null,
+    /// Factor on every loss gradient. Accumulating over `accum` windows before
+    /// an update means each window contributes its share, not its full weight.
+    grad_scale: f32 = 1,
+    /// Whether this window starts a fresh accumulation.
+    clear_grads: bool = true,
     opt: MTParams = .{},
     /// The weights Muon updates instead of AdamW, with its scratch.
     muon_params: []usize = &.{},
@@ -530,7 +535,9 @@ fn buildOptTable(m: *Model) !void {
         const unused_stop = i == m.stop and m.c.stop == 0;
         // Muon weights still count towards the gradient norm, but AdamW skips them.
         const adam = !frozen and !unused_stop and !isMuonParam(m, i);
-        flags[i] = (if (frozen) @as(u8, 0) else 1) | (if (adam) @as(u8, 2) else 0);
+        // bit 2: updated by AdamW, bit 4: Muon owns it and clears it itself.
+        flags[i] = (if (frozen) @as(u8, 0) else 1) | (if (adam) @as(u8, 2) else 0) |
+            (if (isMuonParam(m, i)) @as(u8, 4) else 0);
         lrmul[i] = mupScale(m, i);
         var s: i64 = 0;
         while (s < p.n) : (s += MT_CHUNK) {
@@ -990,7 +997,7 @@ fn layersBackward(m: *Model, s: *StreamState, from: usize, to: usize, dstream: [
         }
         const layers_f: f32 = @floatFromInt(c.layers);
         try moe.backward(k, m.dM, Wx[0..E], m.store.at(ly.router).work, m.store.at(ly.router).grad,
-            dWx[0..E], m.dH, &ly.mc, &m.moeW, c.aux / layers_f, c.zloss / layers_f);
+            dWx[0..E], m.dH, &ly.mc, &m.moeW, c.aux / layers_f * m.grad_scale, c.zloss / layers_f * m.grad_scale);
         try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ ly.S, m.Sb, nd_i64 });
         try ops.layernormBwd(k, m.Sb, m.dH, m.store.at(ly.gamma).master, ly.mean, ly.rstd, m.dSnorm,
             m.store.at(ly.gamma).grad, m.store.at(ly.beta).grad, @intCast(N), c.dim);
@@ -1039,7 +1046,10 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
     const k = m.kernels;
     const nd_i64: i64 = @intCast(ND);
 
-    try (try k.get("mt_zero")).launch(@intCast(m.opt.nchunks), 256, .{m.opt}); // all gradients at once
+    // The gradients are cleared by the optimizer as it consumes them, so a
+    // window only clears them itself when it starts a fresh accumulation
+    // after something else wrote into them (a resumed run, a refused step).
+    if (m.clear_grads) try (try k.get("mt_zero")).launch(@intCast(m.opt.nchunks), 256, .{m.opt});
     const logging = m.log_traces and m.trlog != null;
     if (logging) try gpu.zero(m.trlog.?, (2 * @as(usize, @intCast(c.layers)) + 256) * D * 4);
 
@@ -1052,7 +1062,8 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
     if (c.latent > 0) try (try k.get("to_f32")).launch(blocks(ND), 256, .{ m.tgtX, m.dEnc, nd_i64 });
 
     try gpu.zero(m.dXres, ND * 4);
-    try (try k.get("ce_bwd")).launch(blocks(N), 256, .{ m.probs, m.nxt, m.dlogits, c.ce, @as(i32, @intCast(N)) });
+    const gs = m.grad_scale;
+    try (try k.get("ce_bwd")).launch(blocks(N), 256, .{ m.probs, m.nxt, m.dlogits, c.ce * gs, @as(i32, @intCast(N)) });
     try linalg.linearDW(@intCast(N), 256, c.dim, m.dlogits, m.X, m.store.at(m.dec).grad, 0);
     try linalg.linearDX(@intCast(N), 256, c.dim, m.dlogits, m.store.at(m.dec).work, m.dXs, 0);
     try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dXres, nd_i64 });
@@ -1061,7 +1072,7 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
         const targets = m.nxt_mtp + head * N;
         const dlogits = m.logits_mtp + head * N * 256; // reused as the head's gradient
         try (try k.get("ce_bwd")).launch(blocks(N), 256,
-            .{ probs, targets, dlogits, c.ce * c.mtp_weight, @as(i32, @intCast(N)) });
+            .{ probs, targets, dlogits, c.ce * c.mtp_weight * gs, @as(i32, @intCast(N)) });
         try linalg.linearDW(@intCast(N), 256, c.dim, dlogits, m.X, m.store.at(p).grad, 0);
         try linalg.linearDX(@intCast(N), 256, c.dim, dlogits, m.store.at(p).work, m.dXs, 0);
         try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dXres, nd_i64 });
@@ -1069,7 +1080,7 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
     if (m.dXext) |ext| try (try k.get("add_f32")).launch(blocks(ND), 256, .{ m.dXres, ext, nd_i64 });
     if (c.stop > 0) {
         try (try k.get("stop_bwd")).launch(blocks(N), 256,
-            .{ m.stoplog, m.end, m.dstop, c.stopposw, c.stop, @as(i32, @intCast(N)) });
+            .{ m.stoplog, m.end, m.dstop, c.stopposw, c.stop * gs, @as(i32, @intCast(N)) });
         try linalg.linearDW(@intCast(N), 1, c.dim, m.dstop, m.X, m.store.at(m.stop).grad, 0);
         try linalg.linearDX(@intCast(N), 1, c.dim, m.dstop, m.store.at(m.stop).work, m.dXs, 0);
         try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dXres, nd_i64 });
@@ -1077,9 +1088,9 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
     if (c.latent > 0 or c.@"var" > 0)
         try (try k.get("to_f32")).launch(blocks(ND), 256, .{ m.X, m.dEncTmp, nd_i64 });
     if (c.latent > 0)
-        try (try k.get("latent_bwd")).launch(blocks(ND), 256, .{ m.dEncTmp, m.dEnc, m.dXres, c.latent, nd_i64 });
+        try (try k.get("latent_bwd")).launch(blocks(ND), 256, .{ m.dEncTmp, m.dEnc, m.dXres, c.latent * gs, nd_i64 });
     if (c.@"var" > 0) { // the hinge is active only below unit variance
-        const scl: f32 = if (hmv[1] + 1e-4 >= 1.0) 0.0 else -0.5 / params.sqrtf(hmv[1] + 1e-4) * c.@"var";
+        const scl: f32 = if (hmv[1] + 1e-4 >= 1.0) 0.0 else -0.5 / params.sqrtf(hmv[1] + 1e-4) * c.@"var" * gs;
         try (try k.get("var_bwd")).launch(blocks(ND), 256, .{ m.dEncTmp, m.dXres, hmv[0], scl, nd_i64 });
     }
     try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ m.dXres, m.dXs, nd_i64 });

@@ -72,9 +72,17 @@ pub const Session = struct {
             .{ s.m.logits, s.m.nxt, s.m.probs, s.m.losstmp, @as(i32, @intCast(N)) });
         try gpu.download(std.mem.sliceAsBytes(out), s.m.losstmp);
     }
-    pub fn backward(s: *Session, log_traces: bool) !void {
+    /// `first` starts a fresh accumulation (the gradients are cleared) and
+    /// `of` is how many windows will be added up before the update, which
+    /// scales each window's contribution.
+    pub fn backwardAccumulating(s: *Session, log_traces: bool, first: bool, of: i32) !void {
         s.m.log_traces = log_traces;
+        s.m.clear_grads = first;
+        s.m.grad_scale = 1.0 / @as(f32, @floatFromInt(of));
         try model.backwardWindow(&s.m, &s.state);
+    }
+    pub fn backward(s: *Session, log_traces: bool) !void {
+        try s.backwardAccumulating(log_traces, true, 1);
     }
     pub fn optimizerStep(s: *Session, step: i32) !void {
         try model.optimizerStep(&s.m, step);

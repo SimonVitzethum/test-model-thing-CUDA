@@ -67,4 +67,6 @@ pub fn step(k: *gpu.Kernels, w: *Ws, p: params.Par, x: [*]f32, lr: f32, wd: f32)
     // The published scaling keeps the update's size independent of the shape.
     const scale = params.sqrtf(@floatFromInt(@max(rows, cols)));
     try (try k.get("muon_update")).launch(blocks(n), 256, .{ p.master, w.xb, p.work, lr, scale, wd, p.n });
+    // AdamW clears the gradients it consumes; these belong to Muon.
+    try gpu.zeroAsync(p.grad, n * 4);
 }

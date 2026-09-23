@@ -5,18 +5,17 @@ const cuda = @import("cuda.zig");
 const bf16 = cuda.bf16;
 
 // ---- src/emb.cu ----
-/// Embedding gather: one row of the table per position, zero for ignored targets.
+/// Embedding gather: one row of the table per position, zero for ignored
+/// targets. One thread per element rather than per row, so that neighbouring
+/// threads read and write neighbouring addresses.
 export fn emb_gather(W: cuda.ConstGlobal(bf16), ids: cuda.ConstGlobal(i32), out: cuda.Global(bf16),
                      N: i32, D: i32) callconv(.nvptx_kernel) void {
-    const i = cuda.globalIdX();
-    if (i >= @as(u32, @bitCast(N))) return;
-    const d = out + @as(usize, i) * @as(usize, @intCast(D));
-    if (ids[i] < 0) {
-        for (0..@intCast(D)) |dd| d[dd] = cuda.f2bf(0);
-        return;
-    }
-    const s = W + @as(usize, @intCast(ids[i])) * @as(usize, @intCast(D));
-    for (0..@intCast(D)) |dd| d[dd] = s[dd];
+    const i: i64 = @intCast(cuda.globalIdX());
+    if (i >= @as(i64, N) * D) return;
+    const d = @rem(i, D);
+    const row = @divTrunc(i, D);
+    const id = ids[@intCast(row)];
+    out[@intCast(i)] = if (id < 0) cuda.f2bf(0) else W[@intCast(@as(i64, id) * D + d)];
 }
 
 /// Embedding scatter: accumulate the fp32 gradients into the table.
@@ -451,7 +450,17 @@ export fn mt_sumsq(P: MTParams) callconv(.nvptx_kernel) void {
 export fn mt_adam(P: MTParams, clip: f32, lr: f32, b1: f32, b2: f32, eps: f32, wd: f32,
                   bc1: f32, bc2: f32) callconv(.nvptx_kernel) void {
     const c = P.chunks[cuda.blockIdxX()];
-    if (P.flags[@intCast(c.param)] & 2 == 0) return;
+    // Chunks this kernel does not update (the frozen target, an unused stop
+    // head, the weights Muon owns) still need their gradient cleared, which
+    // used to be a separate pass over every parameter.
+    if (P.flags[@intCast(c.param)] & 2 == 0) {
+        if (P.flags[@intCast(c.param)] & 4 == 0) {
+            const g = P.grad[@intCast(c.param)] + @as(usize, @intCast(c.start));
+            var j = cuda.threadIdxX();
+            while (j < @as(u32, @bitCast(c.len))) : (j += cuda.blockDimX()) g[j] = 0;
+        }
+        return;
+    }
     const s = P.sumsq[0];
     if (!(s - s == 0)) return; // non-finite
     const scale: f32 = if (clip > 0) cuda.__nv_fminf(1, cuda.fdiv(clip, cuda.__nv_fmaxf(@floatCast(@sqrt(s)), 1e-12))) else 1;
@@ -459,7 +468,7 @@ export fn mt_adam(P: MTParams, clip: f32, lr: f32, b1: f32, b2: f32, eps: f32, w
     const master = P.master[@intCast(c.param)] + at;
     const m = P.m[@intCast(c.param)] + at;
     const v = P.v[@intCast(c.param)] + at;
-    const grad = P.grad[@intCast(c.param)] + at;
+    const grad: cuda.Global(f32) = P.grad[@intCast(c.param)] + at;
     const work = P.work[@intCast(c.param)] + at;
     const step_lr = lr * P.lrmul[@intCast(c.param)];
     var i = cuda.threadIdxX();
@@ -469,6 +478,7 @@ export fn mt_adam(P: MTParams, clip: f32, lr: f32, b1: f32, b2: f32, eps: f32, w
         const nv = b2 * v[i] + (1.0 - b2) * g * g;
         m[i] = nm;
         v[i] = nv;
+        grad[i] = 0; // consumed; the next window accumulates into it again
         const w = master[i] - step_lr * (cuda.fdiv(cuda.fdiv(nm, bc1), cuda.fsqrt(cuda.fdiv(nv, bc2)) + eps) + wd * master[i]);
         master[i] = w;
         work[i] = cuda.f2bf(w);
@@ -734,13 +744,25 @@ export fn to_f32(s: cuda.ConstGlobal(bf16), d: cuda.Global(f32), n: i64) callcon
     if (i < n) d[@intCast(i)] = cuda.bf2f(s[@intCast(i)]);
 }
 
-/// Switch auxiliary loss: the summed probabilities per expert.
+/// Switch auxiliary loss: the summed probabilities per expert. One block per
+/// expert, because a single block of E threads left the machine idle while it
+/// walked the whole window.
 export fn aux_sum(probs: cuda.ConstGlobal(f32), sum_p: cuda.Global(f32), N: i32, E: i32) callconv(.nvptx_kernel) void {
-    const e = cuda.threadIdxX();
+    const e = cuda.blockIdxX();
     if (e >= @as(u32, @bitCast(E))) return;
+    const t = cuda.threadIdxX();
+    const stride = cuda.blockDimX();
     var acc: f32 = 0;
-    for (0..@intCast(N)) |r| acc += probs[r * @as(usize, @intCast(E)) + e];
-    sum_p[e] = acc;
+    var r = t;
+    while (r < @as(u32, @bitCast(N))) : (r += stride) acc += probs[@as(usize, r) * @as(usize, @intCast(E)) + e];
+    ln_buf[t] = acc;
+    cuda.syncThreads();
+    var half = stride / 2;
+    while (half > 0) : (half >>= 1) {
+        if (t < half) ln_buf[t] += ln_buf[t + half];
+        cuda.syncThreads();
+    }
+    if (t == 0) sum_p[e] = ln_buf[0];
 }
 
 /// z-loss: mean(lse^2) over the rows.

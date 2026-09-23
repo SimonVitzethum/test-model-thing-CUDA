@@ -18,6 +18,7 @@
     F(float, stopposw, 20.f) F(float, ematau, .99f) F(float, gradclip, 1.f) \
     F(int, maxcarry, 0) F(int, seed, 1234) F(int, traces, 0) F(float, trace_decay, 1.f) F(int, docsep, -1) F(int, dialog, 0) \
     F(int, patch, 0) F(int, patch_lo, 2) F(int, patch_hi, 0) F(int, patch_max, 32) F(int, patch_decay, 0) \
+    F(int, accum, 1) \
     F(int, mup, 0) F(int, mup_base, 256) F(int, muon, 0) F(float, muon_lr, .02f) \
     F(int, mtp, 0) F(float, mtp_weight, .3f) \
     F(int, mem, 0) F(int, mem_len, 256) F(int, mem_heads, 4) F(int, mem_dh, 32) F(int, mem_every, 2) F(int, mem_rdim, 0) \
@@ -73,8 +74,8 @@ static void validate_cfg(const Cfg& c) {
     // Patching, mup, Muon and multi-token prediction live in the Zig build.
     // The keys exist here so both builds write the same configuration text,
     // but switching them on would silently train a different model.
-    require(c.patch == 0 && c.patch_hi == 0 && c.mup == 0 && c.muon == 0 && c.mtp == 0,
-            "patch, mup, muon and mtp need the Zig build");
+    require(c.patch == 0 && c.patch_hi == 0 && c.mup == 0 && c.muon == 0 && c.mtp == 0 && c.accum == 1,
+            "patch, mup, muon, mtp and accum need the Zig build");
     require(c.mem == 0 || c.mem == 1, "mem must be 0 or 1");
     if (c.mem) {
         require(c.mem_len > 0 && c.mem_len <= 4096 && c.mem_heads > 0 && c.mem_dh > 0 &&

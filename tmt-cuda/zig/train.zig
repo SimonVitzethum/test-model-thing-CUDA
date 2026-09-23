@@ -174,6 +174,9 @@ fn run(init: std.process.Init, out: Out) !void {
     if (!evaluation and (progress.cursor % T != 0 or progress.cursor > ((per - 1) / T) * T))
         return fail("invalid checkpoint dataset cursor", .{});
     const mtp: usize = @intCast(cfgInt(text, "mtp"));
+    // Windows added up before one optimizer update. The update is the
+    // expensive part at this model size, so doing it less often pays.
+    const accum: u64 = @intCast(@max(1, cfgInt(text, "accum")));
     const ids = try arena.alloc(c_int, N);
     const targets = try arena.alloc(c_int, N);
     const ends = try arena.alloc(c_int, N);
@@ -273,7 +276,8 @@ fn run(init: std.process.Init, out: Out) !void {
             if (!std.math.isFinite(loss)) return fail("non-finite loss; update refused", .{});
             const diagnostics = (progress.step + 1) % 100 == 0;
             const log_traces = traces and diagnostics;
-            sess.backward(log_traces) catch return gpuFail();
+            const first = progress.step % accum == 0;
+            sess.backwardAccumulating(log_traces, first, @intCast(accum)) catch return gpuFail();
             if (log_traces) {
                 var s: [9]f64 = undefined;
                 sess.traceStats(&s) catch return gpuFail();
@@ -298,10 +302,11 @@ fn run(init: std.process.Init, out: Out) !void {
                     try out.print(" h%s n=%ld |s|=%.3g", .{ names[k].ptr, @as(c_long, @intCast(@divTrunc(cnt[k], @as(i64, @intCast(B))))), sum[k] / @as(f64, @floatFromInt(cnt[k])) });
                 try out.print("\n", .{});
             }
-            sess.optimizerStep(@intCast(progress.step)) catch |e| return if (e == error.NonFiniteGradient)
-                fail("non-finite gradient; update refused", .{})
-            else
-                gpuFail();
+            if ((progress.step + 1) % accum == 0)
+                sess.optimizerStep(@intCast(progress.step / accum)) catch |e| return if (e == error.NonFiniteGradient)
+                    fail("non-finite gradient; update refused", .{})
+                else
+                    gpuFail();
             ce_sum += ce * @as(f32, @floatFromInt(count)); // float product, as in C++ (ce * count)
         }
         if (!std.math.isFinite(ce_sum)) return fail("non-finite evaluation score", .{});
