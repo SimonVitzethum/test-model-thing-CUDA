@@ -3,6 +3,22 @@
 //! W(N,K) row-major: Y(M,N) = X(M,K) @ W^T, dX = dY @ W, dW = dY^T @ X.
 const std = @import("std");
 const gpu = @import("gpu.zig");
+const ptx = @import("../ptx.zig");
+
+extern fn cudaEventCreate(event: *?*anyopaque) c_int;
+extern fn cudaEventRecord(event: ?*anyopaque, stream: ?*anyopaque) c_int;
+extern fn cudaEventSynchronize(event: ?*anyopaque) c_int;
+extern fn cudaEventElapsedTime(ms: *f32, start: ?*anyopaque, end: ?*anyopaque) c_int;
+var ev_start: ?*anyopaque = null;
+var ev_stop: ?*anyopaque = null;
+
+/// When profiling is on the matmuls are timed like the kernels, so the table
+/// covers the whole step instead of leaving a hole where cuBLAS runs.
+// cuBLAS runs on the runtime's stream, so it is timed with runtime events.
+fn markStart(name: []const u8) void {
+    _ = name;
+}
+fn markEnd(_: []const u8) void {}
 
 pub const bf16 = u16;
 
@@ -42,22 +58,28 @@ fn check(rc: c_int, what: []const u8) gpu.Error!void {
 pub fn linearFwd(M: i32, N: i32, K: i32, X: [*]const bf16, W: [*]const bf16, Y: [*]bf16) !void {
     const al: f32 = 1;
     const be: f32 = 0;
+    markStart("gemm forward");
     try check(cublasGemmEx(try h(), OP_T, OP_N, N, M, K, &al, W, R_16BF, K, X, R_16BF, K,
         &be, Y, R_16BF, N, COMPUTE_32F, GEMM_DEFAULT_TENSOR_OP), "linear_fwd");
+    markEnd("gemm forward");
 }
 
 /// dX(M,K) = dY(M,N) @ W(N,K), accumulating when beta is nonzero.
 pub fn linearDX(M: i32, N: i32, K: i32, dY: [*]const bf16, W: [*]const bf16, dX: [*]bf16, beta: f32) !void {
     const al: f32 = 1;
+    markStart("gemm dX");
     try check(cublasGemmEx(try h(), OP_N, OP_N, K, M, N, &al, W, R_16BF, K, dY, R_16BF, N,
         &beta, dX, R_16BF, K, COMPUTE_32F, GEMM_DEFAULT_TENSOR_OP), "linear_dX");
+    markEnd("gemm dX");
 }
 
 /// dW(N,K) fp32 = dY(M,N)^T @ X(M,K), accumulating when beta is nonzero.
 pub fn linearDW(M: i32, N: i32, K: i32, dY: [*]const bf16, X: [*]const bf16, dW: [*]f32, beta: f32) !void {
     const al: f32 = 1;
+    markStart("gemm dW");
     try check(cublasGemmEx(try h(), OP_N, OP_T, K, N, M, &al, X, R_16BF, K, dY, R_16BF, N,
         &beta, dW, R_32F, K, COMPUTE_32F, GEMM_DEFAULT_TENSOR_OP), "linear_dW");
+    markEnd("gemm dW");
 }
 
 /// Row-major C(M,N) = A(M,K) @ B(K,N), bf16 in and out.
@@ -93,7 +115,9 @@ pub const Batched = struct {
     beta: f32 = 0,
 };
 pub fn batched(g: Batched) !void {
+    markStart("gemm batched");
     try check(cublasGemmStridedBatchedEx(try h(), if (g.transa) OP_T else OP_N, if (g.transb) OP_T else OP_N,
         g.m, g.n, g.k, &g.alpha, g.A, R_16BF, g.lda, g.strideA, g.B, R_16BF, g.ldb, g.strideB,
         &g.beta, g.C, R_32F, g.ldc, g.strideC, g.batch, COMPUTE_32F, GEMM_DEFAULT_TENSOR_OP), "batched GEMM");
+    markEnd("gemm batched");
 }

@@ -6,11 +6,13 @@ const config = @import("model/config.zig");
 const checkpoint = @import("model/checkpoint.zig");
 const session = @import("model/session.zig");
 const gpu = @import("model/gpu.zig");
+const ptx = @import("ptx.zig");
 
 /// The compiled kernels, loaded by the session at startup.
 const kernels_ptx = @embedFile("kernels.ptx");
 /// Numbers are formatted through libc, so the log matches to the last digit.
 extern "c" fn snprintf(buf: [*]u8, size: usize, fmt: [*:0]const u8, ...) c_int;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 const Fatal = error{Fatal};
 
@@ -188,6 +190,9 @@ fn run(init: std.process.Init, out: Out) !void {
     var ce_sum: f64 = 0;
     const ln2 = @log(2.0);
     const begin = std.Io.Clock.awake.now(io);
+    // TMT_PROFILE=1 times every kernel and matmul; it costs throughput,
+    // because each one is waited for, but shows where the step goes.
+    if (getenv("TMT_PROFILE") != null) ptx.Profile.enable();
     session.installStopHandler();
     const mode_z = try arena.dupeZ(u8, mode);
     try out.print("CUDA hierarchical byte model: D=%d L=%d E=%d k=%d B=%d T=%d mode=%s step=%llu\n", .{
@@ -305,6 +310,7 @@ fn run(init: std.process.Init, out: Out) !void {
         progress.cursor += T;
         progress.carried += T;
         if (!evaluation and saveevery != 0 and progress.step % saveevery == 0) checkpoint.save(arena, io, path, &sess.m, &sess.state, &progress) catch return ckptFail();
+        ptx.Profile.collect(); // the events are read where the host waits anyway
         if (progress.step % 20 == 0)
             try out.print("step=%llu loss=%.6f ce=%.6f bpb=%.6f\n", .{ @as(c_ulonglong, progress.step), @as(f64, loss), @as(f64, ce), @as(f64, ce) / ln2 });
         if (!evaluation and experts > 1 and use_win > 0 and progress.step % 100 == 0) {
@@ -329,6 +335,7 @@ fn run(init: std.process.Init, out: Out) !void {
     const seconds = @as(f64, @floatFromInt(ns)) / 1e9;
     if (!evaluation) checkpoint.save(arena, io, path, &sess.m, &sess.state, &progress) catch return ckptFail();
     if (measured == 0) return fail("no byte pairs evaluated", .{});
+    try ptx.Profile.report(out.w);
     // Stable machine-readable record for experiment runners.
     const m: f64 = @floatFromInt(measured);
     try out.print("{\"mode\":\"%s\",\"steps\":%llu,\"bytes\":%llu,\"ce\":%.9g,\"bpb\":%.9g,\"seconds\":%.6f,\"bytes_per_second\":%.3f}\n", .{
