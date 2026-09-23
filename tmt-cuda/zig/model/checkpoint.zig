@@ -6,6 +6,7 @@ const std = @import("std");
 const gpu = @import("gpu.zig");
 const cfgmod = @import("config.zig");
 const model = @import("model.zig");
+const params = @import("params.zig");
 
 pub const Error = error{Checkpoint};
 
@@ -72,6 +73,31 @@ const File = struct {
             if (f.writing) try gpu.download(buf[0..n], dev);
             try f.bytes(buf[0..n]);
             if (!f.writing) try gpu.upload(dev, buf[0..n]);
+        }
+    }
+    /// A moment array that the file always carries as fp32 but the device may
+    /// hold in bf16. The staging buffer converts on the way past, so the
+    /// checkpoint stays byte for byte what the C++ build writes.
+    fn deviceState(f: *File, ptr: *anyopaque, n: usize, half: bool) !void {
+        if (!half) return f.device(ptr, n * 4);
+        const step = @min(n, 1 << 18);
+        const host = try f.gpa.alloc(f32, step);
+        defer f.gpa.free(host);
+        const dev = try f.gpa.alloc(u16, step);
+        defer f.gpa.free(dev);
+        var at: usize = 0;
+        while (at < n) : (at += step) {
+            const k = @min(step, n - at);
+            const d: *anyopaque = @ptrFromInt(@intFromPtr(ptr) + at * 2);
+            if (f.writing) {
+                try gpu.download(std.mem.sliceAsBytes(dev[0..k]), d);
+                for (dev[0..k], host[0..k]) |b, *x| x.* = params.bf2fHost(b);
+            }
+            try f.bytes(std.mem.sliceAsBytes(host[0..k]));
+            if (!f.writing) {
+                for (host[0..k], dev[0..k]) |x, *b| b.* = params.f2bfHost(x);
+                try gpu.upload(d, std.mem.sliceAsBytes(dev[0..k]));
+            }
         }
     }
     fn skip(f: *File, n: u64) void {
@@ -218,8 +244,8 @@ fn payload(f: *File, m: *model.Model, state: *model.StreamState, progress: *Prog
         try f.scalar(&n);
         if (n != @as(u64, @intCast(p.n))) return fail("checkpoint parameter shape mismatch", .{});
         try f.device(p.master, @intCast(n * 4));
-        try f.device(p.m, @intCast(n * 4));
-        try f.device(p.v, @intCast(n * 4));
+        try f.deviceState(p.m, @intCast(n), p.half_moments);
+        try f.deviceState(p.v, @intCast(n), p.half_moments);
         if (!f.writing) {
             const g: u32 = @intCast((n + 255) / 256);
             try (try m.kernels.get("copy_bf16")).launch(g, 256, .{ p.master, p.work, p.n });

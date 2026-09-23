@@ -45,6 +45,7 @@ const MTParams = extern struct {
     chunks: u64,
     nchunks: i32,
     sumsq: u64,
+    seed: u32 = 0, // stochastic rounding counter; unused with fp32 state
 };
 
 var failures: usize = 0;

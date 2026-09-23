@@ -8,12 +8,19 @@ const gpu = @import("gpu.zig");
 pub const bf16 = u16;
 
 /// One parameter: fp32 master, Adam moments, gradient and the bf16 working copy.
+///
+/// The moments can be kept in bf16 instead (`mom_bf16`), which halves the
+/// bytes the optimizer moves for them. The
+/// pointers keep their fp32 type because they are device addresses that the
+/// host never dereferences; `half_moments` says what the memory behind them
+/// actually holds, and every reader has to ask.
 pub const Par = struct {
     master: [*]f32,
     m: [*]f32,
     v: [*]f32,
     grad: [*]f32,
     work: [*]bf16,
+    half_moments: bool = false,
     /// Running average of the weights over training; only allocated when
     /// `wavg` is on, and never read by the training step itself.
     avg: ?[*]f32 = null,
@@ -30,6 +37,8 @@ pub const Store = struct {
     /// Set before the parameters are built when `wavg` is on; every parameter
     /// then carries an averaged copy as well.
     want_avg: bool = false,
+    /// Set before the parameters are built; the width of the Adam moments.
+    half_moments: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Store {
         return .{ .memory = gpu.Memory.init(gpa), .gpa = gpa };
@@ -54,10 +63,11 @@ pub const Store = struct {
         const un: usize = @intCast(n);
         const p = Par{
             .master = try s.memory.allocT(f32, un),
-            .m = try s.memory.callocT(f32, un),
-            .v = try s.memory.callocT(f32, un),
+            .m = if (s.half_moments) @ptrCast(@alignCast(try s.memory.callocT(bf16, un))) else try s.memory.callocT(f32, un),
+            .v = if (s.half_moments) @ptrCast(@alignCast(try s.memory.callocT(bf16, un))) else try s.memory.callocT(f32, un),
             .grad = try s.memory.callocT(f32, un),
             .work = try s.memory.allocT(bf16, un),
+            .half_moments = s.half_moments,
             .avg = if (s.want_avg) try s.memory.callocT(f32, un) else null,
             .n = n,
             .cols = n,
@@ -66,6 +76,24 @@ pub const Store = struct {
         return s.values.items.len - 1;
     }
 };
+
+// ---- the host side of bf16 optimizer state ----
+// The checkpoint always speaks fp32, so the conversion happens in the staging
+// buffer on the way past. It is round-to-nearest, not stochastic: a
+// checkpoint is a one-off conversion of a value that is not being accumulated
+// into, and stochastic rounding buys nothing there - it only matters where a
+// small update would otherwise be lost.
+
+/// Round to nearest even, the same arithmetic as the device's `f2bf`.
+pub fn f2bfHost(x: f32) bf16 {
+    const u: u32 = @bitCast(x);
+    if ((u & 0x7fffffff) > 0x7f800000) return 0x7fc0;
+    const bias: u32 = ((u >> 16) & 1) +% 0x7fff;
+    return @truncate((u +% bias) >> 16);
+}
+pub fn bf2fHost(x: bf16) f32 {
+    return @bitCast(@as(u32, x) << 16);
+}
 
 /// Uniform in [a, b), from the same generator the C++ build uses.
 pub fn hostInit(h: []f32, a: f32, b: f32, seed: *u32) void {

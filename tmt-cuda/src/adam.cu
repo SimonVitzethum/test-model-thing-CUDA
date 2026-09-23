@@ -49,6 +49,7 @@ struct MTParams {  // device arrays, one entry per parameter
     MTChunk* chunks = nullptr;
     int nchunks = 0;
     double* sumsq = nullptr;  // global squared gradient norm
+    unsigned seed = 0;  // stochastic rounding counter (Zig build only)
 };
 
 __global__ void mt_sumsq_kernel(MTParams P) {

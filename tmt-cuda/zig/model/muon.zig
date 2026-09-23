@@ -4,7 +4,8 @@
 //! AdamW, as in the published recipe.
 //!
 //! The iteration runs in bf16 because its three matrix products per step go
-//! over the tensor cores; the momentum, the weights and the norm stay fp32.
+//! over the tensor cores; the weights and the norm stay fp32, and so does the
+//! momentum unless `mom_bf16` puts it in bf16 with stochastic rounding.
 const std = @import("std");
 const gpu = @import("gpu.zig");
 const linalg = @import("linalg.zig");
@@ -47,11 +48,12 @@ fn blocks(n: usize) u32 {
 }
 
 /// One weight matrix: momentum, orthogonalization, update.
-pub fn step(k: *gpu.Kernels, w: *Ws, p: params.Par, x: [*]f32, lr: f32, wd: f32) !void {
+pub fn step(k: *gpu.Kernels, w: *Ws, p: params.Par, x: [*]f32, lr: f32, wd: f32, seed: u32) !void {
     const rows: usize = @intCast(p.rows);
     const cols: usize = @intCast(p.cols);
     const n: usize = @intCast(p.n);
-    try (try k.get("muon_momentum")).launch(blocks(n), 256, .{ p.m, p.grad, x, MOMENTUM, p.n });
+    try (try k.get("muon_momentum")).launch(blocks(n), 256, .{ p.m, p.grad, x, MOMENTUM, p.n,
+        @as(i32, if (p.half_moments) 1 else 0), seed });
     try gpu.zero(w.sumsq, 4);
     try (try k.get("muon_sumsq")).launch(@min(blocks(n), 1024), 256, .{ x, w.sumsq, p.n });
     try (try k.get("muon_start")).launch(blocks(n), 256, .{ x, w.sumsq, w.xb, p.n });

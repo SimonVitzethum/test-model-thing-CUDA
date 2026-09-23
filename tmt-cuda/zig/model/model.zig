@@ -73,6 +73,8 @@ pub const MTParams = extern struct {
     chunks: u64 = 0,
     nchunks: i32 = 0,
     sumsq: u64 = 0,
+    /// Counter for the stochastic rounding; the step number.
+    seed: u32 = 0,
 };
 
 pub const Model = struct {
@@ -203,6 +205,7 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
     var m = Model{ .c = c, .gpa = gpa, .store = params.Store.init(gpa), .mem = gpu.Memory.init(gpa), .kernels = kernels };
     errdefer m.deinit();
     m.store.want_avg = c.wavg > 0; // has to be set before any parameter exists
+    m.store.half_moments = c.mom_bf16 != 0;
     const D: usize = @intCast(c.dim);
     const nl: usize = @intCast(c.layers);
     const E: usize = @intCast(c.experts);
@@ -582,9 +585,10 @@ fn buildOptTable(m: *Model) !void {
         const unused_stop = i == m.stop and m.c.stop == 0;
         // Muon weights still count towards the gradient norm, but AdamW skips them.
         const adam = !frozen and !unused_stop and !isMuonParam(m, i);
-        // bit 2: updated by AdamW, bit 4: Muon owns it and clears it itself.
+        // bit 2: updated by AdamW, bit 4: Muon owns it and clears it itself,
+        // bit 8: its Adam moments are bf16.
         flags[i] = (if (frozen) @as(u8, 0) else 1) | (if (adam) @as(u8, 2) else 0) |
-            (if (isMuonParam(m, i)) @as(u8, 4) else 0);
+            (if (isMuonParam(m, i)) @as(u8, 4) else 0) | (if (p.half_moments) @as(u8, 8) else 0);
         lrmul[i] = mupScale(m, i);
         var s: i64 = 0;
         while (s < p.n) : (s += MT_CHUNK) {
@@ -1182,6 +1186,9 @@ pub fn optimizerStep(m: *Model, step: i32) !void {
     const b1: f32 = 0.9;
     const b2: f32 = 0.999;
     const k = m.kernels;
+    // The stochastic rounding is seeded from the step, so a rerun of the
+    // same configuration rounds identically.
+    m.opt.seed = @as(u32, @bitCast(step)) +% 1;
     try gpu.zeroAsync(@as(*anyopaque, @ptrFromInt(m.opt.sumsq)), 8);
     try (try k.get("mt_sumsq")).launch(@intCast(m.opt.nchunks), 256, .{m.opt});
     try (try k.get("mt_adam")).launch(@intCast(m.opt.nchunks), 256, .{
@@ -1190,7 +1197,8 @@ pub fn optimizerStep(m: *Model, step: i32) !void {
     });
     for (m.muon_params) |j| { // the same schedule shape, Muon's own size
         const lr = c.muon_lr * lrAt(c, step) / c.lr;
-        try muon.step(k, &m.muon_ws, m.store.at(j), m.muon_x, lr, 0.01);
+        try muon.step(k, &m.muon_ws, m.store.at(j), m.muon_x, lr, 0.01,
+            m.opt.seed ^ @as(u32, @intCast(j)) *% 0x2545f491);
     }
     // The weight average is a separate pass over every parameter, so it runs
     // on an interval rather than every step; the effective time constant is
