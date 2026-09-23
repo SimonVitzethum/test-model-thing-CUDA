@@ -58,6 +58,38 @@ pub inline fn f2bf(x: f32) bf16 {
     return @truncate((u +% bias) >> 16);
 }
 
+/// A random word from a counter, with no state anywhere. Stochastic rounding
+/// needs one random number per element, and every stateful generator would
+/// have to read and write that state - which is exactly the memory traffic
+/// the bf16 optimizer state is there to save. A counter-based generator (the
+/// Random123 idea) derives the word from the element index and a per-step
+/// seed instead, so it costs arithmetic only, is reproducible for a given
+/// seed, and gives every element an independent stream.
+///
+/// The mixing is the Murmur3 finalizer: two multiplies and three xorshifts,
+/// which passes the avalanche tests and is about as cheap as mixing gets.
+pub inline fn mix32(counter: u32, seed: u32) u32 {
+    var x = (counter *% 0x9e3779b9) ^ (seed *% 0x85ebca6b);
+    x ^= x >> 16;
+    x *%= 0x85ebca6b;
+    x ^= x >> 13;
+    x *%= 0xc2b2ae35;
+    x ^= x >> 16;
+    return x;
+}
+
+/// fp32 -> bf16 with stochastic rounding: the discarded 16 bits are compared
+/// against a uniform random 16-bit number instead of against a half, so the
+/// value rounds up with probability equal to the part that is lost. The
+/// rounding is then unbiased in expectation, and an update far smaller than
+/// one bf16 ulp still moves the weight with the right frequency rather than
+/// vanishing, which is what round-to-nearest does to it.
+pub inline fn f2bfSr(x: f32, r: u32) bf16 {
+    const u: u32 = @bitCast(x);
+    if ((u & 0x7fffffff) > 0x7f800000) return 0x7fc0; // NaN
+    return @truncate((u +% (r & 0xffff)) >> 16);
+}
+
 // ---- math (libdevice, the same functions nvcc calls for expf and friends) ----
 pub extern fn __nv_expf(x: f32) f32;
 pub extern fn __nv_logf(x: f32) f32;

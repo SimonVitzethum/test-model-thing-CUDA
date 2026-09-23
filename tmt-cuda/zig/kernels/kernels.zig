@@ -424,7 +424,31 @@ pub const MTParams = extern struct {
     chunks: cuda.Global(MTChunk),
     nchunks: i32,
     sumsq: cuda.Global(f64), // global squared gradient norm
+    /// Which of the optimizer state arrays are bf16 rather than fp32:
+    /// bit 0 the moments, bit 1 the master copy (and the weight average,
+    /// which shares the master's width). Zero is the default everywhere.
+    half: i32 = 0,
+    /// Counter for the stochastic rounding; the step number, so a rerun of
+    /// the same configuration rounds the same way.
+    seed: u32 = 0,
 };
+
+/// The optimizer state arrays are addressed through the same pointers whether
+/// they hold fp32 or bf16; only the element width changes. The flag is
+/// uniform over the whole grid, so the branch is free.
+inline fn optLoad(p: cuda.Global(f32), i: usize, half: bool) f32 {
+    if (!half) return p[i];
+    const q: cuda.Global(bf16) = @ptrCast(p);
+    return cuda.bf2f(q[i]);
+}
+inline fn optStore(p: cuda.Global(f32), i: usize, half: bool, x: f32, r: u32) void {
+    if (!half) {
+        p[i] = x;
+        return;
+    }
+    const q: cuda.Global(bf16) = @ptrCast(p);
+    q[i] = cuda.f2bfSr(x, r);
+}
 
 var mt_buf: [256]f64 addrspace(.shared) = undefined;
 
@@ -458,9 +482,12 @@ export fn mt_wavg(P: MTParams, tau: f32) callconv(.nvptx_kernel) void {
     const at: usize = @intCast(c.start);
     const master = P.master[@intCast(c.param)] + at;
     const avg = P.avg[@intCast(c.param)] + at;
+    const hw = P.half & 2 != 0; // the average keeps the master's width
     var i = cuda.threadIdxX();
-    while (i < @as(u32, @bitCast(c.len))) : (i += cuda.blockDimX())
-        avg[i] = tau * avg[i] + (1 - tau) * master[i];
+    while (i < @as(u32, @bitCast(c.len))) : (i += cuda.blockDimX()) {
+        const a = tau * optLoad(avg, i, hw) + (1 - tau) * optLoad(master, i, hw);
+        optStore(avg, i, hw, a, cuda.mix32(@intCast(at + i), P.seed ^ @as(u32, @bitCast(c.param)) *% 0x2545f491));
+    }
 }
 
 /// AdamW with global-norm clipping computed on the device. A non-finite norm
@@ -489,17 +516,27 @@ export fn mt_adam(P: MTParams, clip: f32, lr: f32, b1: f32, b2: f32, eps: f32, w
     const grad: cuda.Global(f32) = P.grad[@intCast(c.param)] + at;
     const work = P.work[@intCast(c.param)] + at;
     const step_lr = lr * P.lrmul[@intCast(c.param)];
+    const hm = P.half & 1 != 0;
+    const hw = P.half & 2 != 0;
+    // One counter stream per parameter, indexed by the element.
+    const key = P.seed ^ @as(u32, @bitCast(c.param)) *% 0x2545f491;
     var i = cuda.threadIdxX();
     while (i < @as(u32, @bitCast(c.len))) : (i += cuda.blockDimX()) {
         const g = grad[i] * scale;
-        const nm = b1 * m[i] + (1.0 - b1) * g;
-        const nv = b2 * v[i] + (1.0 - b2) * g * g;
-        m[i] = nm;
-        v[i] = nv;
+        const nm = b1 * optLoad(m, i, hm) + (1.0 - b1) * g;
+        const nv = b2 * optLoad(v, i, hm) + (1.0 - b2) * g * g;
+        // One 32-bit word carries the two 16-bit draws the moments need; the
+        // master copy takes a second word, so its rounding is independent.
+        const r = cuda.mix32(@intCast(at + i), key);
+        optStore(m, i, hm, nm, r);
+        optStore(v, i, hm, nv, r >> 16);
         grad[i] = 0; // consumed; the next window accumulates into it again
-        const w = master[i] - step_lr * (cuda.fdiv(cuda.fdiv(nm, bc1), cuda.fsqrt(cuda.fdiv(nv, bc2)) + eps) + wd * master[i]);
-        master[i] = w;
-        work[i] = cuda.f2bf(w);
+        const x = optLoad(master, i, hw);
+        const w = x - step_lr * (cuda.fdiv(cuda.fdiv(nm, bc1), cuda.fsqrt(cuda.fdiv(nv, bc2)) + eps) + wd * x);
+        optStore(master, i, hw, w, cuda.mix32(@intCast(at + i), key +% 0x9e3779b9));
+        // With a bf16 master the working copy is the master, so the store
+        // above already wrote it.
+        if (!hw) work[i] = cuda.f2bf(w);
     }
 }
 
@@ -1443,13 +1480,15 @@ export fn mse_mean(a: cuda.ConstGlobal(f32), b: cuda.ConstGlobal(f32), out: cuda
 // fp32 on the master weights; only the matrix products go through cuBLAS.
 
 /// m = beta*m + g, and the Newton-Schulz input g + beta*m (Nesterov).
+/// `half` keeps the momentum in bf16 with stochastic rounding (`mom_bf16`).
 export fn muon_momentum(m: cuda.Global(f32), g: cuda.ConstGlobal(f32), x: cuda.Global(f32),
-                        beta: f32, n: i64) callconv(.nvptx_kernel) void {
+                        beta: f32, n: i64, half: i32, seed: u32) callconv(.nvptx_kernel) void {
     const i: i64 = @intCast(cuda.globalIdX());
     if (i >= n) return;
     const u: usize = @intCast(i);
-    const nm = beta * m[u] + g[u];
-    m[u] = nm;
+    const h = half != 0;
+    const nm = beta * optLoad(m, u, h) + g[u];
+    optStore(m, u, h, nm, cuda.mix32(@intCast(u), seed));
     x[u] = g[u] + beta * nm;
 }
 
@@ -1496,13 +1535,16 @@ export fn muon_blend(x: cuda.Global(bf16), t: cuda.ConstGlobal(bf16), a: f32, n:
 
 /// The weight step, with decoupled weight decay, plus the bf16 working copy.
 export fn muon_update(master: cuda.Global(f32), x: cuda.ConstGlobal(bf16), work: cuda.Global(bf16),
-                      lr: f32, scale: f32, wd: f32, n: i64) callconv(.nvptx_kernel) void {
+                      lr: f32, scale: f32, wd: f32, n: i64, half: i32, seed: u32) callconv(.nvptx_kernel) void {
     const i: i64 = @intCast(cuda.globalIdX());
     if (i >= n) return;
     const u: usize = @intCast(i);
-    const w = master[u] - lr * (scale * cuda.bf2f(x[u]) + wd * master[u]);
-    master[u] = w;
-    work[u] = cuda.f2bf(w);
+    const h = half != 0;
+    const p = optLoad(master, u, h);
+    const w = p - lr * (scale * cuda.bf2f(x[u]) + wd * p);
+    optStore(master, u, h, w, cuda.mix32(@intCast(u), seed));
+    // A bf16 master *is* the working copy; the store above wrote it.
+    if (!h) work[u] = cuda.f2bf(w);
 }
 
 // The fp32 -> bf16 conversion the Newton-Schulz products need is copy_bf16.
