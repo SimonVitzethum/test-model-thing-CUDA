@@ -387,6 +387,20 @@ A ramp starts in the worst throughput regime and eats its own gain. Once
 CUDA graphs have removed the fixed cost, the FLOP argument survives into
 wall clock and this is worth doing.
 
+## Long shots
+
+Six ideas with a plausible route to a large factor are planned out in
+MOONSHOTS.md, with a cheap decisive test for each. They are not ranked
+against this list and do not compete with it: the items here are expected
+to work, those are expected to mostly not.
+
+Three of them are worth starting regardless of the long shot, because
+their first stage pays on its own: solving the output head exactly (it is
+convex), Adam moments and master weights in bf16 with stochastic rounding
+(it takes 30 bytes per parameter down to 16 on the largest kernel in the
+step), and the trajectory extrapolation test, which costs an afternoon
+against checkpoints that already exist.
+
 ## Considered and rejected
 
 Written down so they do not get reopened in six months.
