@@ -6,6 +6,7 @@ const gpu = @import("gpu.zig");
 const cfgmod = @import("config.zig");
 const model = @import("model.zig");
 const ops = @import("ops.zig");
+const params = @import("params.zig");
 
 pub const Cfg = cfgmod.Cfg;
 pub const Progress = @import("checkpoint.zig").Progress;
@@ -137,7 +138,7 @@ pub const Session = struct {
         return if (which == 0) s.m.MS.rq else s.m.MS.rk;
     }
     pub fn paramMaster(s: *const Session, j: usize, out: []f32) !void {
-        try gpu.download(std.mem.sliceAsBytes(out), s.m.store.at(j).master);
+        try params.downloadMaster(s.gpa, s.m.store.at(j), out);
     }
     pub fn setParamGrad(s: *const Session, j: usize, in: []const f32) !void {
         try gpu.upload(s.m.store.at(j).grad, std.mem.sliceAsBytes(in));
@@ -275,7 +276,7 @@ pub const Session = struct {
         const carry = try s.gpa.alloc(f32, B * D);
         defer s.gpa.free(carry);
         for (s.m.L, 0..) |ly, l| {
-            try gpu.download(std.mem.sliceAsBytes(decay), s.m.store.at(ly.decay).master);
+            try params.downloadMaster(s.gpa, s.m.store.at(ly.decay), decay);
             try gpu.download(std.mem.sliceAsBytes(carry), s.state.carry[l]);
             for (decay, 0..) |dv, d| {
                 const a = 1 / (1 + @exp(-@as(f64, dv)));

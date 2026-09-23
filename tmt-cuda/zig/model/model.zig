@@ -171,7 +171,7 @@ pub fn seedAverage(m: *Model) !void {
     if (m.c.wavg <= 0) return;
     for (m.store.values.items) |p| {
         const a = p.avg orelse continue;
-        try gpu.copyDevice(a, p.master, @as(usize, @intCast(p.n)) * 4);
+        try gpu.copyDevice(a, p.master, params.masterBytes(p));
     }
 }
 
@@ -206,6 +206,7 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
     errdefer m.deinit();
     m.store.want_avg = c.wavg > 0; // has to be set before any parameter exists
     m.store.half_moments = c.mom_bf16 != 0;
+    m.store.half_master = c.master_bf16 != 0;
     const D: usize = @intCast(c.dim);
     const nl: usize = @intCast(c.layers);
     const E: usize = @intCast(c.experts);
@@ -224,7 +225,7 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
             const n: usize = @intCast(mm.store.at(p).n);
             try h.resize(g, n);
             params.hostInit(h.items, a, b, s);
-            try gpu.upload(mm.store.at(p).master, std.mem.sliceAsBytes(h.items));
+            try params.uploadMaster(g, mm.store.at(p), h.items);
             try toWork(mm, p);
         }
     }.f;
@@ -232,8 +233,10 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
     m.emb = try m.store.add(256 * @as(i64, c.dim));
     try initU(&m, &host, gpa, m.emb, -0.05, 0.05, &seed);
     m.tgt = try m.store.add(256 * @as(i64, c.dim));
-    try gpu.copyDevice(m.store.at(m.tgt).master, m.store.at(m.emb).master, 256 * D * 4);
-    try gpu.copyDevice(m.store.at(m.tgt).work, m.store.at(m.emb).work, 256 * D * 2);
+    try gpu.copyDevice(m.store.at(m.tgt).master, m.store.at(m.emb).master,
+        params.masterBytes(m.store.at(m.tgt)));
+    if (!m.store.at(m.tgt).half_master)
+        try gpu.copyDevice(m.store.at(m.tgt).work, m.store.at(m.emb).work, 256 * D * 2);
     m.dec = try m.store.add(256 * @as(i64, c.dim));
     {
         const a = params.sqrtf(1.0 / @as(f32, @floatFromInt(D)));
@@ -261,21 +264,21 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
             const a = params.expf(-params.logf(2.0) / half);
             v.* = params.logf(a / (1.0 - a));
         }
-        try gpu.upload(m.store.at(ly.decay).master, std.mem.sliceAsBytes(host.items));
+        try params.uploadMaster(gpa, m.store.at(ly.decay), host.items);
         try toWork(&m, ly.decay);
         ly.gate = try m.store.add(@intCast(D)); // draws D values and keeps zero
         try initU(&m, &host, gpa, ly.gate, 0, 0, &seed);
         ly.gamma = try m.store.add(@intCast(D));
         @memset(host.items, 1.0);
-        try gpu.upload(m.store.at(ly.gamma).master, std.mem.sliceAsBytes(host.items));
+        try params.uploadMaster(gpa, m.store.at(ly.gamma), host.items);
         try toWork(&m, ly.gamma);
         ly.beta = try m.store.add(@intCast(D));
-        try gpu.zero(m.store.at(ly.beta).master, D * 4);
+        try gpu.zero(m.store.at(ly.beta).master, params.masterBytes(m.store.at(ly.beta)));
         try gpu.zero(m.store.at(ly.beta).work, D * 2);
         ly.router = try m.store.add2d(@intCast(E), @intCast(D));
         try host.resize(gpa, E * D);
         params.hostNormal(host.items, 0.02, &seed);
-        try gpu.upload(m.store.at(ly.router).master, std.mem.sliceAsBytes(host.items));
+        try params.uploadMaster(gpa, m.store.at(ly.router), host.items);
         try toWork(&m, ly.router);
         const a = params.sqrtf(1.0 / @as(f32, @floatFromInt(D)));
         for (0..E) |e| {
@@ -380,10 +383,10 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
             ml.p.gamma = try m.store.add(@intCast(D));
             try host.resize(gpa, D);
             @memset(host.items, 1.0);
-            try gpu.upload(m.store.at(ml.p.gamma).master, std.mem.sliceAsBytes(host.items));
+            try params.uploadMaster(gpa, m.store.at(ml.p.gamma), host.items);
             try toWork(&m, ml.p.gamma);
             ml.p.beta = try m.store.add(@intCast(D));
-            try gpu.zero(m.store.at(ml.p.beta).master, D * 4);
+            try gpu.zero(m.store.at(ml.p.beta).master, params.masterBytes(m.store.at(ml.p.beta)));
             try gpu.zero(m.store.at(ml.p.beta).work, D * 2);
             ml.keep.qc = try m.mem.allocT(bf16, B * H * T * dh);
             ml.keep.qr = try m.mem.allocT(bf16, B * H * T * R);
@@ -415,7 +418,7 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
             const a = params.expf(-params.logf(2.0) / half);
             v.* = params.logf(a / (1.0 - a));
         }
-        try gpu.upload(m.store.at(m.MS.decay).master, std.mem.sliceAsBytes(host.items));
+        try params.uploadMaster(gpa, m.store.at(m.MS.decay), host.items);
         try toWork(&m, m.MS.decay);
         m.MS.gate = try m.store.add(@intCast(D));
         try initU(&m, &host, gpa, m.MS.gate, 0, 0, &seed);
@@ -426,7 +429,7 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
             me.gamma = try m.store.add(@intCast(D));
             try host.resize(gpa, D);
             @memset(host.items, 1.0);
-            try gpu.upload(m.store.at(me.gamma).master, std.mem.sliceAsBytes(host.items));
+            try params.uploadMaster(gpa, m.store.at(me.gamma), host.items);
             try toWork(&m, me.gamma);
             me.beta = try m.store.add(@intCast(D));
             me.wq = try m.store.add2d(@intCast(HD), @intCast(D));
@@ -438,7 +441,7 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
             me.wo = try m.store.add2d(@intCast(D), @intCast(HD));
             for ([_]usize{ me.beta, me.wo }) |p| {
                 const n: usize = @intCast(m.store.at(p).n);
-                try gpu.zero(m.store.at(p).master, n * 4);
+                try gpu.zero(m.store.at(p).master, params.masterBytes(m.store.at(p)));
                 try gpu.zero(m.store.at(p).work, n * 2);
             }
             me.Xsnap = try m.mem.allocT(bf16, ND);
@@ -495,6 +498,7 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
 /// master -> bf16 working copy.
 fn toWork(m: *Model, p: usize) !void {
     const par = m.store.at(p);
+    if (par.half_master) return; // the master copy already is the working copy
     const n: u32 = @intCast(@divTrunc(par.n + 255, 256));
     try (try m.kernels.get("copy_bf16")).launch(n, 256, .{ par.master, par.work, par.n });
 }
@@ -586,9 +590,10 @@ fn buildOptTable(m: *Model) !void {
         // Muon weights still count towards the gradient norm, but AdamW skips them.
         const adam = !frozen and !unused_stop and !isMuonParam(m, i);
         // bit 2: updated by AdamW, bit 4: Muon owns it and clears it itself,
-        // bit 8: its Adam moments are bf16.
+        // bit 8: bf16 moments, bit 16: bf16 master copy.
         flags[i] = (if (frozen) @as(u8, 0) else 1) | (if (adam) @as(u8, 2) else 0) |
-            (if (isMuonParam(m, i)) @as(u8, 4) else 0) | (if (p.half_moments) @as(u8, 8) else 0);
+            (if (isMuonParam(m, i)) @as(u8, 4) else 0) |
+            (if (p.half_moments) @as(u8, 8) else 0) | (if (p.half_master) @as(u8, 16) else 0);
         lrmul[i] = mupScale(m, i);
         var s: i64 = 0;
         while (s < p.n) : (s += MT_CHUNK) {

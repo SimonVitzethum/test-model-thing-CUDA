@@ -4,8 +4,9 @@
 //! AdamW, as in the published recipe.
 //!
 //! The iteration runs in bf16 because its three matrix products per step go
-//! over the tensor cores; the weights and the norm stay fp32, and so does the
-//! momentum unless `mom_bf16` puts it in bf16 with stochastic rounding.
+//! over the tensor cores; the momentum, the weights and the norm are fp32
+//! unless `mom_bf16` or `master_bf16` puts them in bf16 with stochastic
+//! rounding, which halves what the momentum and the update kernels move.
 const std = @import("std");
 const gpu = @import("gpu.zig");
 const linalg = @import("linalg.zig");
@@ -68,7 +69,8 @@ pub fn step(k: *gpu.Kernels, w: *Ws, p: params.Par, x: [*]f32, lr: f32, wd: f32,
     }
     // The published scaling keeps the update's size independent of the shape.
     const scale = params.sqrtf(@floatFromInt(@max(rows, cols)));
-    try (try k.get("muon_update")).launch(blocks(n), 256, .{ p.master, w.xb, p.work, lr, scale, wd, p.n });
+    try (try k.get("muon_update")).launch(blocks(n), 256, .{ p.master, w.xb, p.work, lr, scale, wd, p.n,
+        @as(i32, if (p.half_master) 1 else 0), seed +% 0x9e3779b9 });
     // AdamW clears the gradients it consumes; these belong to Muon.
     try gpu.zeroAsync(p.grad, n * 4);
 }

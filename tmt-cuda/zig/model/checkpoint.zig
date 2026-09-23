@@ -75,9 +75,9 @@ const File = struct {
             if (!f.writing) try gpu.upload(dev, buf[0..n]);
         }
     }
-    /// A moment array that the file always carries as fp32 but the device may
-    /// hold in bf16. The staging buffer converts on the way past, so the
-    /// checkpoint stays byte for byte what the C++ build writes.
+    /// An optimizer state array that the file always carries as fp32 but the
+    /// device may hold in bf16. The staging buffer converts on the way past,
+    /// so the checkpoint stays byte for byte what the C++ build writes.
     fn deviceState(f: *File, ptr: *anyopaque, n: usize, half: bool) !void {
         if (!half) return f.device(ptr, n * 4);
         const step = @min(n, 1 << 18);
@@ -243,10 +243,10 @@ fn payload(f: *File, m: *model.Model, state: *model.StreamState, progress: *Prog
         var n: u64 = @intCast(p.n);
         try f.scalar(&n);
         if (n != @as(u64, @intCast(p.n))) return fail("checkpoint parameter shape mismatch", .{});
-        try f.device(p.master, @intCast(n * 4));
+        try f.deviceState(p.master, @intCast(n), p.half_master);
         try f.deviceState(p.m, @intCast(n), p.half_moments);
         try f.deviceState(p.v, @intCast(n), p.half_moments);
-        if (!f.writing) {
+        if (!f.writing and !p.half_master) {
             const g: u32 = @intCast((n + 255) / 256);
             try (try m.kernels.get("copy_bf16")).launch(g, 256, .{ p.master, p.work, p.n });
         }
@@ -332,10 +332,12 @@ pub fn loadWeights(gpa: std.mem.Allocator, io: std.Io, path: []const u8, m: *mod
         var n: u64 = 0;
         try f.scalar(&n);
         if (n != @as(u64, @intCast(p.n))) return fail("parameter shape mismatch", .{});
-        try f.device(p.master, @intCast(n * 4));
+        try f.deviceState(p.master, @intCast(n), p.half_master);
         f.skip(n * 4 * 2); // the two Adam moments
-        const g: u32 = @intCast((n + 255) / 256);
-        try (try m.kernels.get("copy_bf16")).launch(g, 256, .{ p.master, p.work, p.n });
+        if (!p.half_master) {
+            const g: u32 = @intCast((n + 255) / 256);
+            try (try m.kernels.get("copy_bf16")).launch(g, 256, .{ p.master, p.work, p.n });
+        }
     }
     var spos: i64 = 0;
     try f.scalar(&spos); // the stream state is rebuilt, so its position is ignored

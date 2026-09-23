@@ -22,7 +22,7 @@
     F(int, mup, 0) F(int, mup_base, 256) F(int, muon, 0) F(float, muon_lr, .02f) \
     F(int, mtp, 0) F(float, mtp_weight, .3f) \
     F(float, wavg, 0.f) F(int, wavg_every, 8) \
-    F(int, mom_bf16, 0) \
+    F(int, mom_bf16, 0) F(int, master_bf16, 0) \
     F(int, mem, 0) F(int, mem_len, 256) F(int, mem_heads, 4) F(int, mem_dh, 32) F(int, mem_every, 2) F(int, mem_rdim, 0) \
     F(int, mla, 0) F(int, mla_heads, 4) F(int, mla_dh, 32) \
     F(int, mla_L, 32) F(int, mla_R, 16) F(int, mla_cache, 4096) \
@@ -77,8 +77,8 @@ static void validate_cfg(const Cfg& c) {
     // The keys exist here so both builds write the same configuration text,
     // but switching them on would silently train a different model.
     require(c.patch == 0 && c.patch_hi == 0 && c.mup == 0 && c.muon == 0 && c.mtp == 0 &&
-                c.accum == 1 && c.wavg == 0 && c.mom_bf16 == 0,
-            "patch, mup, muon, mtp, accum, wavg and bf16 moments need the Zig build");
+                c.accum == 1 && c.wavg == 0 && c.mom_bf16 == 0 && c.master_bf16 == 0,
+            "patch, mup, muon, mtp, accum, wavg and the bf16 optimizer state need the Zig build");
     require(c.mem == 0 || c.mem == 1, "mem must be 0 or 1");
     if (c.mem) {
         require(c.mem_len > 0 && c.mem_len <= 4096 && c.mem_heads > 0 && c.mem_dh > 0 &&
