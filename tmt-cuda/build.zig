@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "train", .cuda = true },
         .{ .name = "gradcheck", .cuda = true },
         .{ .name = "kgtrain", .cuda = true },
+        .{ .name = "kbench", .cuda = true },
         .{ .name = "ktest", .cuda = true, .reference = true },
     };
     for (tools) |t| {
