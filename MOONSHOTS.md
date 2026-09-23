@@ -38,38 +38,56 @@ checkpoints and jump forward along it.
 
 3. **PCA over checkpoints, not over weights.** With K checkpoints of P
    parameters, build the K x P matrix, subtract the mean, and take the
-   eigenvectors of the K x K Gram matrix. K is 20, so this is a 20x20
-   eigenproblem - the size of the parameter vector never enters the
-   decomposition. For P = 34M and K = 20 the matrix is 2.7 GB in fp32,
-   which fits in the 31 GB of RAM.
+   eigenvectors of the K x K Gram matrix - a 20x20 eigenproblem at K=20.
+   The parameter count does not enter the *decomposition*, but it does
+   enter the work: forming the Gram matrix is O(P*K^2) and reprojecting is
+   O(P*K). Cheap, not free. At P = 34M and K = 20 the matrix is 2.7 GB in
+   fp32, which fits in the 31 GB of RAM.
 
-4. **Fit each component in schedule time, not step time.** The cosine
-   schedule sets the shape of the trajectory, so fit the component
-   trajectories against the integrated learning rate. A straight line in
-   step number is the wrong basis and will predict badly for a reason that
-   has nothing to do with the hypothesis.
+4. **Time axis = cumulative learning rate.** Fit the components against
+   the integrated learning rate, sum of lr over steps, not against step
+   number. The cosine schedule sets the shape of the trajectory, so step
+   number is the wrong basis and will predict badly for a reason that has
+   nothing to do with the hypothesis.
 
-5. **Reconstruct, write a checkpoint, evaluate.** The averaged-checkpoint
-   path from TODO item 9 already writes a second checkpoint from swapped
-   pointers; the same route works here.
+5. **Extrapolate the averaged weights, not the iterates.** TODO item 9 is
+   now implemented: `wavg=0.999 wavg_every=8` writes `<path>.avg` beside
+   the checkpoint. Fitting raw iterates fits noise in the valley instead of
+   motion along the river.
 
-### The cheapest test
+6. **Reconstruct, write a checkpoint, evaluate.** The averaged-checkpoint
+   path already writes a second checkpoint from swapped pointers; the same
+   route works here.
 
-One matrix, ten checkpoints, extrapolate 10% beyond the last, evaluate.
-An afternoon, and the checkpoints from the night run exist already.
+### The experiment is a curve, not a leapfrog
 
-### What makes it work if it works
+An earlier draft proposed leapfrogging - train 10%, jump 5%, refit - as
+the shape that survives subspace rotation. It does, but it caps the payoff
+at **1.5x**, and this is a moonshot section. For 10x the jump has to cover
+nine times the distance already trained.
 
-Not one long jump - **leapfrogging**. Train 10%, extrapolate 5%, refit,
-repeat. The known objection is that the subspace rotates, and a short jump
-followed by a refit is exactly the shape that survives rotation. Test the
-single jump first because it is cheaper, but do not conclude from it.
+So the experiment is the curve: **maximum lossless jump distance as a
+function of how far training has progressed**. Leapfrogging is the safe
+operating mode to fall back to *if* the curve looks good, not the thing
+being measured.
+
+### The metric, and why the obvious one is wrong
+
+**Steps or FLOPs to reach a target loss after the jump, including
+recovery** - not the loss immediately after landing.
+
+After a jump the Adam moments no longer correspond to the weights, and the
+MoE router can redistribute its assignments abruptly. A jump that lands at
+a good loss and then takes longer to recover than it saved has bought
+nothing. What to do with the moments - keep, zero, rescale - is an
+experimental variable in its own right, and the `router:` line in the
+training log should be compared before and after.
 
 ### The signal to stop
 
-If the extrapolated weights evaluate *worse* than the last checkpoint at
-every extrapolation distance including 2%, the components being fitted are
-not the ones carrying the progress. That is one afternoon spent.
+The extrapolated weights evaluate worse than the last checkpoint at every
+distance including 2%, after recovery. Then the components being fitted
+are not the ones carrying the progress. One afternoon spent.
 
 ---
 
@@ -157,20 +175,66 @@ contents of the fast store.
    `loss_slow - loss_with_fast`: replay what the slow weights have not yet
    absorbed. The two losses are already computed.
 
+### The trap that would have sunk this
+
+The obvious priority `loss_slow - loss_with_fast`, measured on the episode
+the fast store just recorded, is **wrong**, and wrong in a way that would
+have produced a convincing-looking result.
+
+On that episode the fast store's advantage is pure retrieval. The priority
+is therefore highest for whatever is best memorised, and distilling
+against it copies the corpus into the slow weights. That is memorisation
+dressed as consolidation, and the loss curve would have looked excellent.
+
+**The advantage has to be measured on other bytes.** Write the fast store
+from window W, then evaluate on W' - the *continuation* of W, which the
+store never saw:
+
+```
+A = loss_slow(W') - loss_with_fast(W')
+```
+
+This asks whether the store carries something that *transfers*, rather
+than something it can look up. Priority and distillation target both
+belong on W', not on W. If the store only memorised W, then A is zero on
+W' and the idea is dead - cheaply.
+
+### Phase 0, before building any of it
+
+Measure A. One hour, and it is make-or-break in the same way the teacher's
+perplexity was for distillation: if a one-shot episodic store gives no
+advantage on continuation bytes, there is nothing for consolidation to
+consolidate.
+
+### Episode size, measured
+
+`StreamState` carries per stream: the recurrent carry (layers x D x 4 =
+32 KB at dim=512, 16 layers), the hybrid traces (another 64 KB), and the
+MLA cache when `mla=1` (`mla_cache * mla_L * 4`, about 512 KB).
+
+So **96 KB per episode without MLA, around 600 KB with it** - not the
+kilobytes claimed in an earlier draft, and not megabytes either. A few
+thousand episodes is 300 MB without MLA, which is affordable; with MLA it
+is not, and the buffer has to store offsets and replay the state instead.
+
+### A structural note
+
+`mem=1` is a *fact* memory over supplied fact bytes, not an episodic store
+written from the training stream. The encoder takes arbitrary byte
+sequences, so feeding it a window's bytes is natural - but it is a change
+of use, not a feature that is already there.
+
 ### The measurement that decides it
 
-**Per unique byte, not per step.** The entire claim is sample efficiency,
-so the x-axis has to be bytes the model has never seen. Replay that merely
-repeats data will look good per step and flat per unique byte, and that
-distinction is the whole experiment. If it is not measured this way the
-result means nothing either direction.
+**Per unique byte, not per step**, and the evaluation must run on **held-out
+data**. The per-unique-byte axis only catches the memorisation failure if
+the evaluation is on bytes no part of the system has seen. Replay that
+merely repeats data looks good per step and flat per unique byte.
 
 ### The signal to stop
 
-Equal or worse BPB per unique byte at three replay ratios. Then replay is
-data repetition wearing a hat, which is the standing objection.
-
----
+Phase 0 returns A near zero on continuation bytes. Or, later: equal or
+worse held-out BPB per unique byte at three replay ratios.
 
 ## D. Solve instead of search
 
@@ -199,15 +263,35 @@ that has already moved.
 The same applies to the MTP heads, which are additional decoders, and to
 the stop head.
 
-### D2. The recurrence is linear in the state
+### D2. Withdrawn - the convexity claim was wrong
 
-With the gates `a` held fixed, `s = a*s + (1-a)*x` is a **linear** map
-from inputs to states. So for fixed gates, state-to-output is a convex
-problem. That gives an alternating scheme: solve the readout exactly,
-take gradient steps on the gates, repeat.
+An earlier draft claimed that because the recurrence is linear in the
+state for fixed gates, state-to-output is convex, and that this is a
+structural advantage over a transformer. Both halves are wrong.
 
-This is a real structural property of this architecture that a transformer
-does not have, and it is the part of D worth pursuing beyond D1.
+With the gates fixed the state is linear in the inputs and therefore in
+`W_in`. But the logits are `W_dec * (... W_in ...)`, which is **bilinear**,
+not jointly convex. And between the recurrence and the head sit the
+experts, the norms and further layers. What is convex is the final linear
+readout, exactly as in a transformer - which has the analogous property
+anyway, being linear in V for fixed attention weights.
+
+So there is no structural advantage here to claim, and a reviewer would
+go straight for this sentence. D1 stands on its own; D2 does not exist.
+
+### Implementation notes for D1
+
+"Exactly" means iteratively to convergence - L-BFGS over a buffer of
+hidden states - not a closed form. And it needs L2 regularisation:
+near-deterministic bytes otherwise send the weights off without bound.
+
+### The one-hour pretest that may end D1 before it starts
+
+Freeze the body at a current checkpoint, solve only the head to
+convergence, and measure the loss difference against the head that is
+already there. It is probably tiny, because the head is small and is
+trained at every step. Then D1 is finished before it is built. If the gap
+is large instead, that is a real finding and a reason to build.
 
 ### The signal to stop
 
@@ -234,8 +318,25 @@ in the informative direction: **quantisation reduces bandwidth**, which is
 precisely the measured bottleneck. The argument that kills FLOP-saving
 ideas here is the argument *for* this one.
 
-Concretely, `mt_adam` is the largest kernel in the step at 3.7 ms, running
-at 322 GB/s - the ceiling - moving 30 bytes per parameter:
+### Profile before choosing the target
+
+The measurement below was taken with `muon=0`. `isMuonParam` returns false
+whenever Muon is off, so in that configuration `mt_adam` really does own
+every parameter. Turn Muon on - which TODO item 3 is about to do - and the
+expert matrices, the router and the MLA and memory projections leave
+`mt_adam` entirely; it keeps the embedding, the decoder, the MTP heads and
+the vectors, a small fraction of a byte model. The traffic moves to Muon's
+own fp32 momentum and master weights, and the same compression applies
+there instead.
+
+So profile under both settings and let that pick the target.
+
+Also, to keep the claims straight: **stages 1 and 2 are optimizer state
+compression, not integer training.** Useful, and a different experiment
+from stage 5.
+
+With `muon=0`, `mt_adam` is the largest kernel in the step at 3.7 ms,
+running at 322 GB/s - the ceiling - moving 30 bytes per parameter:
 
 ```
 master fp32  4 + 4 read/write
