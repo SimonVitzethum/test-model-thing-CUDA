@@ -50,7 +50,6 @@ const Run = struct {
 fn run_cfg(gpa: std.mem.Allocator, io: std.Io, cfg: config.Cfg, ckpt: []const u8, file_cfg: config.Cfg,
            data: []const u8, starts: []const usize, len: usize, keep_groups: bool) !Run {
     var sess = session.Session.init(gpa, io, cfg, kernels_ptx) catch return gpuFail();
-    sess.attach();
     defer sess.deinit();
     checkpoint.loadWeights(gpa, io, ckpt, &sess.m, file_cfg) catch return ckptFail();
     const B: usize = @intCast(cfg.batch);

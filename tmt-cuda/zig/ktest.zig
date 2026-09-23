@@ -27,6 +27,8 @@ const CellOpt = extern struct {
     logDec: u64 = 0,
     logGate: u64 = 0,
     logEmb: u64 = 0,
+    mask: u64 = 0,
+    plen: u64 = 0,
 };
 
 /// Host mirrors of the optimizer structures (device pointers as addresses).
@@ -38,6 +40,7 @@ const MTParams = extern struct {
     grad: u64,
     work: u64,
     flags: u64,
+    lrmul: u64,
     chunks: u64,
     nchunks: i32,
     sumsq: u64,
@@ -594,12 +597,15 @@ pub fn main(init: std.process.Init) !u8 {
         }
         const d_flags = try Dev.alloc(3);
         try Dev.up(d_flags, &flags);
+        const lrmul = [_]f32{ 1, 1, 1 }; // mup leaves these at one
+        const d_lrmul = try Dev.alloc(3 * 4);
+        try Dev.up(d_lrmul, std.mem.sliceAsBytes(&lrmul));
         const d_chunks = try Dev.alloc(nchunks * @sizeOf(MTChunk));
         try Dev.up(d_chunks, std.mem.sliceAsBytes(chunks));
         const d_sumsq = try Dev.alloc(8);
         const P = MTParams{
             .master = d_tab[0], .m = d_tab[1], .v = d_tab[2], .grad = d_tab[3], .work = d_tab[4],
-            .flags = @intFromPtr(d_flags), .chunks = @intFromPtr(d_chunks),
+            .flags = @intFromPtr(d_flags), .lrmul = @intFromPtr(d_lrmul), .chunks = @intFromPtr(d_chunks),
             .nchunks = @intCast(nchunks), .sumsq = @intFromPtr(d_sumsq),
         };
         const out = try gpa.alloc(f32, 4 * total);
@@ -1392,8 +1398,7 @@ pub fn main(init: std.process.Init) !u8 {
         try config.set(&c, "patch_hi", "2");
         var kern = try gpu.Kernels.load(gpa, kernels_ptx);
         var sess = session.Session.init(gpa, init.io, c, kernels_ptx) catch return error.Session;
-        sess.attach();
-        defer sess.deinit();
+            defer sess.deinit();
         _ = &kern;
         const T = 32;
         const bytes = try gpa.alloc(i32, T);

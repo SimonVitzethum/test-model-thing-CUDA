@@ -15,7 +15,9 @@ pub const config = cfgmod;
 pub const Session = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    kernels: gpu.Kernels,
+    /// Heap-allocated, because the model keeps a pointer to it and callers
+    /// move the session around (into a struct, out of a constructor).
+    kernels: *gpu.Kernels,
     m: model.Model,
     state: model.StreamState,
     /// Lazily created by the knowledge-graph trainer.
@@ -23,26 +25,19 @@ pub const Session = struct {
     ext: ?[*]f32 = null,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, c: Cfg, ptx: [:0]const u8) !Session {
-        var s = Session{
-            .gpa = gpa,
-            .io = io,
-            .kernels = try gpu.Kernels.load(gpa, ptx),
-            .m = undefined,
-            .state = undefined,
-        };
-        s.m = try model.build(gpa, c, &s.kernels);
+        const kernels = try gpa.create(gpu.Kernels);
+        errdefer gpa.destroy(kernels);
+        kernels.* = try gpu.Kernels.load(gpa, ptx);
+        var s = Session{ .gpa = gpa, .io = io, .kernels = kernels, .m = undefined, .state = undefined };
+        s.m = try model.build(gpa, c, kernels);
         s.state = try model.buildState(gpa, &s.m);
         return s;
-    }
-    /// The model keeps a pointer to the kernel table, so the session may not
-    /// be copied after init; callers hold it in place.
-    pub fn attach(s: *Session) void {
-        s.m.kernels = &s.kernels;
     }
     pub fn deinit(s: *Session) void {
         if (s.acc.len != 0) s.gpa.free(s.acc);
         s.state.deinit();
         s.m.deinit();
+        s.gpa.destroy(s.kernels);
     }
 
     pub fn resetState(s: *Session) !void {

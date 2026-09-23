@@ -151,7 +151,6 @@ fn run(init: std.process.Init, out: Out) !void {
     defer data.close();
     if (data.bytes.len < B * (if (evaluation) 2 else T + 1)) return fail("dataset too small for batch/seqlen", .{});
     var sess = session.Session.init(arena, io, cfg, kernels_ptx) catch return gpuFail();
-    sess.attach();
     defer sess.deinit();
     var progress = checkpoint.Progress{};
     if (have) {

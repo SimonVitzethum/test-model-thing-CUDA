@@ -44,6 +44,7 @@ struct MTParams {  // device arrays, one entry per parameter
     float **master = nullptr, **m = nullptr, **v = nullptr, **grad = nullptr;
     bf16** work = nullptr;
     unsigned char* flags = nullptr;  // bit 0: in the gradient norm, bit 1: updated by AdamW
+    float* lrmul = nullptr;          // per-parameter factor on the learning rate (mup)
     MTChunk* chunks = nullptr;
     int nchunks = 0;
     double* sumsq = nullptr;  // global squared gradient norm
@@ -78,12 +79,13 @@ __global__ void mt_adam_kernel(MTParams P, float clip, float lr, float b1, float
     float *master = P.master[c.param] + c.start, *m = P.m[c.param] + c.start, *v = P.v[c.param] + c.start;
     const float* grad = P.grad[c.param] + c.start;
     bf16* work = P.work[c.param] + c.start;
+    float step_lr = lr * P.lrmul[c.param];
     for (int i = threadIdx.x; i < c.len; i += blockDim.x) {
         float g = grad[i] * scale;
         float nm = b1 * m[i] + (1.0f - b1) * g;
         float nv = b2 * v[i] + (1.0f - b2) * g * g;
         m[i] = nm; v[i] = nv;
-        float w = master[i] - lr * ((nm / bc1) / (sqrtf(nv / bc2) + eps) + wd * master[i]);
+        float w = master[i] - step_lr * ((nm / bc1) / (sqrtf(nv / bc2) + eps) + wd * master[i]);
         master[i] = w;
         work[i] = f2bf(w);
     }

@@ -34,7 +34,6 @@ pub const Generator = struct {
             .s = try session.Session.init(gpa, io, cfg, ptx),
             .rng = stdrand.Mt19937.init(seed),
         };
-        g.s.attach();
         try checkpoint.loadWeights(gpa, io, path, &g.s.m, file_cfg);
         return g;
     }

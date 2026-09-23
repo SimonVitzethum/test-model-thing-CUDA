@@ -172,7 +172,6 @@ const Kg = struct {
             .R = @intCast(cfg.mem_rdim), .gpa = gpa, .w = undefined,
             .last = try gpa.alloc(c_int, B), .rows = try gpa.alloc(f32, B * D),
         };
-        kg.sess.attach();
         kg.w = try Window.init(gpa, B, kg.T, kg.M);
         return kg;
     }

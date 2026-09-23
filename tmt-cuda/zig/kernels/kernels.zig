@@ -230,22 +230,30 @@ pub const CellOpt = extern struct {
     plen: ?cuda.ConstGlobal(i32) = null,
 };
 
-/// The decay of one step: its value, and the derivative with respect to the
-/// pre-activation, which the backward needs.
-const Step = struct { eff: f32, dadz: f32 };
+/// One step of the recurrence: the decay that multiplies the state, the
+/// sigmoid it came from, and how many bytes the step covers. The backward
+/// derives the local term from these, in the association the C++ kernel uses,
+/// so a model without patching computes the same bits as before.
+const Step = struct { eff: f32, a: f32, len: f32 = 1, scaled: bool = false };
 
 inline fn cellStep(o: CellOpt, decay: f32, gate: ?cuda.ConstGlobal(f32), d: u32, x: f32,
                    b: u32, T: i32, t: i32) Step {
     const at: usize = @intCast(@as(i32, @intCast(b)) * T + t);
-    if (o.mask) |m| if (m[at] == 0) return .{ .eff = 1, .dadz = 0 };
-    if (o.docsep >= 0 and o.ids.?[at] == o.docsep) return .{ .eff = 0, .dadz = 0 };
+    if (o.mask) |m| if (m[at] == 0) return .{ .eff = 1, .a = 1 };
+    if (o.docsep >= 0 and o.ids.?[at] == o.docsep) return .{ .eff = 0, .a = 0 };
     const a = cuda.sigmoid(decay + if (gate) |g| g[d] * x else 0);
     if (o.plen) |lens| {
         const len: f32 = @floatFromInt(lens[at]);
-        const eff = cuda.__nv_fast_powf(a, len);
-        return .{ .eff = eff, .dadz = len * eff * (1.0 - a) };
+        return .{ .eff = cuda.__nv_fast_powf(a, len), .a = a, .len = len, .scaled = true };
     }
-    return .{ .eff = a, .dadz = a * (1.0 - a) };
+    return .{ .eff = a, .a = a };
+}
+
+/// d(decay of the step) / d(pre-activation), times (prev - x).
+inline fn cellLocal(st: Step, prev: f32, x: f32, masked: bool) f32 {
+    if (masked) return 0;
+    if (st.scaled) return (prev - x) * (st.len * st.eff * (1.0 - st.a));
+    return (prev - x) * st.a * (1.0 - st.a);
 }
 
 /// Pass 1: the time loop, one thread per (stream, channel).
@@ -332,7 +340,7 @@ export fn state_bwd(dS: cuda.ConstGlobal(bf16), S: cuda.ConstGlobal(f32), decay:
         const a = st.eff;
         const total = cuda.bf2f(dS[idx]) + future;
         const prev = if (t != 0) S[idx - @as(usize, @intCast(D))] else if (initial) |i| i[@as(usize, b) * @as(usize, @intCast(D)) + d] else 0;
-        const local = (prev - x) * st.dadz;
+        const local = cellLocal(st, prev, x, a == 1 and o.mask != null);
         const gz = total * local;
         dX[idx] = total * (1.0 - a) + if (gate) |g| gz * g[d] else 0;
         gd += gz;
@@ -393,7 +401,7 @@ export fn emb_trace(X: cuda.ConstGlobal(bf16), S: cuda.ConstGlobal(f32), initial
         const st = cellStep(o, decay[d], gate, d, x, b, T, t);
         const a = st.eff;
         const prev = if (t != 0) S[idx - dim] else initial[bd];
-        const k = if (gate) |g| @mulAdd(f32, (prev - x) * st.dadz, g[d], 1.0 - a) else 1.0 - a;
+        const k = if (gate) |g| @mulAdd(f32, cellLocal(st, prev, x, false), g[d], 1.0 - a) else 1.0 - a;
         e[@as(usize, @intCast(o.ids.?[@intCast(@as(i32, @intCast(b)) * T + t)])) * dim] += suffix * k;
         suffix *= o.gamma * a;
     }

@@ -435,6 +435,7 @@ static void build_opt_table(Model& m) {
     std::vector<float*> master(P), mm(P), vv(P), grad(P);
     std::vector<bf16*> work(P);
     std::vector<unsigned char> flags(P);
+    std::vector<float> lrmul(P, 1.f);
     std::vector<MTChunk> chunks;
     for (size_t i = 0; i < P; ++i) {
         auto& p = m.params.at(i);
@@ -449,7 +450,7 @@ static void build_opt_table(Model& m) {
         CUDA_CHECK(cudaMemcpy(dst, src.data(), src.size() * sizeof(src[0]), cudaMemcpyHostToDevice));
     };
     up(m.opt.master, master); up(m.opt.m, mm); up(m.opt.v, vv); up(m.opt.grad, grad);
-    up(m.opt.work, work); up(m.opt.flags, flags); up(m.opt.chunks, chunks);
+    up(m.opt.work, work); up(m.opt.flags, flags); up(m.opt.lrmul, lrmul); up(m.opt.chunks, chunks);
     m.opt.nchunks = (int)chunks.size();
     m.memory.allocate(m.opt.sumsq, sizeof(double));
 }
