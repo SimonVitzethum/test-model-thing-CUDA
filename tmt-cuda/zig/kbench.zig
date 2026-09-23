@@ -234,7 +234,7 @@ pub fn main(init: std.process.Init) !u8 {
         // What the dispatch really runs: one matmul per expert, each over its
         // own rows, padded to a multiple of 128.
         const per_expert = ((N * K / E + 127) / 128) * 128;
-        try rows.append(gpa, .{ .name = "gemm one expert", .flops = 2 * @as(f64, @floatFromInt(per_expert)) * fD * fD, .per_step = layers * @as(f64, @floatFromInt(E)) * 3, .us = try timeIt(repeat, .{ .a = ba, .b = bb, .c = bc, .M = per_expert, .D = D }, struct {
+        try rows.append(gpa, .{ .name = "gemm one expert", .flops = 2 * @as(f64, @floatFromInt(per_expert)) * fD * fD, .per_step = 0, .us = try timeIt(repeat, .{ .a = ba, .b = bb, .c = bc, .M = per_expert, .D = D }, struct {
             fn f(c: anytype) !void {
                 try linalg.linearFwd(@intCast(c.M), @intCast(c.D), @intCast(c.D), c.a, c.b, c.c);
             }
@@ -264,7 +264,7 @@ pub fn main(init: std.process.Init) !u8 {
         try gpu.upload(pb, std.mem.sliceAsBytes(table[E .. 2 * E]));
         try gpu.upload(pc, std.mem.sliceAsBytes(table[2 * E ..]));
         const flops = 2 * @as(f64, @floatFromInt(per_expert * E)) * fD * fD;
-        try rows.append(gpa, .{ .name = "gemm experts batched", .flops = flops, .per_step = 0, .us = try timeIt(repeat, .{ .a = @intFromPtr(pa), .b = @intFromPtr(pb), .c = @intFromPtr(pc), .M = per_expert, .D = D, .E = E }, struct {
+        try rows.append(gpa, .{ .name = "gemm experts batched", .flops = flops, .per_step = layers * 3, .us = try timeIt(repeat, .{ .a = @intFromPtr(pa), .b = @intFromPtr(pb), .c = @intFromPtr(pc), .M = per_expert, .D = D, .E = E }, struct {
             fn f(c: anytype) !void {
                 try linalg.linearFwdBatched(@intCast(c.M), @intCast(c.D), @intCast(c.D), c.a, c.b, c.c, @intCast(c.E));
             }
