@@ -1535,3 +1535,41 @@ export fn patch_broadcast_bwd(dX: cuda.ConstGlobal(bf16), first: cuda.ConstGloba
     while (t <= hi and lo >= 0) : (t += 1) acc += cuda.bf2f(dX[@intCast((b * T + t) * D + d)]);
     dXp[@intCast(i)] = cuda.f2bf(acc);
 }
+
+/// The embedding gradient without atomics, in two passes.
+///
+/// The host sorts the window's positions by byte value and cuts each byte's
+/// run into tiles of equal size. One block per (tile, channel block) sums its
+/// tile, and a second pass adds a byte's tiles together in a fixed order.
+/// Summing a whole byte in one block would be reproducible too, but the
+/// frequent bytes are hundreds of positions long and the rare ones two, so
+/// one block would run while the rest of the machine idles.
+export fn emb_tiles(dOut: cuda.ConstGlobal(f32), perm: cuda.ConstGlobal(i32),
+                    tile_from: cuda.ConstGlobal(i32), tile_to: cuda.ConstGlobal(i32),
+                    partial: cuda.Global(f32), D: i32) callconv(.nvptx_kernel) void {
+    const tile = cuda.blockIdxX();
+    const d = cuda.blockIdxY() * cuda.blockDimX() + cuda.threadIdxX();
+    if (d >= @as(u32, @bitCast(D))) return;
+    const dim: usize = @intCast(D);
+    var acc: f32 = 0;
+    var i = tile_from[tile];
+    const to = tile_to[tile];
+    while (i < to) : (i += 1) acc += dOut[@as(usize, @intCast(perm[@intCast(i)])) * dim + d];
+    partial[@as(usize, tile) * dim + d] = acc;
+}
+
+/// Second pass: a byte's tiles, added in the order the host laid them out.
+export fn emb_reduce(partial: cuda.ConstGlobal(f32), byte_tiles: cuda.ConstGlobal(i32),
+                     dW: cuda.Global(f32), D: i32) callconv(.nvptx_kernel) void {
+    const r = cuda.blockIdxX(); // byte value
+    const d = cuda.blockIdxY() * cuda.blockDimX() + cuda.threadIdxX();
+    if (d >= @as(u32, @bitCast(D))) return;
+    const from = byte_tiles[r];
+    const to = byte_tiles[r + 1];
+    if (from == to) return;
+    const dim: usize = @intCast(D);
+    var acc: f32 = 0;
+    var t = from;
+    while (t < to) : (t += 1) acc += partial[@as(usize, @intCast(t)) * dim + d];
+    dW[@as(usize, r) * dim + d] += acc;
+}

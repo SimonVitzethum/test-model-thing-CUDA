@@ -97,6 +97,23 @@ pub fn main(init: std.process.Init) !u8 {
     const bb = try mem.callocT(u16, span);
     const bc = try mem.callocT(u16, span);
     const ia = try mem.callocT(i32, span);
+    const islots = try mem.callocT(i32, span);
+    // Index buffers decide how much these kernels collide, so they hold
+    // realistic values: byte ids spread over 256 rows, and slots a
+    // permutation, as the dispatch produces.
+    {
+        const host = try gpa.alloc(i32, @max(N * K, N));
+        defer gpa.free(host);
+        var r: u32 = 12345;
+        for (host, 0..) |*v, i| {
+            r = r *% 1664525 +% 1013904223;
+            v.* = @intCast((r >> 8) % 256);
+            _ = i;
+        }
+        try gpu.upload(ia, std.mem.sliceAsBytes(host[0..N]));
+        for (host, 0..) |*v, i| v.* = @intCast(i % (N * K));
+        try gpu.upload(islots, std.mem.sliceAsBytes(host[0 .. N * K]));
+    }
 
     // ---- the ceilings, measured with the same clock ----
     const stream_us = try timeIt(20, .{ .k = try mod.get("copy_bf16"), .a = fa, .b = ba, .n = stream_n }, struct {
@@ -179,17 +196,17 @@ pub fn main(init: std.process.Init) !u8 {
                 try c.k.launch(@intCast(c.N), 64, .{ c.x, c.W, c.l, c.p, c.i, c.w, @as(i32, @intCast(c.N)), @as(i32, @intCast(c.E)), @as(i32, @intCast(c.K)), @as(i32, @intCast(c.D)) });
             }
         }.f) });
-        try rows.append(gpa, .{ .name = "gather_slot", .bytes = 4 * NKD, .per_step = 2 * layers, .us = try timeIt(repeat, .{ .k = try mod.get("gather_slot"), .x = ba, .s = ia, .o = bb, .N = N, .K = K, .D = D, .g = @as(u32, @intCast((N * K * D + 255) / 256)) }, struct {
+        try rows.append(gpa, .{ .name = "gather_slot", .bytes = 4 * NKD, .per_step = 2 * layers, .us = try timeIt(repeat, .{ .k = try mod.get("gather_slot"), .x = ba, .s = islots, .o = bb, .N = N, .K = K, .D = D, .g = @as(u32, @intCast((N * K * D + 255) / 256)) }, struct {
             fn f(c: anytype) !void {
                 try c.k.launch(c.g, 256, .{ c.x, c.s, c.o, @as(i32, @intCast(c.N)), @as(i32, @intCast(c.K)), @as(i32, @intCast(c.D)) });
             }
         }.f) });
-        try rows.append(gpa, .{ .name = "combine", .bytes = 2 * NKD + 4 * ND, .per_step = layers, .us = try timeIt(repeat, .{ .k = try mod.get("combine"), .y = ba, .w = fa, .s = ia, .o = bb, .N = N, .K = K, .D = D, .g = blocks }, struct {
+        try rows.append(gpa, .{ .name = "combine", .bytes = 2 * NKD + 4 * ND, .per_step = layers, .us = try timeIt(repeat, .{ .k = try mod.get("combine"), .y = ba, .w = fa, .s = islots, .o = bb, .N = N, .K = K, .D = D, .g = blocks }, struct {
             fn f(c: anytype) !void {
                 try c.k.launch(c.g, 256, .{ c.y, c.w, c.s, c.o, @as(i32, @intCast(c.N)), @as(i32, @intCast(c.K)), @as(i32, @intCast(c.D)), @as(f32, 1) });
             }
         }.f) });
-        try rows.append(gpa, .{ .name = "scatter_add", .bytes = 2 * NKD + 4 * ND, .per_step = layers, .us = try timeIt(repeat, .{ .k = try mod.get("scatter_add"), .d = ba, .s = ia, .o = bb, .N = N, .K = K, .D = D, .g = blocks }, struct {
+        try rows.append(gpa, .{ .name = "scatter_add", .bytes = 2 * NKD + 4 * ND, .per_step = layers, .us = try timeIt(repeat, .{ .k = try mod.get("scatter_add"), .d = ba, .s = islots, .o = bb, .N = N, .K = K, .D = D, .g = blocks }, struct {
             fn f(c: anytype) !void {
                 try c.k.launch(c.g, 256, .{ c.d, c.s, c.o, @as(i32, @intCast(c.N)), @as(i32, @intCast(c.K)), @as(i32, @intCast(c.D)) });
             }
@@ -228,6 +245,18 @@ pub fn main(init: std.process.Init) !u8 {
             try linalg.linearFwd(@intCast(c.N), 256, @intCast(c.D), c.a, c.b, c.c);
         }
     }.f) });
+
+    // How much does issuing work cost, independent of the work itself? A
+    // kernel with nothing to do, launched many times without waiting.
+    {
+        const k = try mod.get("zero_f32");
+        const us = try timeIt(2000, .{ .k = k, .a = fa }, struct {
+            fn f(c: anytype) !void {
+                try c.k.launch(1, 32, .{ c.a, @as(i64, 1) });
+            }
+        }.f);
+        try rows.append(gpa, .{ .name = "empty launch", .us = us, .per_step = 0 });
+    }
 
     // ---- the table ----
     // Printed separately: one snprintf with many mixed integer and float

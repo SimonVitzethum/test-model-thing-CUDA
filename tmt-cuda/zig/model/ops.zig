@@ -31,6 +31,15 @@ fn blocks(n: usize) u32 {
 pub fn embForward(k: *gpu.Kernels, W: [*]const bf16, ids: [*]const i32, out: [*]bf16, N: i32, D: i32) !void {
     try (try k.get("emb_gather")).launch(blocks(@intCast(N)), 256, .{ W, ids, out, N, D });
 }
+/// The deterministic form: one thread per (byte, channel), summing the
+/// segment the host sorted for it.
+pub fn embBackwardSorted(k: *gpu.Kernels, dOut: [*]const f32, perm: [*]const i32,
+                         tile_from: [*]const i32, tile_to: [*]const i32, byte_tiles: [*]const i32,
+                         partial: [*]f32, tiles: usize, dW: [*]f32, D: i32) !void {
+    const gy: u32 = @intCast(@divTrunc(D + 255, 256));
+    try (try k.get("emb_tiles")).launchGrid(@intCast(tiles), gy, 256, .{ dOut, perm, tile_from, tile_to, partial, D });
+    try (try k.get("emb_reduce")).launchGrid(256, gy, 256, .{ partial, byte_tiles, dW, D });
+}
 pub fn embBackward(k: *gpu.Kernels, dOut: [*]const f32, ids: [*]const i32, dW: [*]f32, N: i32, D: i32) !void {
     try (try k.get("emb_scatter")).launch(blocks(@intCast(N)), 256, .{ dOut, ids, dW, N, D });
 }

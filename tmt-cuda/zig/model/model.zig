@@ -12,6 +12,9 @@ const muon = @import("muon.zig");
 pub const bf16 = u16;
 pub const Cfg = cfgmod.Cfg;
 const MT_CHUNK: i64 = 4096;
+/// Positions per tile of the embedding gradient: small enough to spread the
+/// frequent bytes over the machine, large enough that the second pass stays short.
+const EMB_TILE: usize = 32;
 
 pub const Layer = struct {
     decay: usize = 0,
@@ -118,6 +121,14 @@ pub const Model = struct {
     nxt: [*]i32 = undefined,
     end: [*]i32 = undefined,
     pos: [*]i64 = undefined,
+    /// The window's positions sorted by byte value, with the 257 segment
+    /// boundaries: what the embedding gradient sums over.
+    emb_perm: [*]i32 = undefined,
+    emb_tile_from: [*]i32 = undefined,
+    emb_tile_to: [*]i32 = undefined,
+    emb_byte_tiles: [*]i32 = undefined,
+    emb_partial: [*]f32 = undefined,
+    emb_tiles: usize = 0,
     moe_stats: ?[*]f32 = null,
     /// Diagnostics: accumulate the trace part of the gradients in `trlog`.
     log_traces: bool = false,
@@ -280,6 +291,13 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
     m.tgtX = try m.mem.allocT(bf16, ND);
     m.mv = try m.mem.allocT(f32, 2);
     m.pos = try m.mem.allocT(i64, N);
+    m.emb_perm = try m.mem.allocT(i32, N);
+    // At most one tile per EMB_TILE positions plus one partial tile per byte.
+    const max_tiles = (N + EMB_TILE - 1) / EMB_TILE + 256;
+    m.emb_tile_from = try m.mem.allocT(i32, max_tiles);
+    m.emb_tile_to = try m.mem.allocT(i32, max_tiles);
+    m.emb_byte_tiles = try m.mem.allocT(i32, 257);
+    m.emb_partial = try m.mem.allocT(f32, max_tiles * D);
 
     if (c.patch_hi > 0) { // room for the worst case, one patch per byte
         const P = &m.patches;
@@ -629,6 +647,49 @@ fn hostSum(gpa: std.mem.Allocator, d: [*]const f32, n: usize) !f32 {
 pub const Losses = struct { total: f32, ce: f32 };
 
 /// One window: embedding, the layer stack, the decoder and the losses.
+
+/// Sort the window's positions by byte value, so the embedding gradient can
+/// sum each byte's segment without atomics. Counting sort, stable, on the
+/// host, where the bytes already are.
+pub fn sortByByte(m: *Model, ids: []const i32) !void {
+    const gpa = m.gpa;
+    const perm = try gpa.alloc(i32, ids.len);
+    defer gpa.free(perm);
+    var offsets: [257]i32 = @splat(0);
+    for (ids) |id| offsets[@as(usize, @intCast(id & 0xff)) + 1] += 1;
+    for (1..257) |i| offsets[i] += offsets[i - 1];
+    var cursor = offsets;
+    for (ids, 0..) |id, i| {
+        const bucket: usize = @intCast(id & 0xff);
+        perm[@intCast(cursor[bucket])] = @intCast(i);
+        cursor[bucket] += 1;
+    }
+    // Cut every byte's run into tiles, so the frequent bytes are spread over
+    // many blocks instead of holding one block busy on their own.
+    const max_tiles = (ids.len + EMB_TILE - 1) / EMB_TILE + 256;
+    const tile_from = try gpa.alloc(i32, max_tiles);
+    defer gpa.free(tile_from);
+    const tile_to = try gpa.alloc(i32, max_tiles);
+    defer gpa.free(tile_to);
+    var byte_tiles: [257]i32 = @splat(0);
+    var n: usize = 0;
+    for (0..256) |r| {
+        byte_tiles[r] = @intCast(n);
+        const tile: i32 = @intCast(EMB_TILE);
+        var at = offsets[r];
+        while (at < offsets[r + 1]) : (at += tile) {
+            tile_from[n] = at;
+            tile_to[n] = @min(at + tile, offsets[r + 1]);
+            n += 1;
+        }
+    }
+    byte_tiles[256] = @intCast(n);
+    m.emb_tiles = n;
+    try gpu.upload(m.emb_perm, std.mem.sliceAsBytes(perm));
+    try gpu.upload(m.emb_tile_from, std.mem.sliceAsBytes(tile_from[0..n]));
+    try gpu.upload(m.emb_tile_to, std.mem.sliceAsBytes(tile_to[0..n]));
+    try gpu.upload(m.emb_byte_tiles, std.mem.sliceAsBytes(byte_tiles[0..]));
+}
 
 /// Work out this window's patch boundaries from the bytes and upload them.
 /// A fixed stride is the baseline; the byte-class rule ends a patch after a
@@ -1049,7 +1110,8 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
             m.store.at(m.MS.decay).grad, m.store.at(m.MS.gate).grad, m.store.at(m.emb).grad,
             m.store.at(m.MS.eprev).grad, m.store.at(m.MS.pos).grad, c.batch, c.mem_len, c.dim);
     try (try k.get("cast_add")).launch(blocks(ND), 256, .{ m.dXs, m.dEnc, nd_i64 });
-    try ops.embBackward(k, m.dEnc, m.ids, m.store.at(m.emb).grad, @intCast(N), c.dim);
+    try ops.embBackwardSorted(k, m.dEnc, m.emb_perm, m.emb_tile_from, m.emb_tile_to,
+        m.emb_byte_tiles, m.emb_partial, m.emb_tiles, m.store.at(m.emb).grad, c.dim);
     try gpu.checkLaunch();
 }
 

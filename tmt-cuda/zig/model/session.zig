@@ -58,6 +58,7 @@ pub const Session = struct {
         // The patch boundaries follow from the bytes, so they are worked out
         // here, where the window still exists on the host.
         try model.layoutPatches(&s.m, ids);
+        try model.sortByByte(&s.m, ids);
         try gpu.upload(s.m.ids, std.mem.sliceAsBytes(ids));
         try gpu.upload(s.m.nxt, std.mem.sliceAsBytes(targets));
         try gpu.upload(s.m.end, std.mem.sliceAsBytes(ends));
