@@ -202,16 +202,74 @@ The interaction to watch: long half-lives see no signal at short context,
 so either grow `half_max` along with the window or accept that those
 channels start late.
 
-### 14. Self-distillation [35%]
+### 14. Distillation from a local LLM [55%]
 
-Soft targets carry more bits per example than a one-hot byte, and for a
-model that overfits at 24 epochs a soft target is also a regulariser -
-which is why this sits in the same bucket as item 2.
+Second only to item 1, and it attacks the same bottleneck: a one-hot byte
+carries at most 8 bits, a soft distribution over 256 bytes carries far
+more. Distillation multiplies the information per byte, which is exactly
+what a data-limited model is short of. A 40M byte-level student from an 8B
+teacher is the textbook case for it.
 
-An outside teacher is awkward: they are token-based, so the distribution
-has to be marginalised over the tokenisation to become a byte
-distribution. Doable, not trivial. The cheaper route is an earlier
-checkpoint of this model as its own teacher, which also pairs with item 6.
+A teacher is already on this machine: `qwen3:8b` at 5.2 GB fits in the
+8 GB of VRAM (`qwen3:1.7b` at 1.4 GB is the fast alternative).
+
+**Measured, not estimated.** Qwen3-1.7B scored against the same held-out
+set the model is measured on (`enwik8/held.bin`, 2 MB, 1024-token windows,
+bf16):
+
+```
+Qwen3-1.7B    0.853 BPB      3.08 bits per token, 3.6 bytes per token
+this model    1.63  BPB
+```
+
+The teacher is nearly twice as good, and that is the *small* one. The
+chunk boundaries handicap it slightly, so the true figure is a little
+better still.
+
+**Cost, once, not per run.** Scoring runs at 6337 tokens/s on this GPU:
+
+| corpus | teacher | wall clock |
+|---|---|---|
+| enwik8 (100 MB) | Qwen3-1.7B | **1.2 h** |
+| enwik9 (1 GB) | Qwen3-1.7B | **11.8 h**, one night |
+| enwik8 | Qwen3-8B | ~5 h, estimated from the size ratio |
+
+Top-8 targets over enwik9 come to roughly 13 GB on disk. Every run after
+that reads them for free.
+
+The measurement script is `teacher_bpb.py`; it takes the model name, the
+corpus and how many bytes to score.
+
+**The tokenisation is solvable, and more cheaply than it first looks.**
+The teacher is BPE, the student is bytes. At a token boundary the teacher
+gives `P(t)` over tokens, so
+
+```
+P(next byte = b) = sum of P(t) over all t beginning with b
+```
+
+and for bytes *inside* a token no second forward pass is needed: restrict
+the token set to those consistent with the bytes emitted so far,
+renormalise, group by next byte. A trie over the vocabulary, one teacher
+forward per *token* rather than per byte, and a byte-level target at every
+position from roughly 4x less teacher work.
+
+The one approximation: if the real text falls outside the top-k the
+consistent set goes empty, and the target falls back to the hard byte.
+
+**The question that had to be answered first** - whether a model trained
+on code and mathematics is any good on 2006 Wikipedia markup - is answered
+above, and the answer is yes.
+
+**Caveats.** The student can pick up abilities it could never have learned
+from the data, which is the point, but it makes comparisons against the
+existing runs a comparison between two different things. And it is several
+days of work: trie, marginalisation, target format, loader, a KL term
+beside the cross-entropy.
+
+Self-distillation from an earlier checkpoint of this model remains
+possible and pairs with item 6, but it is the weak version: the teacher is
+capped at what the student already reached.
 
 ### 15. Selective loss on learnable bytes, Rho-1-style [20%]
 
