@@ -5,6 +5,30 @@ const gpu = @import("gpu.zig");
 
 pub const bf16 = u16;
 
+/// How many rows one expert may be padded to for the batched matmul: twice
+/// the balanced share is as much padding as the batched form can ever repay.
+pub fn uniformRows(N: usize, E: usize, K: usize) usize {
+    return ((2 * N * K / E + 127) / 128) * 128;
+}
+
+/// One batched matmul over all experts is about 1.7 times faster than the same
+/// work issued per expert, but it has to pad every expert to the longest one.
+/// It therefore only pays while the router is reasonably balanced, which is
+/// what this decides, per window.
+fn batchWorthIt(k: *const Keep, E: usize, pm: i32, capacity: usize) bool {
+    if (pm <= 0 or @as(usize, @intCast(pm)) > capacity) return false;
+    var own: i64 = 0;
+    for (0..E) |e| own += @divTrunc(k.hcnt[e] + 127, 128) * 128;
+    const padded: i64 = @as(i64, pm) * @as(i64, @intCast(E));
+    return padded * 4 <= own * 5; // at most a quarter more work than the loop
+}
+
+/// Slots the dispatch buffers must hold: enough for every expert to be padded
+/// alike, which is what lets one batched matmul serve them all.
+pub fn slotCapacity(N: usize, E: usize, K: usize) usize {
+    return @max(N * K + E * 128, E * uniformRows(N, E, K));
+}
+
 /// Kept per layer between forward and backward.
 pub const Keep = struct {
     zloss: f32 = 0,
@@ -30,7 +54,7 @@ pub const Keep = struct {
     stat: ?[*]f32 = null,
 
     pub fn alloc(k: *Keep, mem: *gpu.Memory, N: usize, E: usize, K: usize, D: usize) !void {
-        const Tk = N * K + E * 128; // padding slack, 128 slots per expert
+        const Tk = slotCapacity(N, E, K);
         k.logits = try mem.allocT(f32, N * E);
         k.probs = try mem.allocT(f32, N * E);
         k.idx = try mem.allocT(i32, N * K);
@@ -45,6 +69,17 @@ pub const Keep = struct {
 
 /// Shared transient buffers; the layers run one after the other.
 pub const Ws = struct {
+    /// Device arrays of pointers for the batched expert matmuls: the rows of
+    /// each expert, its output, and the gradients of both.
+    pxg: u64 = 0,
+    pyg: u64 = 0,
+    pdyg: u64 = 0,
+    pdxg: u64 = 0,
+    /// The row count each expert is padded to; the pointer arrays describe
+    /// this padding, so they are rebuilt when it changes.
+    padded: usize = 0,
+    /// How many rows per expert the buffers can hold.
+    capacity: usize = 0,
     w: [*]f32 = undefined, // (N,K) routing weights
     offsets: [*]i32 = undefined, // (E)
     cursor: [*]i32 = undefined, // (E)
@@ -58,7 +93,11 @@ pub const Ws = struct {
     Xf: [*]f32 = undefined, // (N,D) fp32 copy of H for the router weight gradient
 
     pub fn alloc(w: *Ws, mem: *gpu.Memory, N: usize, E: usize, K: usize, D: usize) !void {
-        const Tk = N * K + E * 128;
+        // Room for every expert to be padded to the same length, up to twice
+        // the balanced share. Beyond that the dispatch falls back to one
+        // matmul per expert rather than padding the whole window away.
+        w.capacity = uniformRows(N, E, K);
+        const Tk = slotCapacity(N, E, K);
         w.w = try mem.allocT(f32, N * K);
         w.offsets = try mem.allocT(i32, E);
         w.cursor = try mem.allocT(i32, E);
@@ -70,6 +109,29 @@ pub const Ws = struct {
         w.dlog_b = try mem.allocT(bf16, N * E);
         w.dXg = try mem.allocT(bf16, Tk * D);
         w.Xf = try mem.allocT(f32, N * D);
+        w.pxg = @intFromPtr(try mem.allocT(u64, E));
+        w.pyg = @intFromPtr(try mem.allocT(u64, E));
+        w.pdyg = @intFromPtr(try mem.allocT(u64, E));
+        w.pdxg = @intFromPtr(try mem.allocT(u64, E));
+    }
+
+    /// Points the arrays at the slices of this window's padding.
+    fn setPointers(w: *Ws, gpa: std.mem.Allocator, E: usize, D: usize, pm: usize, k: *const Keep) !void {
+        if (w.padded == pm) return;
+        const host = try gpa.alloc(u64, E * 4);
+        defer gpa.free(host);
+        for (0..E) |e| {
+            const at = e * pm * D;
+            host[e] = @intFromPtr(w.Xg + at);
+            host[E + e] = @intFromPtr(k.Yg + at);
+            host[2 * E + e] = @intFromPtr(w.dYg + at);
+            host[3 * E + e] = @intFromPtr(w.dXg + at);
+        }
+        try gpu.upload(@as(*anyopaque, @ptrFromInt(w.pxg)), std.mem.sliceAsBytes(host[0..E]));
+        try gpu.upload(@as(*anyopaque, @ptrFromInt(w.pyg)), std.mem.sliceAsBytes(host[E .. 2 * E]));
+        try gpu.upload(@as(*anyopaque, @ptrFromInt(w.pdyg)), std.mem.sliceAsBytes(host[2 * E .. 3 * E]));
+        try gpu.upload(@as(*anyopaque, @ptrFromInt(w.pdxg)), std.mem.sliceAsBytes(host[3 * E ..]));
+        w.padded = pm;
     }
 };
 
@@ -91,8 +153,9 @@ fn blocks(n: usize) u32 {
 
 /// Top-k dispatch, the expert matmuls and the weighted combine. Returns the
 /// auxiliary loss unless the caller collects the statistics itself.
-pub fn forward(kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16, Wexp: []const [*]bf16,
-               Y: [*]bf16, k: *Keep, w: *Ws, N: usize, E: usize, K: usize, D: usize, beta: f32) !f32 {
+pub fn forward(gpa: std.mem.Allocator, kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16,
+               Wexp: []const [*]bf16, wptr: u64, Y: [*]bf16, k: *Keep, w: *Ws,
+               N: usize, E: usize, K: usize, D: usize, beta: f32) !f32 {
     k.N = @intCast(N);
     k.E = @intCast(E);
     k.K = @intCast(K);
@@ -120,11 +183,17 @@ pub fn forward(kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16, Wex
         k.hoff[e] = tk;
         tk += k.hcnt[e];
     }
-    // Padded to blocks of 128, which keeps the GEMM shapes stable.
+    // Padded to blocks of 128, which keeps the GEMM shapes stable. When every
+    // expert fits the same padded length, they are laid out alike and one
+    // batched matmul serves all of them.
+    var pm: i32 = 0;
+    for (0..E) |e| pm = @max(pm, @divTrunc(k.hcnt[e] + 127, 128) * 128);
+    const uniform = batchWorthIt(k, E, pm, w.capacity);
     for (0..E) |e| {
-        k.phoff[e] = ptk;
+        k.phoff[e] = if (uniform) @as(i32, @intCast(e)) * pm else ptk;
         ptk += @divTrunc(k.hcnt[e] + 127, 128) * 128;
     }
+    if (uniform) ptk = @as(i32, @intCast(E)) * pm;
     k.Tk = tk;
     k.Ptk = ptk;
     try gpu.upload(w.cursor, std.mem.sliceAsBytes(k.phoff[0..E]));
@@ -134,11 +203,14 @@ pub fn forward(kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16, Wex
     if (tk > 0) {
         try (try kern.get("gather_slot")).launch(blocks(N * K * D), 256,
             .{ X, k.slot_of, w.Xg, @as(i32, @intCast(N)), @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
-        for (0..E) |e| {
-            const pm = @divTrunc(k.hcnt[e] + 127, 128) * 128;
-            if (pm == 0) continue;
+        if (uniform) {
+            try w.setPointers(gpa, E, D, @intCast(pm), k);
+            try linalg.linearFwdBatched(pm, @intCast(D), @intCast(D), w.pxg, wptr, w.pyg, @intCast(E));
+        } else for (0..E) |e| {
+            const rows = @divTrunc(k.hcnt[e] + 127, 128) * 128;
+            if (rows == 0) continue;
             const off: usize = @as(usize, @intCast(k.phoff[e])) * D;
-            try linalg.linearFwd(pm, @intCast(D), @intCast(D), w.Xg + off, Wexp[e], k.Yg + off);
+            try linalg.linearFwd(rows, @intCast(D), @intCast(D), w.Xg + off, Wexp[e], k.Yg + off);
         }
     }
     try (try kern.get("combine")).launch(blocks(N * D), 256,
@@ -160,9 +232,9 @@ pub fn forward(kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16, Wex
 
 /// Backward through combine, the experts and the router, including the
 /// analytic gradients of the balancing terms.
-pub fn backward(kern: *gpu.Kernels, dY: [*]const bf16, Wexp: []const [*]bf16, Wrouter: [*]const bf16,
-                dWrouter: [*]f32, dWexp: []const [*]f32, dX: [*]bf16, k: *Keep, w: *Ws,
-                aux: f32, zcoef: f32) !void {
+pub fn backward(gpa: std.mem.Allocator, kern: *gpu.Kernels, dY: [*]const bf16, Wexp: []const [*]bf16,
+                wptr: u64, Wrouter: [*]const bf16, dWrouter: [*]f32, dWexp: []const [*]f32,
+                dwptr: u64, dX: [*]bf16, k: *Keep, w: *Ws, aux: f32, zcoef: f32) !void {
     const N: usize = @intCast(k.N);
     const E: usize = @intCast(k.E);
     const K: usize = @intCast(k.K);
@@ -197,13 +269,21 @@ pub fn backward(kern: *gpu.Kernels, dY: [*]const bf16, Wexp: []const [*]bf16, Wr
     try linalg.linearDW(@intCast(N), @intCast(E), @intCast(D), w.dlog_b, k.H, dWrouter, 0);
     // The router's input gradient accumulates into dX.
     try linalg.linearDX(@intCast(N), @intCast(E), @intCast(D), w.dlog_b, Wrouter, dX, 1);
-    for (0..E) |e| {
-        const pm = @divTrunc(k.hcnt[e] + 127, 128) * 128;
-        if (pm == 0) continue;
+    // The same padding as in the forward, so the same batched shapes apply.
+    var pm: i32 = 0;
+    for (0..E) |e| pm = @max(pm, @divTrunc(k.hcnt[e] + 127, 128) * 128);
+    const uniform = batchWorthIt(k, E, pm, w.capacity) and w.padded == @as(usize, @intCast(pm));
+    if (uniform) {
+        try linalg.linearDWBatched(pm, @intCast(D), @intCast(D), w.pdyg, w.pxg, dwptr, @intCast(E));
+        try linalg.linearDXBatched(pm, @intCast(D), @intCast(D), w.pdyg, wptr, w.pdxg, @intCast(E));
+    } else for (0..E) |e| {
+        const rows = @divTrunc(k.hcnt[e] + 127, 128) * 128;
+        if (rows == 0) continue;
         const off: usize = @as(usize, @intCast(k.phoff[e])) * D;
-        try linalg.linearDW(pm, @intCast(D), @intCast(D), w.dYg + off, w.Xg + off, dWexp[e], 0);
-        try linalg.linearDX(pm, @intCast(D), @intCast(D), w.dYg + off, Wexp[e], w.dXg + off, 0);
+        try linalg.linearDW(rows, @intCast(D), @intCast(D), w.dYg + off, w.Xg + off, dWexp[e], 0);
+        try linalg.linearDX(rows, @intCast(D), @intCast(D), w.dYg + off, Wexp[e], w.dXg + off, 0);
     }
+    _ = gpa;
     try (try kern.get("scatter_add")).launch(blocks(N * D), 256,
         .{ w.dXg, k.slot_of, dX, @as(i32, @intCast(N)), @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
 }

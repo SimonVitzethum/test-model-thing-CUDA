@@ -246,6 +246,55 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }.f) });
 
+    if (E > 1) {
+        // Eight expert matmuls as one batched call, against the same eight
+        // issued one after the other.
+        const per_expert = ((N * K / E + 127) / 128) * 128;
+        const table = try gpa.alloc(u64, E * 3);
+        defer gpa.free(table);
+        const pa = try mem.allocT(u64, E);
+        const pb = try mem.allocT(u64, E);
+        const pc = try mem.allocT(u64, E);
+        for (0..E) |e| {
+            table[e] = @intFromPtr(ba + e * per_expert * D);
+            table[E + e] = @intFromPtr(bb + e * D * D);
+            table[2 * E + e] = @intFromPtr(bc + e * per_expert * D);
+        }
+        try gpu.upload(pa, std.mem.sliceAsBytes(table[0..E]));
+        try gpu.upload(pb, std.mem.sliceAsBytes(table[E .. 2 * E]));
+        try gpu.upload(pc, std.mem.sliceAsBytes(table[2 * E ..]));
+        const flops = 2 * @as(f64, @floatFromInt(per_expert * E)) * fD * fD;
+        try rows.append(gpa, .{ .name = "gemm experts batched", .flops = flops, .per_step = layers * 3, .us = try timeIt(repeat, .{ .a = @intFromPtr(pa), .b = @intFromPtr(pb), .c = @intFromPtr(pc), .M = per_expert, .D = D, .E = E }, struct {
+            fn f(c: anytype) !void {
+                try linalg.linearFwdBatched(@intCast(c.M), @intCast(c.D), @intCast(c.D), c.a, c.b, c.c, @intCast(c.E));
+            }
+        }.f) });
+        try rows.append(gpa, .{ .name = "gemm experts in turn", .flops = flops, .per_step = layers * 3, .us = try timeIt(repeat, .{ .a = ba, .b = bb, .c = bc, .M = per_expert, .D = D, .E = E }, struct {
+            fn f(c: anytype) !void {
+                for (0..c.E) |e| try linalg.linearFwd(@intCast(c.M), @intCast(c.D), @intCast(c.D), c.a + e * c.M * c.D, c.b + e * c.D * c.D, c.c + e * c.M * c.D);
+            }
+        }.f) });
+    }
+
+    // Host cost of issuing work: the wall-clock time to enqueue many calls
+    // without waiting for any of them. Device time says what the GPU does;
+    // this says whether the host can keep it fed.
+    {
+        const issue = 2000;
+        const fissue: f64 = @floatFromInt(issue);
+        var at = std.Io.Clock.awake.now(io);
+        for (0..issue) |_| try linalg.linearFwd(512, @intCast(D), @intCast(D), ba, bb, bc);
+        var ns = at.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+        try gpu.synchronize();
+        try rows.append(gpa, .{ .name = "cublas call (host)", .us = @as(f64, @floatFromInt(ns)) / 1000.0 / fissue, .per_step = 0 });
+        const k = try mod.get("copy_bf16");
+        at = std.Io.Clock.awake.now(io);
+        for (0..issue) |_| try k.launch(1, 32, .{ fa, ba, @as(i64, 1) });
+        ns = at.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+        try gpu.synchronize();
+        try rows.append(gpa, .{ .name = "kernel launch (host)", .us = @as(f64, @floatFromInt(ns)) / 1000.0 / fissue, .per_step = 0 });
+    }
+
     // How much does issuing work cost, independent of the work itself? A
     // kernel with nothing to do, launched many times without waiting.
     {

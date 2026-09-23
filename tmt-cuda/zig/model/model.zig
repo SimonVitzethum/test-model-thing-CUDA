@@ -23,6 +23,10 @@ pub const Layer = struct {
     beta: usize = 0,
     router: usize = 0,
     exp: [16]usize = @splat(0),
+    /// Device arrays of the expert weight and gradient pointers, for the
+    /// batched matmul that serves all experts of this layer at once.
+    exp_w: u64 = 0,
+    exp_g: u64 = 0,
     input: [*]bf16 = undefined,
     S: [*]f32 = undefined, // (N,D) states
     mean: [*]f32 = undefined,
@@ -438,6 +442,18 @@ pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
             try initU(&m, &host, gpa, m.MS.rk, -r, r, &seed);
         }
     }
+    if (E > 1) { // the pointer tables the batched expert matmul reads
+        const table = try gpa.alloc(u64, E);
+        defer gpa.free(table);
+        for (m.L) |*ly| {
+            for (0..E) |e| table[e] = @intFromPtr(m.store.at(ly.exp[e]).work);
+            ly.exp_w = @intFromPtr(try m.mem.alloc(E * 8));
+            try gpu.upload(@as(*anyopaque, @ptrFromInt(ly.exp_w)), std.mem.sliceAsBytes(table));
+            for (0..E) |e| table[e] = @intFromPtr(m.store.at(ly.exp[e]).grad);
+            ly.exp_g = @intFromPtr(try m.mem.alloc(E * 8));
+            try gpu.upload(@as(*anyopaque, @ptrFromInt(ly.exp_g)), std.mem.sliceAsBytes(table));
+        }
+    }
     if (c.muon != 0) try collectMuon(&m);
     try buildOptTable(&m);
     try gpu.checkLaunch();
@@ -819,8 +835,8 @@ fn layersForward(m: *Model, s: *StreamState, from: usize, to: usize, stream: [*]
             m.H, ly.mean, ly.rstd, @intCast(N), c.dim);
         for (0..E) |e| Wx[e] = m.store.at(ly.exp[e]).work;
         // The residual add is folded into the combine (beta = 1).
-        aux_acc += try moe.forward(k, m.H, m.store.at(ly.router).work, Wx[0..E], stream,
-            &ly.mc, &m.moeW, N, E, @intCast(c.topk), D, 1.0);
+        aux_acc += try moe.forward(m.gpa, k, m.H, m.store.at(ly.router).work, Wx[0..E], ly.exp_w,
+            stream, &ly.mc, &m.moeW, N, E, @intCast(c.topk), D, 1.0);
         if (c.mla != 0 and m.ML[l].use) {
             const ml = &m.ML[l];
             try gpu.copyDevice(ml.Xsnap, stream, ND * 2);
@@ -996,8 +1012,9 @@ fn layersBackward(m: *Model, s: *StreamState, from: usize, to: usize, dstream: [
             dWx[e] = m.store.at(ly.exp[e]).grad;
         }
         const layers_f: f32 = @floatFromInt(c.layers);
-        try moe.backward(k, m.dM, Wx[0..E], m.store.at(ly.router).work, m.store.at(ly.router).grad,
-            dWx[0..E], m.dH, &ly.mc, &m.moeW, c.aux / layers_f * m.grad_scale, c.zloss / layers_f * m.grad_scale);
+        try moe.backward(m.gpa, k, m.dM, Wx[0..E], ly.exp_w, m.store.at(ly.router).work,
+            m.store.at(ly.router).grad, dWx[0..E], ly.exp_g, m.dH, &ly.mc, &m.moeW,
+            c.aux / layers_f * m.grad_scale, c.zloss / layers_f * m.grad_scale);
         try (try k.get("copy_bf16")).launch(blocks(ND), 256, .{ ly.S, m.Sb, nd_i64 });
         try ops.layernormBwd(k, m.Sb, m.dH, m.store.at(ly.gamma).master, ly.mean, ly.rstd, m.dSnorm,
             m.store.at(ly.gamma).grad, m.store.at(ly.beta).grad, @intCast(N), c.dim);

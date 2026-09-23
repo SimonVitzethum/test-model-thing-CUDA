@@ -14,7 +14,10 @@ var ev_stop: ?*anyopaque = null;
 
 /// When profiling is on the matmuls are timed like the kernels, so the table
 /// covers the whole step instead of leaving a hole where cuBLAS runs.
-// cuBLAS runs on the runtime's stream, so it is timed with runtime events.
+// Timing a matmul with events around the call measures cuBLAS choosing a
+// kernel as if the GPU were running it, which inflates the number by an order
+// of magnitude. They are measured in kbench instead, where a loop of calls is
+// timed as a whole.
 fn markStart(name: []const u8) void {
     _ = name;
 }
@@ -34,6 +37,11 @@ extern fn cublasGemmEx(handle: ?*anyopaque, transa: c_int, transb: c_int, m: c_i
                        alpha: *const f32, A: ?*const anyopaque, Atype: c_int, lda: c_int,
                        B: ?*const anyopaque, Btype: c_int, ldb: c_int, beta: *const f32,
                        C: ?*anyopaque, Ctype: c_int, ldc: c_int, compute: c_int, algo: c_int) c_int;
+extern fn cublasGemmBatchedEx(handle: ?*anyopaque, transa: c_int, transb: c_int, m: c_int, n: c_int, k: c_int,
+                              alpha: *const f32, A: ?*const anyopaque, Atype: c_int, lda: c_int,
+                              B: ?*const anyopaque, Btype: c_int, ldb: c_int, beta: *const f32,
+                              C: ?*anyopaque, Ctype: c_int, ldc: c_int, batch: c_int,
+                              compute: c_int, algo: c_int) c_int;
 extern fn cublasGemmStridedBatchedEx(handle: ?*anyopaque, transa: c_int, transb: c_int, m: c_int, n: c_int, k: c_int,
                                      alpha: *const f32, A: ?*const anyopaque, Atype: c_int, lda: c_int, strideA: c_longlong,
                                      B: ?*const anyopaque, Btype: c_int, ldb: c_int, strideB: c_longlong, beta: *const f32,
@@ -91,6 +99,39 @@ pub fn gemmNN(M: i32, N: i32, K: i32, A: [*]const bf16, lda: i32, B: [*]const bf
     const be: f32 = 0;
     try check(cublasGemmEx(try h(), OP_N, OP_N, N, M, K, &al, B, R_16BF, ldb, A, R_16BF, K,
         &be, C, R_16BF, N, COMPUTE_32F, GEMM_DEFAULT_TENSOR_OP), "gemm_nn");
+}
+
+/// The three linear shapes above, but for a whole group of matrices at once,
+/// given as device arrays of pointers. The experts of one layer all have the
+/// same shape once their rows are padded alike, so the dispatch runs one call
+/// instead of one per expert; at these sizes a single matmul reaches the
+/// machine's ceiling while eight small ones reach about half of it.
+pub fn linearFwdBatched(M: i32, N: i32, K: i32, X: u64, W: u64, Y: u64, batch: i32) !void {
+    const al: f32 = 1;
+    const be: f32 = 0;
+    markStart("gemm batched forward");
+    try check(cublasGemmBatchedEx(try h(), OP_T, OP_N, N, M, K, &al, @ptrFromInt(W), R_16BF, K,
+        @ptrFromInt(X), R_16BF, K, &be, @ptrFromInt(Y), R_16BF, N, batch, COMPUTE_32F,
+        GEMM_DEFAULT_TENSOR_OP), "batched linear_fwd");
+    markEnd("gemm batched forward");
+}
+pub fn linearDXBatched(M: i32, N: i32, K: i32, dY: u64, W: u64, dX: u64, batch: i32) !void {
+    const al: f32 = 1;
+    const be: f32 = 0;
+    markStart("gemm batched dX");
+    try check(cublasGemmBatchedEx(try h(), OP_N, OP_N, K, M, N, &al, @ptrFromInt(W), R_16BF, K,
+        @ptrFromInt(dY), R_16BF, N, &be, @ptrFromInt(dX), R_16BF, K, batch, COMPUTE_32F,
+        GEMM_DEFAULT_TENSOR_OP), "batched linear_dX");
+    markEnd("gemm batched dX");
+}
+pub fn linearDWBatched(M: i32, N: i32, K: i32, dY: u64, X: u64, dW: u64, batch: i32) !void {
+    const al: f32 = 1;
+    const be: f32 = 0;
+    markStart("gemm batched dW");
+    try check(cublasGemmBatchedEx(try h(), OP_N, OP_T, K, N, M, &al, @ptrFromInt(X), R_16BF, K,
+        @ptrFromInt(dY), R_16BF, N, &be, @ptrFromInt(dW), R_32F, K, batch, COMPUTE_32F,
+        GEMM_DEFAULT_TENSOR_OP), "batched linear_dW");
+    markEnd("gemm batched dW");
 }
 
 /// The batched form the MLA attention uses: one GEMM per (stream, head).
