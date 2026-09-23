@@ -41,6 +41,7 @@ const MTParams = extern struct {
     work: u64,
     flags: u64,
     lrmul: u64,
+    avg: u64,
     chunks: u64,
     nchunks: i32,
     sumsq: u64,
@@ -605,7 +606,7 @@ pub fn main(init: std.process.Init) !u8 {
         const d_sumsq = try Dev.alloc(8);
         const P = MTParams{
             .master = d_tab[0], .m = d_tab[1], .v = d_tab[2], .grad = d_tab[3], .work = d_tab[4],
-            .flags = @intFromPtr(d_flags), .lrmul = @intFromPtr(d_lrmul), .chunks = @intFromPtr(d_chunks),
+            .flags = @intFromPtr(d_flags), .lrmul = @intFromPtr(d_lrmul), .avg = 0, .chunks = @intFromPtr(d_chunks),
             .nchunks = @intCast(nchunks), .sumsq = @intFromPtr(d_sumsq),
         };
         const out = try gpa.alloc(f32, 4 * total);

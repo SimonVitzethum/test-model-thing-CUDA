@@ -58,6 +58,8 @@ pub const Cfg = extern struct {
     muon_lr: f32 = 0.02,
     mtp: i32 = 0,
     mtp_weight: f32 = 0.3,
+    wavg: f32 = 0,
+    wavg_every: i32 = 8,
     mem: i32 = 0,
     mem_len: i32 = 256,
     mem_heads: i32 = 4,
@@ -189,6 +191,8 @@ pub fn validate(c: Cfg) Error!void {
     try require((c.muon == 0 or c.muon == 1) and c.muon_lr > 0, "muon must be 0 or 1 with muon_lr > 0");
     try require(c.mtp >= 0 and c.mtp <= 7 and c.mtp_weight >= 0,
         "require 0 <= mtp <= 7 and mtp_weight >= 0");
+    try require(c.wavg >= 0 and c.wavg < 1 and c.wavg_every >= 1,
+        "require 0 <= wavg < 1 (0 is off) and wavg_every >= 1");
     try require(c.mem == 0 or c.mem == 1, "mem must be 0 or 1");
     if (c.mem != 0) {
         try require(c.mem_len > 0 and c.mem_len <= 4096 and c.mem_heads > 0 and c.mem_dh > 0 and

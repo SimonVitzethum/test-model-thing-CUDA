@@ -14,6 +14,9 @@ pub const Par = struct {
     v: [*]f32,
     grad: [*]f32,
     work: [*]bf16,
+    /// Running average of the weights over training; only allocated when
+    /// `wavg` is on, and never read by the training step itself.
+    avg: ?[*]f32 = null,
     n: i64,
     /// Shape as the weight is stored, (out, in); 1 x n for the vectors.
     rows: i64 = 1,
@@ -24,6 +27,9 @@ pub const Store = struct {
     memory: gpu.Memory,
     values: std.ArrayList(Par) = .empty,
     gpa: std.mem.Allocator,
+    /// Set before the parameters are built when `wavg` is on; every parameter
+    /// then carries an averaged copy as well.
+    want_avg: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Store {
         return .{ .memory = gpu.Memory.init(gpa), .gpa = gpa };
@@ -52,6 +58,7 @@ pub const Store = struct {
             .v = try s.memory.callocT(f32, un),
             .grad = try s.memory.callocT(f32, un),
             .work = try s.memory.allocT(bf16, un),
+            .avg = if (s.want_avg) try s.memory.callocT(f32, un) else null,
             .n = n,
             .cols = n,
         };

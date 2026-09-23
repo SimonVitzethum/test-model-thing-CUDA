@@ -419,6 +419,8 @@ pub const MTParams = extern struct {
     flags: cuda.Global(u8), // bit 0: in the gradient norm, bit 1: updated by AdamW
     /// Per-parameter factor on the learning rate; 1 unless mup scales it.
     lrmul: cuda.Global(f32),
+    /// Running average of the weights over training; null unless wavg is on.
+    avg: cuda.Global(cuda.Global(f32)),
     chunks: cuda.Global(MTChunk),
     nchunks: i32,
     sumsq: cuda.Global(f64), // global squared gradient norm
@@ -443,6 +445,22 @@ export fn mt_sumsq(P: MTParams) callconv(.nvptx_kernel) void {
         cuda.syncThreads();
     }
     if (t == 0 and mt_buf[0] != 0) _ = @atomicRmw(f64, &P.sumsq[0], .Add, mt_buf[0], .monotonic);
+}
+
+/// Running average of the weights over training (LAWA), kept in fp32 beside
+/// the master copy. It is only ever read for evaluation, so it never feeds
+/// back into the step, and it runs every `wavg_every` steps rather than every
+/// step because it moves 12 bytes per parameter in an optimizer that is
+/// already at the bandwidth ceiling.
+export fn mt_wavg(P: MTParams, tau: f32) callconv(.nvptx_kernel) void {
+    const c = P.chunks[cuda.blockIdxX()];
+    if (P.flags[@intCast(c.param)] & 6 == 0) return; // neither AdamW nor Muon
+    const at: usize = @intCast(c.start);
+    const master = P.master[@intCast(c.param)] + at;
+    const avg = P.avg[@intCast(c.param)] + at;
+    var i = cuda.threadIdxX();
+    while (i < @as(u32, @bitCast(c.len))) : (i += cuda.blockDimX())
+        avg[i] = tau * avg[i] + (1 - tau) * master[i];
 }
 
 /// AdamW with global-norm clipping computed on the device. A non-finite norm

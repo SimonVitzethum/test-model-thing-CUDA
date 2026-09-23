@@ -5,6 +5,7 @@ const std = @import("std");
 const config = @import("model/config.zig");
 const checkpoint = @import("model/checkpoint.zig");
 const session = @import("model/session.zig");
+const model = @import("model/model.zig");
 const gpu = @import("model/gpu.zig");
 const ptx = @import("ptx.zig");
 
@@ -35,6 +36,23 @@ fn fail(comptime fmt: []const u8, args: anytype) Fatal {
     return error.Fatal;
 }
 /// The three modules report their own reason for refusing.
+/// Writes the averaged weights beside the checkpoint as `<path>.avg`, in the
+/// same format, so that evaluation and sampling can read it with no new
+/// loading code. It is a separate file rather than a section in the
+/// checkpoint because the moments it carries belong to the training weights
+/// and are meaningless for resuming - and because the format is written byte
+/// for byte as the C++ build writes it.
+fn saveAveraged(gpa: std.mem.Allocator, io: std.Io, path: []const u8,
+                sess: *session.Session, progress: *checkpoint.Progress) !void {
+    if (sess.m.c.wavg <= 0) return;
+    var buf: [4096]u8 = undefined;
+    if (path.len + 4 > buf.len) return;
+    const p = try std.fmt.bufPrint(&buf, "{s}.avg", .{path});
+    model.swapAverage(&sess.m);
+    defer model.swapAverage(&sess.m);
+    try checkpoint.save(gpa, io, p, &sess.m, &sess.state, progress);
+}
+
 fn cfgFail() Fatal {
     return fail("{s}", .{config.lastError()});
 }
@@ -161,6 +179,7 @@ fn run(init: std.process.Init, out: Out) !void {
         const file_cfg = checkpoint.readConfig(arena, io, p) catch return ckptFail();
         checkpoint.loadWeights(arena, io, p, &sess.m, file_cfg) catch return ckptFail();
     }
+    model.seedAverage(&sess.m) catch return gpuFail();
     if (!evaluation and have and (progress.data_size != data.bytes.len or progress.data_hash != data.hash))
         return fail("resume dataset differs from checkpoint", .{});
     if (evaluation) {
@@ -314,7 +333,10 @@ fn run(init: std.process.Init, out: Out) !void {
         progress.step += 1;
         progress.cursor += T;
         progress.carried += T;
-        if (!evaluation and saveevery != 0 and progress.step % saveevery == 0) checkpoint.save(arena, io, path, &sess.m, &sess.state, &progress) catch return ckptFail();
+        if (!evaluation and saveevery != 0 and progress.step % saveevery == 0) {
+            checkpoint.save(arena, io, path, &sess.m, &sess.state, &progress) catch return ckptFail();
+            saveAveraged(arena, io, path, &sess, &progress) catch return ckptFail();
+        }
         ptx.Profile.collect(); // the events are read where the host waits anyway
         if (progress.step % 20 == 0)
             try out.print("step=%llu loss=%.6f ce=%.6f bpb=%.6f\n", .{ @as(c_ulonglong, progress.step), @as(f64, loss), @as(f64, ce), @as(f64, ce) / ln2 });
@@ -338,7 +360,10 @@ fn run(init: std.process.Init, out: Out) !void {
     gpu.synchronize() catch return gpuFail();
     const ns = begin.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     const seconds = @as(f64, @floatFromInt(ns)) / 1e9;
-    if (!evaluation) checkpoint.save(arena, io, path, &sess.m, &sess.state, &progress) catch return ckptFail();
+    if (!evaluation) {
+        checkpoint.save(arena, io, path, &sess.m, &sess.state, &progress) catch return ckptFail();
+        saveAveraged(arena, io, path, &sess, &progress) catch return ckptFail();
+    }
     if (measured == 0) return fail("no byte pairs evaluated", .{});
     try ptx.Profile.report(out.w);
     // Stable machine-readable record for experiment runners.

@@ -69,6 +69,7 @@ pub const MTParams = extern struct {
     work: u64 = 0,
     flags: u64 = 0,
     lrmul: u64 = 0,
+    avg: u64 = 0,
     chunks: u64 = 0,
     nchunks: i32 = 0,
     sumsq: u64 = 0,
@@ -161,6 +162,33 @@ pub const Model = struct {
     }
 };
 
+/// Starts the weight average from the current weights. Called once the
+/// weights are final - after building, or after a checkpoint was read - so
+/// that the average does not begin at zero and spend the run catching up.
+pub fn seedAverage(m: *Model) !void {
+    if (m.c.wavg <= 0) return;
+    for (m.store.values.items) |p| {
+        const a = p.avg orelse continue;
+        try gpu.copyDevice(a, p.master, @as(usize, @intCast(p.n)) * 4);
+    }
+}
+
+/// Exchanges the master and the averaged weights. Nothing is copied: the
+/// two are separate buffers, so swapping the host-side pointers is enough
+/// and costs nothing.
+///
+/// It leaves `m.opt`, which holds the device-side pointer arrays, pointing
+/// at the unswapped buffers. That is only safe because the one caller swaps,
+/// writes a checkpoint and swaps straight back, with no kernel in between.
+pub fn swapAverage(m: *Model) void {
+    if (m.c.wavg <= 0) return;
+    for (m.store.values.items) |*p| {
+        const a = p.avg orelse continue;
+        p.avg = p.master;
+        p.master = a;
+    }
+}
+
 /// Learning rate: linear warmup, then a cosine decay to `minlr`.
 pub fn lrAt(c: Cfg, step: i32) f32 {
     if (step < c.warmup)
@@ -174,6 +202,7 @@ pub fn lrAt(c: Cfg, step: i32) f32 {
 pub fn build(gpa: std.mem.Allocator, c: Cfg, kernels: *gpu.Kernels) !Model {
     var m = Model{ .c = c, .gpa = gpa, .store = params.Store.init(gpa), .mem = gpu.Memory.init(gpa), .kernels = kernels };
     errdefer m.deinit();
+    m.store.want_avg = c.wavg > 0; // has to be set before any parameter exists
     const D: usize = @intCast(c.dim);
     const nl: usize = @intCast(c.layers);
     const E: usize = @intCast(c.experts);
@@ -535,7 +564,8 @@ fn buildOptTable(m: *Model) !void {
     const work = try gpa.alloc(u64, P);
     const flags = try gpa.alloc(u8, P);
     const lrmul = try gpa.alloc(f32, P);
-    defer inline for (.{ master, mm, vv, grad, work }) |x| gpa.free(x);
+    const avg = try gpa.alloc(u64, P);
+    defer inline for (.{ master, mm, vv, grad, work, avg }) |x| gpa.free(x);
     defer gpa.free(flags);
     defer gpa.free(lrmul);
     var chunks: std.ArrayList(MTChunk) = .empty;
@@ -547,6 +577,7 @@ fn buildOptTable(m: *Model) !void {
         vv[i] = @intFromPtr(p.v);
         grad[i] = @intFromPtr(p.grad);
         work[i] = @intFromPtr(p.work);
+        avg[i] = if (p.avg) |a2| @intFromPtr(a2) else 0;
         const frozen = i == m.tgt;
         const unused_stop = i == m.stop and m.c.stop == 0;
         // Muon weights still count towards the gradient norm, but AdamW skips them.
@@ -569,6 +600,7 @@ fn buildOptTable(m: *Model) !void {
     }.f;
     m.opt = .{
         .lrmul = try up(m, std.mem.sliceAsBytes(lrmul)),
+        .avg = try up(m, std.mem.sliceAsBytes(avg)),
         .master = try up(m, std.mem.sliceAsBytes(master)),
         .m = try up(m, std.mem.sliceAsBytes(mm)),
         .v = try up(m, std.mem.sliceAsBytes(vv)),
@@ -1160,6 +1192,11 @@ pub fn optimizerStep(m: *Model, step: i32) !void {
         const lr = c.muon_lr * lrAt(c, step) / c.lr;
         try muon.step(k, &m.muon_ws, m.store.at(j), m.muon_x, lr, 0.01);
     }
+    // The weight average is a separate pass over every parameter, so it runs
+    // on an interval rather than every step; the effective time constant is
+    // wavg^(steps/wavg_every).
+    if (c.wavg > 0 and @rem(step + 1, c.wavg_every) == 0)
+        try (try k.get("mt_wavg")).launch(@intCast(m.opt.nchunks), 256, .{ m.opt, c.wavg });
     const tgt = m.store.at(m.tgt);
     const n = blocks(@intCast(tgt.n));
     try (try k.get("ema")).launch(n, 256, .{ tgt.master, m.store.at(m.emb).master, c.ematau, tgt.n });

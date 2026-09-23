@@ -45,6 +45,7 @@ struct MTParams {  // device arrays, one entry per parameter
     bf16** work = nullptr;
     unsigned char* flags = nullptr;  // bit 0: in the gradient norm, bit 1: updated by AdamW
     float* lrmul = nullptr;          // per-parameter factor on the learning rate (mup)
+    float** avg = nullptr;           // running weight average (Zig build only)
     MTChunk* chunks = nullptr;
     int nchunks = 0;
     double* sumsq = nullptr;  // global squared gradient norm
