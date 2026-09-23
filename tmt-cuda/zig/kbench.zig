@@ -135,12 +135,12 @@ pub fn main(init: std.process.Init) !u8 {
     const gy: u32 = @intCast((D + 255) / 256);
     const opt = ops.CellOpt{};
 
-    try rows.append(gpa, .{ .name = "copy_bf16", .bytes = 6 * ND, .per_step = 3 * layers, .us = try timeIt(repeat, .{ .k = try mod.get("copy_bf16"), .a = fa, .b = ba, .n = N * D, .g = blocks }, struct {
+    try rows.append(gpa, .{ .name = "copy_bf16", .bytes = 6 * ND, .per_step = 4.125 * layers, .us = try timeIt(repeat, .{ .k = try mod.get("copy_bf16"), .a = fa, .b = ba, .n = N * D, .g = blocks }, struct {
         fn f(c: anytype) !void {
             try c.k.launch(c.g, 256, .{ c.a, c.b, @as(i64, @intCast(c.n)) });
         }
     }.f) });
-    try rows.append(gpa, .{ .name = "cast_add", .bytes = 10 * ND, .per_step = 1.5 * layers, .us = try timeIt(repeat, .{ .k = try mod.get("cast_add"), .a = ba, .b = fa, .n = N * D, .g = blocks }, struct {
+    try rows.append(gpa, .{ .name = "cast_add", .bytes = 10 * ND, .per_step = 1.125 * layers, .us = try timeIt(repeat, .{ .k = try mod.get("cast_add"), .a = ba, .b = fa, .n = N * D, .g = blocks }, struct {
         fn f(c: anytype) !void {
             try c.k.launch(c.g, 256, .{ c.a, c.b, @as(i64, @intCast(c.n)) });
         }
@@ -185,7 +185,7 @@ pub fn main(init: std.process.Init) !u8 {
             try c.k.launch(c.g, 256, .{ c.p, c.t, c.d, @as(f32, 1.0), @as(i32, @intCast(c.N)) });
         }
     }.f) });
-    try rows.append(gpa, .{ .name = "dense_activation", .bytes = 6 * ND, .per_step = 2 * layers, .us = try timeIt(repeat, .{ .k = try mod.get("dense_activation"), .p = ba, .g1 = bb, .o = bc, .n = N * D, .g = blocks }, struct {
+    try rows.append(gpa, .{ .name = "dense_activation", .bytes = 6 * ND, .per_step = if (E > 1) 0 else 2 * layers, .us = try timeIt(repeat, .{ .k = try mod.get("dense_activation"), .p = ba, .g1 = bb, .o = bc, .n = N * D, .g = blocks }, struct {
         fn f(c: anytype) !void {
             try c.k.launch(c.g, 256, .{ c.p, c.g1, c.o, @as(i64, @intCast(c.n)), @as(f32, 0) });
         }
@@ -264,12 +264,12 @@ pub fn main(init: std.process.Init) !u8 {
         try gpu.upload(pb, std.mem.sliceAsBytes(table[E .. 2 * E]));
         try gpu.upload(pc, std.mem.sliceAsBytes(table[2 * E ..]));
         const flops = 2 * @as(f64, @floatFromInt(per_expert * E)) * fD * fD;
-        try rows.append(gpa, .{ .name = "gemm experts batched", .flops = flops, .per_step = layers * 3, .us = try timeIt(repeat, .{ .a = @intFromPtr(pa), .b = @intFromPtr(pb), .c = @intFromPtr(pc), .M = per_expert, .D = D, .E = E }, struct {
+        try rows.append(gpa, .{ .name = "gemm experts batched", .flops = flops, .per_step = 0, .us = try timeIt(repeat, .{ .a = @intFromPtr(pa), .b = @intFromPtr(pb), .c = @intFromPtr(pc), .M = per_expert, .D = D, .E = E }, struct {
             fn f(c: anytype) !void {
                 try linalg.linearFwdBatched(@intCast(c.M), @intCast(c.D), @intCast(c.D), c.a, c.b, c.c, @intCast(c.E));
             }
         }.f) });
-        try rows.append(gpa, .{ .name = "gemm experts in turn", .flops = flops, .per_step = layers * 3, .us = try timeIt(repeat, .{ .a = ba, .b = bb, .c = bc, .M = per_expert, .D = D, .E = E }, struct {
+        try rows.append(gpa, .{ .name = "gemm experts in turn", .flops = flops, .per_step = 0, .us = try timeIt(repeat, .{ .a = ba, .b = bb, .c = bc, .M = per_expert, .D = D, .E = E }, struct {
             fn f(c: anytype) !void {
                 for (0..c.E) |e| try linalg.linearFwd(@intCast(c.M), @intCast(c.D), @intCast(c.D), c.a + e * c.M * c.D, c.b + e * c.D * c.D, c.c + e * c.M * c.D);
             }
@@ -330,6 +330,27 @@ pub fn main(init: std.process.Init) !u8 {
     }
     n = snprintf(&line, line.len, "%-20s%48.1f us of device work per training step\n", "sum".ptr, budget);
     try w.writeAll(line[0..@intCast(n)]);
+
+    // What a whole step amounts to: the traffic and the arithmetic of every
+    // kernel, against the time the GPU is given for it. `step_us` is what a
+    // real run takes per window, which turns this into utilization.
+    var bytes: f64 = 0;
+    var flops: f64 = 0;
+    for (rows.items) |r| {
+        bytes += r.bytes * r.per_step;
+        flops += r.flops * r.per_step;
+    }
+    const step_us: f64 = @floatFromInt(try args.int(usize, "step_us", 0));
+    n = snprintf(&line, line.len, "\nper step: %.0f MB moved, %.1f GFLOP\n", bytes / 1e6, flops / 1e9);
+    try w.writeAll(line[0..@intCast(n)]);
+    n = snprintf(&line, line.len, "while the kernels run: %.0f GB/s, %.1f TFLOPS\n", bytes / (budget * 1000.0), flops / (budget * 1e6));
+    try w.writeAll(line[0..@intCast(n)]);
+    if (step_us > 0) {
+        n = snprintf(&line, line.len, "over the whole step (%.0f us): %.0f GB/s, %.1f TFLOPS\n", step_us, bytes / (step_us * 1000.0), flops / (step_us * 1e6));
+        try w.writeAll(line[0..@intCast(n)]);
+        n = snprintf(&line, line.len, "that is %.0f%% of the streaming ceiling and %.0f%% of the matmul ceiling\n", 100 * (bytes / (step_us * 1000.0)) / peak_gbs, 100 * (flops / (step_us * 1e6)) / peak_tflops);
+        try w.writeAll(line[0..@intCast(n)]);
+    }
     try w.flush();
     return 0;
 }

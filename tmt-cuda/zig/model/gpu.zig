@@ -59,17 +59,41 @@ pub fn checkLaunch() Error!void {
     try check(cudaGetLastError(), "kernel launch");
 }
 
+/// Wraps a call that blocks the host until the device catches up, so the
+/// profile can show what those stalls cost.
+fn blocking(comptime what: []const u8, rc: c_int) Error!void {
+    if (!ptx.Profile.on) return check(rc, what);
+    const t0 = monotonic();
+    defer {
+        ptx.Profile.wait_ms += (monotonic() - t0) / 1e6;
+        ptx.Profile.wait_calls += 1;
+    }
+    try check(rc, what);
+}
+
+const Timespec = extern struct { sec: i64, nsec: i64 };
+extern "c" fn clock_gettime(id: c_int, ts: *Timespec) c_int;
+fn monotonic() f64 {
+    var ts: Timespec = undefined;
+    _ = clock_gettime(1, &ts); // CLOCK_MONOTONIC
+    return @as(f64, @floatFromInt(ts.sec)) * 1e9 + @as(f64, @floatFromInt(ts.nsec));
+}
+
 pub fn upload(dst: anytype, src: []const u8) Error!void {
-    try check(cudaMemcpy(@ptrCast(dst), src.ptr, src.len, HostToDevice), "cudaMemcpy to device");
+    try blocking("cudaMemcpy to device", cudaMemcpy(@ptrCast(dst), src.ptr, src.len, HostToDevice));
 }
 pub fn download(dst: []u8, src: anytype) Error!void {
-    try check(cudaMemcpy(dst.ptr, @ptrCast(src), dst.len, DeviceToHost), "cudaMemcpy from device");
+    try blocking("cudaMemcpy from device", cudaMemcpy(dst.ptr, @ptrCast(src), dst.len, DeviceToHost));
 }
+/// Device-to-device and clearing both stay on the null stream: the ordering
+/// against the kernels is the same as the blocking form, but the host does
+/// not wait, and the training step issues a few hundred of these.
 pub fn copyDevice(dst: anytype, src: anytype, bytes: usize) Error!void {
-    try check(cudaMemcpy(@ptrCast(dst), @ptrCast(src), bytes, DeviceToDevice), "cudaMemcpy device to device");
+    try check(cudaMemcpyAsync(@ptrCast(dst), @ptrCast(src), bytes, DeviceToDevice, null),
+              "cudaMemcpyAsync device to device");
 }
 pub fn zero(p: anytype, bytes: usize) Error!void {
-    try check(cudaMemset(@ptrCast(p), 0, bytes), "cudaMemset");
+    try check(cudaMemsetAsync(@ptrCast(p), 0, bytes, null), "cudaMemsetAsync");
 }
 pub fn zeroAsync(p: anytype, bytes: usize) Error!void {
     try check(cudaMemsetAsync(@ptrCast(p), 0, bytes, null), "cudaMemsetAsync");

@@ -121,6 +121,11 @@ pub const Profile = struct {
         entries[count] = .{ .name = name, .ms = ms, .calls = 1 };
         count += 1;
     }
+    /// Host time spent blocked in a transfer, filled by gpu.zig. Every
+    /// pageable copy drains the queue, so this is the bubble it costs.
+    pub var wait_ms: f64 = 0;
+    pub var wait_calls: u64 = 0;
+
     /// The table, longest first.
     pub fn report(out: *std.Io.Writer) !void {
         if (count == 0) return;
@@ -136,6 +141,10 @@ pub const Profile = struct {
             e.name, e.ms, 100 * e.ms / total, e.calls, 1000 * e.ms / @as(f64, @floatFromInt(e.calls)),
         });
         try out.print("{s:<24}{d:>10.1}\n", .{ "total on the device", total });
+        try out.print("{s:<24}{d:>10.1}{s:>9}{d:>10}{d:>12.1}\n", .{
+            "host waits on copies", wait_ms, "", wait_calls,
+            1000 * wait_ms / @as(f64, @floatFromInt(@max(wait_calls, 1))),
+        });
     }
 };
 
