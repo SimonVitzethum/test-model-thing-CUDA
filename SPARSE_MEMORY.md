@@ -344,3 +344,14 @@ In the order the pieces would land:
 
 Scripts behind sections 1, 2 and 4 are in `~/tmt-scratch/fly/`, reading the
 connectome from `~/Dokumente/CNS/fly-llm/data/`.
+
+---
+
+## 13. An application that is not language modelling
+
+DREAM_RSI.md uses this store as the replay simulator of a
+recursive-self-improvement loop over kernel search, where the three
+properties measured above - one-shot writes, low interference, and
+locality-sensitive retrieval - are exactly what such a simulator needs, and
+where the inability to extrapolate stops being a limitation because the
+method claims the same scope.
