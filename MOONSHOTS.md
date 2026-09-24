@@ -801,100 +801,29 @@ different hat.
 
 ## K. The mushroom body write rule
 
-Not a section of its own so much as the missing half of C: a write rule
-for the fast store that is not hand-picked, taken from a circuit that
-learns an association in **one trial** and does not forget the previous
-ones.
+**Moved to SPARSE_MEMORY.md**, which it outgrew.
 
-**A factor of 10 or more: ~10%. Something worthwhile: ~40%.**
+The short version: the missing half of C. A write rule for the fast store
+taken from a circuit that learns an association in one trial without
+overwriting the previous ones, measured from the connectome on this disk
+rather than cited - 62-83 input channels expanding 25-fold onto 2045
+Kenyon cells at 4.8 claws and 1.4% density, normalised by a single
+inhibitory neuron that every cell drives and every cell receives.
 
-### Measured, not cited
+The expansion is random against a degree-preserving null (ratio 1.00),
+though a uniform null says 5.25x and would have killed the idea. Two
+random k-sparse codes share `k^2/m` units, which is 5% of the code at the
+measured ratios against 100% for a dense delta rule, and that is the whole
+argument for one-trial learning.
 
-The connectome is on this disk (`~/Dokumente/CNS`, the male CNS dataset,
-211,577 neurons and 152M weighted edges), so the circuit was measured
-rather than recalled. Right hemisphere, connections of at least five
-synapses:
-
-```
-343 projection neurons carrying   62-83 glomeruli   the input channels
-                     ->           2045 Kenyon cells  expansion 25x
-fan-in per Kenyon cell            4.8 claws          density 1.4%
-                     ->             49 MBONs         readout
-                                      2 APL          one per hemisphere
-                                    166 dopaminergic  the third factor
-```
-
-**The expansion is random, and that had to be checked.** The first
-measurement said Kenyon cells share 5.25x more input than chance, which
-would have killed the idea - a structured expansion is not a hash. That
-number was an artifact of a uniform null: several projection neurons carry
-the same glomerulus, and the glomeruli are not sampled equally. Against a
-**degree-preserving** null the ratio is **1.00 per PN and 0.94 per
-glomerulus**. Random, conditional on degree. The FlyHash premise holds.
-
-**The inhibition is exactly global.** 2081 Kenyon-to-APL connections and
-2078 back, for 2045 Kenyon cells: essentially every cell both drives the
-single inhibitory neuron and is inhibited by it. That is a normalisation
-loop with no structure to learn - it enforces a fixed activity level and
-nothing else.
-
-**The third factor lands on the synapse.** 1470 dopaminergic connections
-onto Kenyon cells and 369 onto MBONs, so the modulator addresses the
-KC->MBON synapse in compartments rather than the cell. The rule is
-three-factor: presynaptic activity, postsynaptic compartment, modulator.
-
-### Why one trial is enough, quantified
-
-Two random k-sparse codes of size `k` in `m` units share `k^2/m` units on
-average. At the measured ratios - 5% of 12800 units active, so k = 640 -
-that is **32 shared units, 5% of the code**.
-
-So writing a new association disturbs an existing one by about five
-percent, against **100% for a dense delta rule**, where every write touches
-every entry. That is the whole mechanism: the sparsity buys
-non-interference, and non-interference is what makes one trial sufficient.
-
-This is the number to beat, and it is the argument for replacing C's
-delta rule rather than an appeal to biology.
-
-### The translation
-
-Scaled to `dim=512` as the channel count:
-
-- **Expand** 512 -> ~12800 units, each reading ~5 channels chosen at random
-  with a non-uniform degree over channels.
-- **k-winner**: keep the top 5%, about 640 units. One global comparison,
-  which is what APL does.
-- **Write** only at the active units - 640 rows of 12800.
-- **Read** through the same hash and take the active rows.
-
-The expansion costs about 12800 x 5 = 64k multiply-adds, which is **less
-than a quarter of one 512x512 GEMM**. On a machine at 15% of its matmul
-ceiling that is free, and it is sparse in exactly the way C needs.
-
-### What this does not give
-
-The connectome is a wiring diagram. It has who connects to whom, how many
-synapses, and usually the sign via the neurotransmitter. It does **not**
-have the synaptic strengths, the neuronal dynamics, or the learning rules
-- those come from physiology, not from the volume.
-
-And the rest of the fly brain is built for vision, olfaction, navigation
-and flight control. Taking the whole connectome as an architecture or a
-sparsity pattern would buy nothing, and no result exists where it sped up
-a machine learning task. The mushroom body is the exception because the
-computation it performs - sparse random expansion, k-winner, local gated
-write - is one that transfers.
-
-### Test it the same way as C
-
-Phase 0 for C measured that the store is content-specific about the
-continuation. The same instrument compares write rules: build the store
-with the delta rule and with the FlyHash rule, and compare the curve of
-loss against position within a document. A rule that writes without
-interference should hold up further into the document.
-
----
+The document also covers what K did not: that capacity scales as
+`0.48 (m/k)^2` so ten million associations cost 467 MB and under 1% of the
+step; that a mushroom body is a memory *over* a representation and cannot
+produce one, since its similarity metric is fixed and random; and the one
+mechanism by which it could make training cheaper rather than merely
+larger - keying the store on the *learned* representation so that content
+the store can supply never generates gradient, which keeps it out of the
+weights instead of consolidating it in.
 
 ## Where to start
 
@@ -914,10 +843,10 @@ number and it says where the band boundaries belong.
 spends the resource this machine has spare. Run the uniform baseline
 before building a gate.
 
-**K** - the mushroom body write rule for C. The circuit is measured and on
-disk, the expansion is confirmed random against a proper null, and the
-interference arithmetic gives a concrete number to beat: 5% against 100%
-for the delta rule.
+**SPARSE_MEMORY.md** - the sparse associative store, formerly K. Start
+with its section 8: measure what fraction of gradient mass falls on
+positions a store could have answered. That number is the ceiling on the
+whole idea and it costs two training runs.
 
 **D1** - solving the output head - still worth its one-hour pretest: freeze
 the body, solve the head, see whether the gap is anything at all.
