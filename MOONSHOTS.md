@@ -522,6 +522,106 @@ but it is a different sentence and both numbers should be reported.
 
 ---
 
+## H. Give every timescale its own target
+
+The one idea here aimed at the sample-efficiency gap itself, rather than at
+routing around it.
+
+**A factor of 10 or more: ~25%. A factor of 100: ~8%.**
+
+### The gap, stated honestly
+
+A child has strong language competence after something like 10^7 to 10^8
+words. A language model needs 10^12 to 10^13 tokens. That is four or five
+orders of magnitude, and it is the only evidence anyone has that a factor
+this large exists at all.
+
+The comparison is also contested, and it should be. Children get
+multimodal grounding, interaction, the ability to ask, and a prior that
+took evolution a very long time to find. Nobody knows how the gap divides
+between the learning rule and everything else. This section bets on one
+identifiable piece of it, not on the whole thing.
+
+### The diagnosis, and it is specific to this architecture
+
+The architecture is multi-timescale. The half-lives are staggered
+geometrically from `half_min=2` to `half_max=65536`, which is the whole
+point of it - different channels are meant to hold information over
+different spans.
+
+The objective is not. It is next-byte prediction, one horizon, and that is
+all of it.
+
+So a channel with a half-life of 65536 bytes learns only through whatever
+its contribution to the *next byte* happens to be. That signal reaches it
+attenuated through the entire stack, and TODO item 8 already measured that
+what does reach it is truncated by a factor of 512 by the BPTT window.
+
+The architecture says "these channels operate at different scales". The
+loss says "all of you, predict the next byte". The mismatch is structural
+and it is free to see, which is why this is worth a section.
+
+### The proposal
+
+Give each band of half-lives a prediction target at its own horizon.
+
+A channel with half-life `h` predicts something about the next `h` bytes,
+not the next one. Fast channels keep next-byte prediction; slow channels
+get targets at their own scale.
+
+**Predicting bytes at those horizons is hopeless** - byte 65536 ahead is
+mostly irreducible noise, and forcing the model to predict it wastes
+capacity on exactly what cannot be predicted. So the targets have to be
+**latent**: the pooled representation of the next `h` bytes, taken from an
+EMA copy of the model with a stop-gradient, JEPA-style.
+
+That is the substance of the idea. Predicting a representation discards
+the unpredictable surface detail and keeps the part that is actually
+learnable, and it does so at the scale the channel is built for.
+
+### How it relates to what is already here
+
+- **MTP** (`mtp`, `mtp_weight`) is the special case at horizons 1 to 7,
+  already implemented and still unevaluated.
+- **Item 11** (latent patch targets) is the special case at patch scale.
+- This generalises both along the architecture's own axis: instead of
+  picking a horizon or two by hand, every band gets the horizon its
+  half-life already implies.
+- It attacks the 512x truncation from the opposite side to **item 8**.
+  RTRL fixes the *gradient path* so the signal can travel back; this fixes
+  the *objective* so there is a strong local signal that does not need to
+  travel. They are complementary, and either one alone is a fair test of
+  the diagnosis.
+
+### Phase 0, and it is cheap
+
+Before building any of it, measure whether the slow channels are actually
+starved. The `decay` and `gate` parameters are per channel, and each
+channel has a known half-life, so:
+
+**Plot the gradient norm of `decay_c` against that channel's half-life.**
+
+If it falls off sharply with `h`, the diagnosis is confirmed and
+quantified in one afternoon - and it also says where the band boundaries
+should go. If the slow channels already receive comparable gradient, the
+premise is wrong and this section stops, cheaply.
+
+`gradcheck` already groups parameters and reports per-group statistics, so
+most of the machinery to do this exists.
+
+### What would make it fail
+
+**Collapse**, the standing problem with latent targets: the model can make
+the target trivially predictable by making the representation constant.
+The anti-collapse tricks are the young and unproven part of the JEPA line,
+and they are the reason item 11 is rated at 30% rather than higher.
+
+**Trivial targets**: pooled representations over long spans may be nearly
+constant across a corpus, in which case predicting them teaches nothing.
+Measure the entropy of the targets before trusting a loss that falls.
+
+---
+
 ## Where to start
 
 **D1** - solving the output head - because it is convex, small, needs no
