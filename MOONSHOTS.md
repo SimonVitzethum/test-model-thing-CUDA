@@ -816,14 +816,22 @@ random k-sparse codes share `k^2/m` units, which is 5% of the code at the
 measured ratios against 100% for a dense delta rule, and that is the whole
 argument for one-trial learning.
 
-The document also covers what K did not: that capacity scales as
-`0.48 (m/k)^2` so ten million associations cost 467 MB and under 1% of the
-step; that a mushroom body is a memory *over* a representation and cannot
-produce one, since its similarity metric is fixed and random; and the one
-mechanism by which it could make training cheaper rather than merely
-larger - keying the store on the *learned* representation so that content
-the store can supply never generates gradient, which keeps it out of the
-weights instead of consolidating it in.
+The document also covers what K did not, and two of those turned out to
+matter more than anything in this summary. Capacity is **linear in m**,
+simulated - ten million associations want 13-26 GB with narrow values, not
+the 467 MB an earlier draft claimed from a formula belonging to a different
+memory. A mushroom body is a memory *over* a representation and cannot
+produce one, its similarity metric being fixed and random. And the one
+mechanism by which it could make training cheaper rather than merely larger
+is keying the store on the *learned* representation, so that content the
+store can supply never generates gradient - section C in reverse.
+
+That mechanism has a trap that would have looked like success: after the
+first epoch the store holds every window with its own continuation, so
+retrieval is perfect everywhere, the gradient vanishes everywhere, and the
+model stops learning structure too. Same-document exclusion is mandatory,
+and it is what kNN-LM and its successors already do - for moderate gains,
+which is the prior to hold.
 
 ## Where to start
 
