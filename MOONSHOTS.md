@@ -379,9 +379,33 @@ they need a benchmark.
 
 ## F. Take someone else's compute
 
-**Large factor: 30-50%.** Not a moonshot - the one item here that plausibly
-delivers 100x - and it is already TODO item 14, where the teacher was
-measured at 0.853 BPB against this model's 1.63.
+**F1 (output distillation): ~60% for a factor of 3-10.
+F2 (transplant the layers): ~25% for a factor of 50 or more** - measured as
+compute to reach a given quality, not as steps per second.
+
+An earlier draft put a flat "30-50% for the large factor" on the section as
+a whole. That was too generous to F1 and too vague about F2, which are
+different bets. It is already TODO item 14, where the teacher was measured
+at 0.853 BPB against this model's 1.63.
+
+The arithmetic on what is being offered:
+
+```
+one night here:  3.8 GB x 34M params x 6   ~ 7.8e17 FLOPs
+Qwen3-1.7B:      36T tokens x 1.7G x 6     ~ 3.7e23 FLOPs
+                                             ~470,000 nights
+```
+
+Half a million nights of this GPU sit in a file on this disk. Almost none
+of it can arrive, and the limit is not the teacher but the student: 34M
+parameters cannot hold what 1.7G learned. The bound is capacity.
+
+Which is why F2 is the interesting half. F1 copies behaviour through the
+narrow channel of the output distribution and buys sample efficiency. F2
+starts the weights near a working solution and skips most of the training
+rather than speeding it up. At 34M parameters 0.85 BPB from scratch is
+probably unreachable at *any* amount of data or time, so F2 is not "100x
+faster" - it makes a target reachable that otherwise is not.
 
 Two routes, and they compose.
 
@@ -416,6 +440,85 @@ The answer is not to avoid it but to **keep both tracks and report both**:
 one line trained from scratch, one transplanted, same evaluation. The
 from-scratch line stays the claim about the architecture; the transplanted
 line is the one that produces a usable model.
+
+---
+
+## G. Retrieval over your own corpus
+
+Not someone else's model - your own training data, made available
+non-parametrically instead of being pressed into the weights.
+
+**A factor of 10 or more: ~45%. A factor of 100: ~15%.** The only idea here
+with a published double-digit result that takes over no foreign knowledge.
+
+### Why the factor could be large, and why here in particular
+
+Byte prediction on Wikipedia mixes two problems that have little to do with
+each other:
+
+1. **Linguistic structure** - syntax, morphology, discourse. Highly
+   compressible, learnable from little data.
+2. **Factual and verbatim content** - names, dates, infoboxes, templates,
+   thousands of near-identical phrasings. Incompressible, needs enormous
+   data to memorise, and is exactly what does not fit in 34M parameters.
+
+Gradient descent spends most of its capacity and most of its steps on (2).
+Retrieval makes (2) free, and leaves the weights with (1) plus "how do I
+copy out of the store" - and (1) is what this architecture should be judged
+on anyway.
+
+This also explains the measurement at the top of TODO.md from a second
+direction. 24 epochs coming out worse than 14 is capacity being burned on
+(2). The data limit is half a shortage of data and half a shortage of
+*somewhere to put content* - and the tool for that is an index, not a
+weight matrix.
+
+### The evidence
+
+RETRO reached the performance of models with **25x more parameters** on the
+Pile. kNN-LM gets large perplexity drops with *no* additional training at
+all, purely by looking things up in the training corpus.
+
+That is 25x, not 100x. Stacked with C it might go further, but stacking
+rarely multiplies cleanly, and this belongs on the page as a
+double-digit-factor idea rather than a hundred-fold one.
+
+### Why this project is unusually well placed to build it
+
+The machinery exists and was measured yesterday. `mem=1` with retrieval
+heads (`mem_rdim`) is built, and `memprobe` showed the store is
+**content-specific about the continuation**: +0.99 nats against unrelated
+text at 14 standard errors, on bytes it never saw.
+
+That measurement is the precondition. It says that *if* the store holds the
+right context, it helps. Retrieval is the mechanism that puts the right
+context there instead of whatever happened to precede the window.
+
+What is missing is an index over the corpus rather than a fixed fact list.
+At byte level something simple suffices: a hashed n-gram index or a suffix
+array over the last m bytes, returning the k most similar places in the
+corpus, whose continuations go into the existing memory slots.
+
+### The trap, and it is the same one as in C
+
+**Exclude the neighbourhood of the current window from retrieval.**
+Otherwise the model looks the answer up instead of predicting it, the loss
+curve looks superb, and it means nothing. Same class of mistake as the
+consolidation priority in C.
+
+At evaluation: retrieve over the **training corpus only**, never over the
+held-out set.
+
+### The honest price
+
+Every step reads k neighbours on top of everything else, and the step is
+bandwidth-bound at 82% of the ceiling - the one resource with nothing to
+spare.
+
+And the claim changes shape. "This model reaches X BPB" becomes "this model
+plus an index over its training corpus reaches X BPB". Still a result from
+its own resources, since the index holds nothing that was not in the data,
+but it is a different sentence and both numbers should be reported.
 
 ---
 
