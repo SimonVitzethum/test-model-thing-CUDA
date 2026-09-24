@@ -479,6 +479,12 @@ RETRO reached the performance of models with **25x more parameters** on the
 Pile. kNN-LM gets large perplexity drops with *no* additional training at
 all, purely by looking things up in the training corpus.
 
+With one caveat that has to travel with the number: part of RETRO's
+reported gain was later attributed to **overlap between the retrieval
+database and the test set**. That is the same leakage trap as below, at
+corpus scale, and it means the headline factor should be treated as an
+upper bound rather than a result.
+
 That is 25x, not 100x. Stacked with C it might go further, but stacking
 rarely multiplies cleanly, and this belongs on the page as a
 double-digit-factor idea rather than a hundred-fold one.
@@ -527,7 +533,20 @@ but it is a different sentence and both numbers should be reported.
 The one idea here aimed at the sample-efficiency gap itself, rather than at
 routing around it.
 
-**A factor of 10 or more: ~25%. A factor of 100: ~8%.**
+**A factor of 10 or more: ~4%. A factor of 100: ~1%.**
+
+Revised down from 25% and 8%, for a reason that should have been in the
+first draft: this is not a new idea. Latent targets at multiple horizons
+are **Contrastive Predictive Coding** (van den Oord et al. 2018) in
+substance. CPC is well studied, it works, and on language it has never
+come near a factor of ten. An idea with a decade of prior art and no large
+result on this modality does not get a 25% prior.
+
+What survives the revision is that CPC was never applied along the axis
+this architecture already has - one horizon per half-life band, with the
+band structure chosen by the model rather than by hand. That is the part
+that is actually new here, and it is worth a cheap test. It is not worth a
+moonshot-sized expectation.
 
 ### The gap, stated honestly
 
@@ -555,7 +574,8 @@ all of it.
 So a channel with a half-life of 65536 bytes learns only through whatever
 its contribution to the *next byte* happens to be. That signal reaches it
 attenuated through the entire stack, and TODO item 8 already measured that
-what does reach it is truncated by a factor of 512 by the BPTT window.
+the span it reaches is 512 times the span the window can inform. (That is
+a ratio of spans, not a measured gradient fraction - see item 8.)
 
 The architecture says "these channels operate at different scales". The
 loss says "all of you, predict the next byte". The mismatch is structural
@@ -572,12 +592,32 @@ get targets at their own scale.
 **Predicting bytes at those horizons is hopeless** - byte 65536 ahead is
 mostly irreducible noise, and forcing the model to predict it wastes
 capacity on exactly what cannot be predicted. So the targets have to be
-**latent**: the pooled representation of the next `h` bytes, taken from an
-EMA copy of the model with a stop-gradient, JEPA-style.
+**latent**: something about the pooled content of the next `h` bytes.
 
-That is the substance of the idea. Predicting a representation discards
-the unpredictable surface detail and keeps the part that is actually
-learnable, and it does so at the scale the channel is built for.
+Predicting a representation discards the unpredictable surface detail and
+keeps the part that is actually learnable, at the scale the channel is
+built for.
+
+### Make it contrastive, not regressive
+
+The first draft proposed regressing onto an EMA copy of the model with a
+stop-gradient, JEPA-style, and then listed collapse as the main risk. CPC
+already solved that problem and the solution should be adopted rather than
+rediscovered.
+
+**Use InfoNCE.** The prediction has to distinguish the *real* future of
+this position from other futures drawn from the batch. A constant
+representation then scores no better than chance, so collapse stops being
+a failure mode and becomes impossible by construction rather than by trick.
+
+The alternative is variance and covariance terms in the VICReg style,
+which keep the regression formulation and push the representation away
+from constants explicitly. Either is defensible; InfoNCE is the one with
+the track record at exactly this task shape.
+
+Negatives come free here: the batch is 64 streams, so other streams at the
+same offset are already the right kind of negative - same position in the
+schedule, different content.
 
 ### How it relates to what is already here
 
@@ -593,45 +633,193 @@ learnable, and it does so at the scale the channel is built for.
   travel. They are complementary, and either one alone is a fair test of
   the diagnosis.
 
-### Phase 0, and it is cheap
+### Phase 0, and the obvious version of it is confounded
 
 Before building any of it, measure whether the slow channels are actually
-starved. The `decay` and `gate` parameters are per channel, and each
-channel has a known half-life, so:
+starved.
 
-**Plot the gradient norm of `decay_c` against that channel's half-life.**
+The obvious test - plot the gradient norm of `decay_c` against the
+channel's half-life - **would confirm the diagnosis whether or not it is
+true**, and that is worth spelling out because it is an easy trap.
 
-If it falls off sharply with `h`, the diagnosis is confirmed and
-quantified in one afternoon - and it also says where the band boundaries
-should go. If the slow channels already receive comparable gradient, the
-premise is wrong and this section stops, cheaply.
+The decay is parameterised, `a = sigmoid(decay + ...)`, so the derivative
+of the effective decay with respect to its parameter is systematically
+small for channels near `a = 1`. A slow channel therefore shows a small
+gradient on `decay_c` *by construction*, fully used or not. A falloff with
+`h` is the expected output of the parameterisation, not evidence.
+
+Two tests that are not confounded:
+
+1. **Gradient on the channel's input weights, normalised by their
+   magnitude.** A relative update size per channel, which the
+   parameterisation of the decay does not distort.
+
+2. **Utility against signal, side by side.** Ablate one half-life band at
+   a time from a trained checkpoint and measure the loss increase - that
+   is the band's *utility*. Put it next to the band's gradient. **A band
+   that contributes a lot and receives little is the actual confirmation**,
+   and neither number alone says anything.
+
+The second is the better test and it costs a checkpoint and a handful of
+evaluation runs. It is also the same measurement section B wants for its
+channel masks, so it pays for two sections at once.
 
 `gradcheck` already groups parameters and reports per-group statistics, so
-most of the machinery to do this exists.
+part of the machinery exists.
 
 ### What would make it fail
 
-**Collapse**, the standing problem with latent targets: the model can make
-the target trivially predictable by making the representation constant.
-The anti-collapse tricks are the young and unproven part of the JEPA line,
-and they are the reason item 11 is rated at 30% rather than higher.
-
 **Trivial targets**: pooled representations over long spans may be nearly
-constant across a corpus, in which case predicting them teaches nothing.
-Measure the entropy of the targets before trusting a loss that falls.
+constant across a corpus, in which case predicting them teaches nothing
+even under InfoNCE - the negatives would be indistinguishable from the
+positive for reasons that have nothing to do with the model. Measure the
+spread of the targets across the batch before trusting a loss that falls.
+
+**Collapse** is handled by the contrastive formulation above and is no
+longer the main risk. It remains the main risk for item 11, which is still
+written as a regression.
+
+**The prior art**: CPC has been tried on speech, vision and language for
+seven years. If per-band horizons were the missing piece, it is not
+obvious why nobody found it. The honest position is that the band
+structure is a genuinely untried variation on a well-tried idea, and that
+untried variations on well-tried ideas usually fail for the same reasons
+the original stalled.
+
+---
+
+## I. Thinking steps inside the recurrence
+
+The only idea on this page that explicitly trades FLOPs for sample
+efficiency - which is the right direction when data is the limit and
+compute is not.
+
+**A factor of 10 or more: ~12%. Something worthwhile: ~40%.**
+
+### The idea
+
+A child processes a sentence far more deeply than one forward pass.
+Quiet-STaR and Reinforcement Pretraining let a model think internally
+before predicting, and reward the thinking that improves the prediction.
+
+For a recurrent model this is unusually natural, and it needs no new
+machinery: **run the recurrence a few extra steps with no new input before
+a difficult byte.** The state update `s = a*s + (1-a)*x` is already
+defined for any number of iterations; feeding it `x = 0`, or the previous
+output, is a well-defined extra step. A small gate decides when to spend
+them.
+
+### Why it fits here specifically
+
+Every other idea on this page is constrained by bandwidth. This one is
+constrained by *arithmetic*, and arithmetic is the resource this machine
+has spare: the step runs at 82% of the streaming ceiling but only **15% of
+the matmul ceiling**. Extra recurrence steps are FLOPs on state that is
+already resident. They are close to free in the currency that is short.
+
+That is a genuine structural match, and it is the reason this outranks
+several better-evidenced ideas here.
+
+### The gate is the whole problem
+
+Deciding *when* to think is the hard part, and the obvious trigger is
+circular: spend steps where the loss is high, but the loss is only known
+after predicting. Workable versions:
+
+- **Predictive entropy** of the output distribution before committing -
+  available, cheap, and does not need the answer.
+- **A learned gate** trained by the improvement it produces, which is the
+  Quiet-STaR construction and needs a reward signal.
+- **Fixed budget, uniformly spent**, as a baseline. Worth running first:
+  if uniform extra steps help, the gating question becomes an
+  optimisation. If they do nothing, the gate cannot save it.
+
+Run the uniform baseline before building any gate.
+
+### Evidence
+
+Real for token models at scale. Thin for pretraining from scratch, and
+thin specifically for the case where the extra computation is recurrence
+steps rather than generated tokens.
+
+### The signal to stop
+
+Uniform extra steps at three budgets do not beat the same wall clock spent
+on more data.
+
+---
+
+## J. Meta-learn the memory update rule
+
+The moonshot on this page, and the only one aimed at the part of the gap
+that comes from prior rather than from learning.
+
+**A factor of 10 or more: ~5%. A factor of 100: ~2%.**
+
+### The idea
+
+Part of what a child brings is not learned in a lifetime - it is a prior
+that took evolution a very long time to find. That part cannot be learned
+from the corpus, but it can be learned *across tasks*.
+
+The concrete target here is already hand-picked: **the fast memory's
+update rule.** Section C proposes a delta rule, `M <- lambda*M + k v^T`,
+because that is the obvious choice. Nothing says it is the right one.
+
+Meta-learning asks: what update rule makes this architecture learn fastest
+across many small tasks? Learn the rule, then use it. That is evolution's
+role, played out on a budget of hours instead of aeons.
+
+### Why the memory rule and not the initialisation
+
+Meta-learning an initialisation (MAML and descendants) needs the inner
+loop to be differentiated through, which for a full pretraining run is
+hopeless. The memory rule is different: it acts **once per window, without
+gradient**, so the inner loop is one step deep. That is what makes this
+tractable at all, and it is why the memory rule is the right handle rather
+than the weights.
+
+### The cheap version of the same idea
+
+**Item 12, formal-language pre-pretraining.** A few thousand steps on
+procedurally generated sequences before real data is the same bet - build
+a prior cheaply instead of paying for it in corpus - without any of the
+meta-learning machinery. It is rated at 30% and costs an afternoon.
+
+Do that first. If a hand-made prior from bracket languages and cellular
+automata measurably helps, a learned one is worth the effort. If it does
+nothing, meta-learning a rule is unlikely to rescue the premise.
+
+### The signal to stop
+
+Item 12 shows no effect, or the meta-learned rule fails to beat the delta
+rule on held-out tasks it was not meta-trained on - which is the failure
+mode learned optimisers have, and this is a learned optimiser wearing a
+different hat.
 
 ---
 
 ## Where to start
 
-**D1** - solving the output head - because it is convex, small, needs no
-new theory and can be built this week.
+Revised after review, and the order changed.
 
-**A** - because the checkpoints from the night run already exist and the
-test costs an afternoon.
+**Item 20 in TODO.md - rephrased data.** Best-evidenced thing on either
+page, roughly 3x reported, and it barely touches the trainer. A tenth of
+enwik9 is one night of generation.
 
-**E stages 1 and 2** - because they pay for themselves on the measured
-bottleneck whether or not stage 5 ever happens.
+**H, but with the contrastive objective and the unconfounded phase 0.**
+The rating came down a long way once CPC turned out to be the precursor,
+but the phase 0 measurement - utility per half-life band against gradient
+per band - is worth doing regardless, because section B wants the same
+number and it says where the band boundaries belong.
 
-**C** - because it is the only idea here with a plausible story for the
-large gap, and because `mem=1` already built half of it.
+**I - thinking steps.** Architecturally cheap, and the only idea that
+spends the resource this machine has spare. Run the uniform baseline
+before building a gate.
+
+**D1** - solving the output head - still worth its one-hour pretest: freeze
+the body, solve the head, see whether the gap is anything at all.
+
+**A** - the checkpoints exist and the test costs an afternoon.
+
+**E stages 1 and 2** - done, measured at +4.3%, no longer a bet.

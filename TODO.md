@@ -110,10 +110,15 @@ is a number behind it. The night run ran `half_max=65536` at `seqlen=128`:
 ```
 slowest channel:   half-life 65536 bytes
 gradient window:              128 bytes
-                   ->  truncated by a factor of 512
+                   ->  the channel reaches 512x further than the
+                      gradient that shapes it
 ```
 
-The slow channels receive gradients over 1/512 of their reach. `traces=1`
+Read that as a ratio of spans, which is what it is, and not as a measured
+fraction of gradient. Nobody has measured how much signal actually arrives;
+512 is the mismatch between what the channel is built to hold and what the
+window can inform. Establishing the real number is part of the work, not a
+premise of it. `traces=1`
 carries the *state* across windows but not the gradient - the forward pass
 remembers, the backward pass does not. That is a measurable defect in the
 current configuration, not a suspected one.
@@ -193,7 +198,7 @@ Interesting here specifically: the long half-life channels see almost no
 long-range signal early in natural text, and this feeds them long-range
 dependencies deliberately. Pairs with item 13.
 
-### 13. Context-length curriculum [40%]
+### 13. Context-length curriculum [25%]
 
 Start with short windows, lengthen. Well established and nearly free, and
 the machinery exists already (`maxcarry`, the traces path).
@@ -201,6 +206,12 @@ the machinery exists already (`maxcarry`, the traces path).
 The interaction to watch: long half-lives see no signal at short context,
 so either grow `half_max` along with the window or accept that those
 channels start late.
+
+Downgraded from 40%. The BabyLM challenge exists to study exactly this gap
+and found that child-like curricula - simple material first - barely
+helped, while distillation and architecture changes did. Context-length
+curriculum is not quite the same thing as a difficulty curriculum, but it
+is close enough that the null result should count against it.
 
 ### 14. Distillation from a local LLM [55%]
 
@@ -332,6 +343,48 @@ Sharpness settles around 2/learning-rate. Worth knowing when Muon
 learning rates get turned up and instabilities appear. The 2/lr result is
 well established for plain gradient descent and blurrier for adaptive and
 orthogonalised methods, so treat it as a diagnostic rather than a target.
+
+## Data, beyond just having more of it
+
+### 20. Rephrased data [50%]
+
+The best-evidenced item added since the first draft. WRAP (Maini et al.
+2024) had a teacher model rewrite web text in several styles and reported
+roughly **3x faster pretraining**. It composes with item 14 from the other
+side: there the teacher supplies logits, here it supplies data.
+
+It also connects to the measurement at the top of this page. Muennighoff
+et al. (2023) found that repeating data is nearly as good as fresh data up
+to about **four epochs**, after which returns decay sharply. The night run
+went fourteen and then twenty-four, so both of those sit well past the
+point where repetition stops paying - which is a second, independent
+account of why 24 came out worse than 14.
+
+**The practical catch, which is specific to this machine.** Generation is
+far slower than scoring. `teacher_bpb.py` scores at 6337 tokens/s;
+generation on the same model runs at perhaps 500-1500 tokens/s even
+batched. enwik9 is about 245M tokens, so rewriting the whole corpus is
+30-70 hours. Rewriting **a tenth of it is one night**, and a tenth
+rephrased into three styles is already 270 MB of new text over the same
+content.
+
+So the plan is a slice, not the corpus, and the experiment is whether a
+mixture of original and rephrased beats the same wall clock on original
+alone.
+
+### 21. Active selection by learning progress [30%]
+
+Not by loss - selecting by loss selects noise, which is the standing
+objection to item 15. By **learning progress**: how much the loss on
+similar material has *fallen* over the recent past.
+
+A child seeks out material at the edge of what it can do, which is neither
+what it knows nor what is incomprehensible. The measurable version of that
+edge is the derivative, not the level.
+
+Related to items 13, 15 and 17, and adaptive where those are fixed.
+Evidence is good in reinforcement learning and on small models, open for
+pretraining.
 
 ## How to measure any of this
 
