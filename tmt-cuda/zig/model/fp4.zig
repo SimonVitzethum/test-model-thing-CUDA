@@ -18,6 +18,7 @@ pub const bf16 = u16;
 const CUDA_R_32F: c_int = 0;
 const CUDA_R_16BF: c_int = 14;
 const CUDA_R_4F_E2M1: c_int = 33;
+const CUDA_R_8F_E4M3: c_int = 28;
 const CUBLAS_COMPUTE_32F: c_int = 68;
 
 const DESC_POINTER_MODE: c_int = 2;
@@ -34,6 +35,8 @@ const LAYOUT_STRIDED_BATCH_OFFSET: c_int = 6;
 /// One e4m3 scale per sixteen values: NVFP4 rather than the MXFP4 variant,
 /// which this GPU's cuBLASLt does not implement.
 const SCALE_VEC16_UE4M3: c_int = 1;
+/// One fp32 scale for the whole tensor: what fp8 uses, and the default.
+const SCALE_SCALAR_32F: c_int = 0;
 
 const OP_N: c_int = 0;
 const OP_T: c_int = 1;
@@ -100,10 +103,29 @@ pub const Gemm = struct {
         return initBatched(M, N, K, w_scale, x_scale, 1, 0, 0, 0);
     }
 
+    /// The same shape in e4m3 rather than e2m1. One fp32 scale per tensor
+    /// instead of a scale per sixteen values, so there is no block-scale
+    /// array to build and no second pass to build it - which is the whole
+    /// reason to prefer it here, where the operands are written once, read
+    /// once, and thrown away.
+    pub fn initFp8(M: i32, N: i32, K: i32, w_scale: *const anyopaque, x_scale: *const anyopaque) !Gemm {
+        return initAny(M, N, K, w_scale, x_scale, 1, 0, 0, 0, CUDA_R_8F_E4M3, SCALE_SCALAR_32F);
+    }
+
+    pub fn initFp8Batched(M: i32, N: i32, K: i32, w_scale: *const anyopaque, x_scale: *const anyopaque,
+                          batch: i32, sw: i64, sx: i64, sy: i64) !Gemm {
+        return initAny(M, N, K, w_scale, x_scale, batch, sw, sx, sy, CUDA_R_8F_E4M3, SCALE_SCALAR_32F);
+    }
+
     /// The experts run as one batched matmul, so the FP4 path has to batch
     /// too or it cannot replace them. Strides are in elements, per operand.
     pub fn initBatched(M: i32, N: i32, K: i32, w_scale: *const anyopaque, x_scale: *const anyopaque,
                        batch: i32, sw: i64, sx: i64, sy: i64) !Gemm {
+        return initAny(M, N, K, w_scale, x_scale, batch, sw, sx, sy, CUDA_R_4F_E2M1, SCALE_VEC16_UE4M3);
+    }
+
+    fn initAny(M: i32, N: i32, K: i32, w_scale: *const anyopaque, x_scale: *const anyopaque,
+               batch: i32, sw: i64, sx: i64, sy: i64, dtype: c_int, scale_mode: c_int) !Gemm {
         if (lt == null) {
             const rc = cublasLtCreate(&lt);
             if (rc != 0) return fail("cublasLtCreate", rc);
@@ -116,7 +138,7 @@ pub const Gemm = struct {
         if (rc != 0) return fail("MatmulDescCreate", rc);
         const ta: c_int = OP_T;
         const tb: c_int = OP_N;
-        const mode: c_int = SCALE_VEC16_UE4M3;
+        const mode: c_int = scale_mode;
         // alpha lives on the device, so the scales never have to be read back.
         const pm: c_int = POINTER_MODE_DEVICE;
         _ = cublasLtMatmulDescSetAttribute(g.desc, DESC_POINTER_MODE, &pm, @sizeOf(c_int));
@@ -133,9 +155,9 @@ pub const Gemm = struct {
         _ = cublasLtMatmulDescSetAttribute(g.desc, DESC_A_SCALE_POINTER, &ap, @sizeOf(usize));
         _ = cublasLtMatmulDescSetAttribute(g.desc, DESC_B_SCALE_POINTER, &bp, @sizeOf(usize));
 
-        rc = cublasLtMatrixLayoutCreate(&g.la, CUDA_R_4F_E2M1, @intCast(K), @intCast(N), @intCast(K));
+        rc = cublasLtMatrixLayoutCreate(&g.la, dtype, @intCast(K), @intCast(N), @intCast(K));
         if (rc != 0) return fail("layout W", rc);
-        rc = cublasLtMatrixLayoutCreate(&g.lb, CUDA_R_4F_E2M1, @intCast(K), @intCast(M), @intCast(K));
+        rc = cublasLtMatrixLayoutCreate(&g.lb, dtype, @intCast(K), @intCast(M), @intCast(K));
         if (rc != 0) return fail("layout X", rc);
         rc = cublasLtMatrixLayoutCreate(&g.ld, CUDA_R_16BF, @intCast(N), @intCast(M), @intCast(N));
         if (rc != 0) return fail("layout Y", rc);
@@ -156,7 +178,7 @@ pub const Gemm = struct {
         _ = cublasLtMatmulPreferenceSetAttribute(pref, PREF_MAX_WORKSPACE, &ws, @sizeOf(usize));
         var found: c_int = 0;
         rc = cublasLtMatmulAlgoGetHeuristic(lt, g.desc, g.la, g.lb, g.ld, g.ld, pref, 1, &g.algo, &found);
-        if (rc != 0 or found == 0) return fail("no NVFP4 algorithm for this shape", rc);
+        if (rc != 0 or found == 0) return fail("no algorithm for this shape", rc);
         return g;
     }
 

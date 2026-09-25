@@ -198,3 +198,17 @@ pub inline fn bf2x2(bits: u32) [2]f32 {
 pub extern fn __nv_fast_sinf(x: f32) f32;
 pub extern fn __nv_fast_cosf(x: f32) f32;
 pub extern fn __nv_fast_powf(x: f32, y: f32) f32;
+
+/// Two f32 to two e4m3 bytes in one instruction, saturating rather than
+/// overflowing to NaN. The hand-written encoder is branchy ALU work that a
+/// gather kernel cannot hide; this is the hardware path, and it packs the
+/// pair so the store is 16 bits wide instead of 8.
+///
+/// As with cvt.rn.f16x2.f32, the first source lands in the high byte.
+pub inline fn cvtE4M3x2(hi: f32, lo: f32) u16 {
+    return asm ("cvt.rn.satfinite.e4m3x2.f32 %[r], %[a], %[b];"
+        : [r] "=h" (-> u16),
+        : [a] "f" (hi),
+          [b] "f" (lo),
+    );
+}

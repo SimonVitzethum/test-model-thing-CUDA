@@ -285,6 +285,55 @@ pub fn main(init: std.process.Init) !u8 {
         try p(w, &b, "%5d,%5d,%-14d %9.1f %9.1f %9.1f %8.2fx %9.4f\n",
             .{ M, NN, K, t_bf, t_q, t_enc, t_bf / (t_q + t_enc), @sqrt(num / @max(den, 1e-30)) });
     }
+    // e4m3, which is the alternative worth knowing about: half the bytes of
+    // bf16 rather than a quarter, but one fp32 scale for the whole tensor -
+    // so nothing has to be built before the matmul can run, and the gathered
+    // buffer can simply be stored in it.
+    {
+        try p(w, &b, "\nfp8 (e4m3), one scale per tensor:\n", .{});
+        const shapes8 = [_][3]i32{ .{ 2048, 512, 512 }, .{ 4096, 512, 512 }, .{ 2048, 2048, 2048 } };
+        for (shapes8) |sh| {
+            const M = sh[0];
+            const NN = sh[1];
+            const K = sh[2];
+            const um: usize = @intCast(M);
+            const un: usize = @intCast(NN);
+            const uk: usize = @intCast(K);
+            const Ab = try mem.allocT(u16, um * uk);
+            const Bb = try mem.allocT(u16, un * uk);
+            const Db = try mem.allocT(u16, um * un);
+            const A8 = try mem.allocT(u8, um * uk);
+            const B8 = try mem.allocT(u8, un * uk);
+            const D8 = try mem.allocT(u16, um * un);
+            const sa = try mem.allocT(f32, 1);
+            const sb = try mem.allocT(f32, 1);
+            const al = try mem.allocT(f32, 1);
+            const ze = try mem.callocT(f32, 1);
+            var one: f32 = 1.0;
+            try gpu.upload(sa, std.mem.asBytes(&one));
+            try gpu.upload(sb, std.mem.asBytes(&one));
+            try gpu.upload(al, std.mem.asBytes(&one));
+            var g8 = fp4.Gemm.initFp8(M, NN, K, @ptrCast(sa), @ptrCast(sb)) catch {
+                try p(w, &b, "%5d,%5d,%-14d %s\n", .{ M, NN, K, fp4.lastError().ptr });
+                continue;
+            };
+            defer g8.deinit();
+            const reps: usize = 50;
+            try linalg.linearFwd(M, NN, K, Ab, Bb, Db);
+            try g8.run(@ptrCast(B8), @ptrCast(A8), @ptrCast(D8), @ptrCast(al), @ptrCast(ze));
+            try gpu.synchronize();
+            var t0 = now();
+            for (0..reps) |_| try linalg.linearFwd(M, NN, K, Ab, Bb, Db);
+            try gpu.synchronize();
+            const tb = (now() - t0) / 1e3 / @as(f64, @floatFromInt(reps));
+            t0 = now();
+            for (0..reps) |_| try g8.run(@ptrCast(B8), @ptrCast(A8), @ptrCast(D8), @ptrCast(al), @ptrCast(ze));
+            try gpu.synchronize();
+            const t8 = (now() - t0) / 1e3 / @as(f64, @floatFromInt(reps));
+            try p(w, &b, "%5d,%5d,%-14d %9.1f %9.1f %8.2fx\n", .{ M, NN, K, tb, t8, tb / t8 });
+        }
+    }
+
     // Does the batched form exist? The experts run batched, so an FP4 path
     // that cannot batch cannot replace them.
     {

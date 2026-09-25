@@ -59,6 +59,7 @@ pub const Cfg = extern struct {
     mtp: i32 = 0,
     mtp_weight: f32 = 0.3,
     fp4: i32 = 0,
+    fp8: i32 = 0,
     fp4_keep_first: i32 = 1,
     fp4_keep_last: i32 = 2,
     rnoise: f32 = 0,
@@ -201,6 +202,8 @@ pub fn validate(c: Cfg) Error!void {
     try require((c.fp4 == 0 or c.fp4 == 1) and c.fp4_keep_first >= 0 and c.fp4_keep_last >= 0 and
         c.fp4_keep_first + c.fp4_keep_last < c.layers,
         "fp4 must be 0 or 1 and the kept blocks must leave some layers");
+    try require((c.fp8 == 0 or c.fp8 == 1) and !(c.fp8 != 0 and c.fp4 != 0),
+        "fp8 must be 0 or 1, and not both fp4 and fp8");
     try require(c.rnoise >= 0 and c.rwarm >= 0,
         "require rnoise >= 0 and rwarm >= 0 (rnoise 0 is off)");
     try require(c.wavg >= 0 and c.wavg < 1 and c.wavg_every >= 1,

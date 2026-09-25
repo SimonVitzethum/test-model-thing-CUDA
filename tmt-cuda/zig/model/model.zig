@@ -891,6 +891,8 @@ fn layersForward(m: *Model, s: *StreamState, from: usize, to: usize, stream: [*]
             // only the last four.
             c.fp4 != 0 and l >= @as(usize, @intCast(c.fp4_keep_first)) and
                 l + @as(usize, @intCast(c.fp4_keep_last)) < @as(usize, @intCast(c.layers)),
+            c.fp8 != 0 and l >= @as(usize, @intCast(c.fp4_keep_first)) and
+                l + @as(usize, @intCast(c.fp4_keep_last)) < @as(usize, @intCast(c.layers)),
             m.fp4_stamp);
         if (c.mla != 0 and m.ML[l].use) {
             const ml = &m.ML[l];

@@ -187,3 +187,47 @@ The optimizer stays out. Adam writes about `lr*m/sqrt(v)` per step, roughly
 update would round away entirely. Stochastic rounding removes the bias, not
 the variance. The master copy is where the precision has to live, and bf16
 with stochastic rounding is already the floor.
+
+## fp8 (e4m3): what NVFP4 could not do here
+
+NVFP4 lost on this hardware because the block scales have to be built before
+the matmul, and at these shapes building them costs more than the matmul
+saves. e4m3 has one fp32 scale for the whole tensor and cuBLASLt applies it
+itself, so there is no array to build, no alpha to compute - and the gathered
+buffer can simply be *stored* in the format, which is where the real saving
+turned out to be.
+
+```
+dim    layers  batch   bf16 B/s   fp8 B/s          bpb bf16 / fp8
+512      16      64     174663     180944   +3.6%   4.9230 / 4.9294
+512      16      32     156395     161451   +3.2%   5.2923 / 5.2959
+1024     16      32      58697      61650   +5.0%   4.9924 / 4.9941
+```
+
+Loss is indistinguishable, which NVFP4's was not (4.966 against 4.925). The
+win grows with width because the matmul's share of the step does.
+
+Three things had to be right, and each was worth about as much as the format:
+
+**The measurement cannot live in the gather.** The first version accumulated
+the activation maximum while gathering, to make it free. It cost 494 us
+against the bf16 gather's 137: thirty-two thousand blocks doing `atomicMax`
+on one address serialise. Delayed scaling instead - the amax over the layer
+input bounds the amax over the rows gathered from it, measured once every
+thirty-two windows with a factor-of-two margin, and the encoder saturates so
+drift clips a few values rather than producing NaN.
+
+**The same for the weights.** One amax pass per expert reads 524 KB in 10.9
+us, which is 48 GB/s - launch overhead, not bandwidth - and there are 10400
+of them in a hundred steps. Weights drift more slowly than activations;
+recalibrating every thirty-two optimizer steps took that from 114 ms to 6.
+
+**The encoder has to be the hardware one.** A hand-written e4m3 encoder is
+branchy ALU work that a bandwidth-bound gather cannot hide: 162 us against
+bf16's 144, despite writing half the bytes. `cvt.rn.satfinite.e4m3x2.f32`
+converts two values in one instruction and packs them, so the store is 16
+bits wide rather than 8. That took the gather to 76 us - 1.9x faster than
+the bf16 gather it replaces, better than the byte count alone predicts.
+
+The backward path is still bf16 and re-gathers its own copy, so roughly half
+the dispatch traffic is untouched.

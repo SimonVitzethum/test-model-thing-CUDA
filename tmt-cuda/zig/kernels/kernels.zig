@@ -1815,6 +1815,72 @@ export fn fp4_absmax(src: cuda.ConstGlobal(bf16), out: cuda.Global(f32), n: i64)
     if (t == 0) _ = cuda.atomicMaxF32(&out[0], @floatCast(mt_buf[0]));
 }
 
+/// e4m3 with a sign, for tensors rather than for scales. Half the bytes of
+/// bf16 against a quarter for e2m1, but one fp32 scale for the whole tensor
+/// and no block scales at all - so unlike NVFP4 nothing has to be built
+/// before the matmul, and a kernel that was going to write the tensor anyway
+/// can write it encoded for free.
+inline fn toE4M3S(v: f32) u8 {
+    const b: u32 = @bitCast(v);
+    const sign: u8 = @intCast((b >> 24) & 0x80);
+    return sign | toE4M3(@abs(v));
+}
+
+/// Gather the routed rows and encode them in one pass.
+///
+/// An earlier version also accumulated the maximum for the next window here,
+/// to make the measurement free. It cost 494 us against the bf16 gather's
+/// 137: thirty-two thousand blocks doing atomicMax on one address serialise,
+/// and that dwarfs the half of the bytes the encoding saves. The maximum is
+/// measured separately and rarely instead - layer-normalised activations do
+/// not change range quickly - and the encoder saturates, so drift costs a
+/// few clipped values rather than a NaN.
+export fn gather_slot_fp8(X: cuda.ConstGlobal(bf16), slot_of: cuda.ConstGlobal(i32), Xg: cuda.Global(u16),
+                          gscale: cuda.ConstGlobal(f32),
+                          N: i32, K: i32, D: i32) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX()); // one thread per *pair*
+    const half = @divTrunc(D, 2);
+    const n = @as(i64, N) * K * half;
+    if (i >= n) return;
+    // Before the first calibration the scale is zero; unit scale is a safe
+    // fallback, because these rows are layer-normalised and e4m3 reaches 448.
+    const gs = gscale[0];
+    const inv = if (gs > 0) 1.0 / gs else @as(f32, 1);
+    const dd = @mod(i, half);
+    const tmp = @divTrunc(i, half);
+    const j = @mod(tmp, K);
+    const r = @divTrunc(tmp, K);
+    const pos: i64 = slot_of[@intCast(r * K + j)];
+    const src: i64 = r * D + dd * 2;
+    const a = cuda.bf2f(X[@intCast(src)]) * inv;
+    const b2 = cuda.bf2f(X[@intCast(src + 1)]) * inv;
+    Xg[@intCast(pos * @as(i64, half) + dd)] = cuda.cvtE4M3x2(b2, a);
+}
+
+/// Weights to e4m3. Flat, because there is no block structure to respect.
+export fn fp8_quant(src: cuda.ConstGlobal(bf16), dst: cuda.Global(u16),
+                    gscale: cuda.ConstGlobal(f32), n: i64) callconv(.nvptx_kernel) void {
+    const i: i64 = @intCast(cuda.globalIdX()); // pairs, as in the gather
+    if (i >= n) return;
+    const inv = 1.0 / gscale[0];
+    dst[@intCast(i)] = cuda.cvtE4M3x2(cuda.bf2f(src[@intCast(i * 2 + 1)]) * inv,
+                                      cuda.bf2f(src[@intCast(i * 2)]) * inv);
+}
+
+/// The e4m3 counterpart of fp4_scale: 448 is the format's largest finite
+/// value, and there is no factor of six because there are no block scales to
+/// leave room for. `amax` is consumed and replaced by the scale, and the
+/// accumulator is reset for the window that will measure the next one.
+export fn fp8_scale(amax: cuda.Global(f32), scale: cuda.Global(f32),
+                    margin: f32) callconv(.nvptx_kernel) void {
+    if (cuda.globalIdX() != 0) return;
+    const a = amax[0];
+    // The margin buys headroom between calibrations: activations may grow by
+    // that factor before anything saturates.
+    if (a > 0) scale[0] = a * margin * (1.0 / 448.0);
+    amax[0] = 0;
+}
+
 /// Turns an absolute maximum into the per-tensor encode scale, on the device,
 /// so nothing has to travel to the host and back between two kernels. The
 /// first version of this path downloaded the value, and with one download per

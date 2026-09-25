@@ -65,6 +65,15 @@ pub const Keep = struct {
     gW: [*]f32 = undefined,
     alpha: [*]f32 = undefined,
     stamp: i64 = -1,
+    /// The same experts in e4m3. Half the bytes of bf16 rather than a
+    /// quarter, but one scale for the tensor and no block scales, so the
+    /// gathered rows can simply be *stored* in it - which is where the
+    /// saving is, since that buffer is written once and read once.
+    Wq8: [*]u8 = undefined,
+    gW8: [*]f32 = undefined,
+    wa8: [*]f32 = undefined,
+    cal8: u32 = 0,
+    stamp8: i64 = -1,
 
     pub fn alloc(k: *Keep, mem: *gpu.Memory, N: usize, E: usize, K: usize, D: usize) !void {
         const Tk = slotCapacity(N, E, K);
@@ -81,6 +90,9 @@ pub const Keep = struct {
         k.Wsc = try mem.allocT(u8, E * D * D / 16);
         k.gW = try mem.callocT(f32, 1);
         k.alpha = try mem.callocT(f32, 1);
+        k.Wq8 = try mem.allocT(u8, E * D * D);
+        k.gW8 = try mem.callocT(f32, 1);
+        k.wa8 = try mem.callocT(f32, 1);
     }
 };
 
@@ -115,8 +127,19 @@ pub const Ws = struct {
     Xsc: [*]u8 = undefined,
     gX: [*]f32 = undefined,
     zero: [*]f32 = undefined, // a device-resident 0 for the matmul's beta
+    one: [*]f32 = undefined, // and a 1: fp8 needs no alpha, unlike NVFP4
     fq: ?fp4.Gemm = null,
     fq_pm: i32 = -1,
+    /// The gathered rows in e4m3, written by the gather itself. `xs8` is the
+    /// scale in use, `xa8` the maximum being accumulated for the next window:
+    /// delayed scaling, so measuring costs no pass of its own.
+    Xg8: [*]u8 = undefined,
+    xs8: [*]f32 = undefined,
+    xa8: [*]f32 = undefined,
+    f8: ?fp4.Gemm = null,
+    f8_pm: i32 = -1,
+    cal8: u32 = 0,
+    f8s: [FQ_SLOTS]?fp4.Gemm = @splat(null),
     /// The unbatched path needs one descriptor per row count, and the row
     /// counts are whatever the router produced - so they are cached by
     /// rows/128 and built once each. Without this the heuristic would be
@@ -141,6 +164,12 @@ pub const Ws = struct {
         w.dXg = try mem.allocT(bf16, Tk * D);
         w.Xf = try mem.allocT(f32, N * D);
         w.Xq = try mem.allocT(u8, Tk * D / 2);
+        w.Xg8 = try mem.allocT(u8, Tk * D);
+        w.xs8 = try mem.callocT(f32, 1);
+        w.xa8 = try mem.callocT(f32, 1);
+        w.one = try mem.allocT(f32, 1);
+        const one: f32 = 1.0;
+        try gpu.upload(w.one, std.mem.asBytes(&one));
         w.Xsc = try mem.allocT(u8, Tk * D / 16);
         w.gX = try mem.callocT(f32, 1);
         w.zero = try mem.callocT(f32, 1);
@@ -192,7 +221,7 @@ fn blocks(n: usize) u32 {
 pub fn forward(gpa: std.mem.Allocator, kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16,
                Wexp: []const [*]bf16, wptr: u64, Y: [*]bf16, k: *Keep, w: *Ws,
                N: usize, E: usize, K: usize, D: usize, beta: f32,
-               noise: f32, seed: u32, use_fp4: bool, stamp: i64) !f32 {
+               noise: f32, seed: u32, use_fp4: bool, use_fp8: bool, stamp: i64) !f32 {
     k.N = @intCast(N);
     k.E = @intCast(E);
     k.K = @intCast(K);
@@ -239,9 +268,28 @@ pub fn forward(gpa: std.mem.Allocator, kern: *gpu.Kernels, X: [*]const bf16, Wro
         .{ k.idx, w.w, w.cursor, k.perm, k.slotw, k.slot_of, @as(i32, @intCast(N)), @as(i32, @intCast(K)) });
     try gpu.zero(w.Xg, @as(usize, @intCast(@max(ptk, 1))) * D * 2);
     if (tk > 0) {
-        try (try kern.get("gather_slot")).launch(blocks(N * K * D), 256,
+        if (use_fp8) {
+            // The scale comes from the previous window's maximum, and this
+            // window measures the next one while it gathers. The encode is
+            // therefore free: this kernel had to write the buffer anyway.
+            // Recalibrate rarely: the amax over the layer input bounds the
+            // amax over the rows gathered from it, and one pass every
+            // thirty-two windows amortises to nothing.
+            if (w.cal8 == 0) {
+                try gpu.zero(w.xa8, 4);
+                try (try kern.get("fp4_absmax")).launch(256, 256,
+                    .{ X, w.xa8, @as(i64, @intCast(N * D)) });
+                try (try kern.get("fp8_scale")).launch(1, 32, .{ w.xa8, w.xs8, @as(f32, 2.0) });
+            }
+            try (try kern.get("gather_slot_fp8")).launch(blocks(N * K * D / 2), 256,
+                .{ X, k.slot_of, w.Xg8, w.xs8,
+                   @as(i32, @intCast(N)), @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
+            w.cal8 = (w.cal8 + 1) % 32;
+        } else try (try kern.get("gather_slot")).launch(blocks(N * K * D), 256,
             .{ X, k.slot_of, w.Xg, @as(i32, @intCast(N)), @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
-        if (use_fp4) {
+        if (use_fp8) {
+            try fp8Experts(kern, Wexp, k, w, E, D, pm, uniform, stamp);
+        } else if (use_fp4) {
             try fp4Experts(kern, Wexp, k, w, E, D, pm, ptk, uniform, stamp);
         } else if (uniform) {
             try w.setPointers(gpa, E, D, @intCast(pm), k);
@@ -345,6 +393,64 @@ fn fp4Experts(kern: *gpu.Kernels, Wexp: []const [*]bf16, k: *Keep, w: *Ws,
         g.setScales(@ptrCast(k.Wsc + e * D * D / 16), @ptrCast(w.Xsc + off * D / 16));
         try g.run(@ptrCast(k.Wq + e * D * D / 2), @ptrCast(w.Xq + off * D / 2),
             @ptrCast(k.Yg + off * D), &k.alpha[0], &w.zero[0]);
+    }
+}
+
+/// The experts' forward matmul in e4m3.
+///
+/// Where NVFP4 has to build a block-scale array before it can multiply, this
+/// has one fp32 scale per tensor and cuBLASLt applies it - so alpha is one,
+/// there is no encode pass for the activations at all (the gather wrote
+/// them), and the only cost is re-encoding the weights when the optimizer
+/// has moved them.
+fn fp8Experts(kern: *gpu.Kernels, Wexp: []const [*]bf16, k: *Keep, w: *Ws,
+              E: usize, D: usize, pm: i32, uniform: bool, stamp: i64) !void {
+    if (k.stamp8 != stamp) {
+        // The maximum is measured rarely, the encoding done every step. One
+        // amax pass per expert costs 10.9 us to read 524 KB - 48 GB/s, which
+        // is launch overhead rather than bandwidth - and weights drift more
+        // slowly than the activations do, so a margin covers the interval.
+        if (k.cal8 == 0) {
+            const amax = try kern.get("fp4_absmax");
+            try gpu.zero(k.wa8, 4);
+            for (0..E) |e|
+                try amax.launch(256, 256, .{ Wexp[e], k.wa8, @as(i64, @intCast(D * D)) });
+            // One scale over all the layer's experts, so a batched matmul
+            // needs only the one scale pointer.
+            try (try kern.get("fp8_scale")).launch(1, 32, .{ k.wa8, k.gW8, @as(f32, 1.5) });
+        }
+        k.cal8 = (k.cal8 + 1) % 32;
+        const q = try kern.get("fp8_quant");
+        for (0..E) |e|
+            try q.launch(blocks(D * D / 2), 256,
+                .{ Wexp[e], k.Wq8 + e * D * D, k.gW8, @as(i64, @intCast(D * D / 2)) });
+        k.stamp8 = stamp;
+    }
+
+    if (uniform) {
+        const rows: usize = @intCast(pm);
+        if (w.f8 == null or w.f8_pm != pm) {
+            if (w.f8) |*g| g.deinit();
+            w.f8 = try fp4.Gemm.initFp8Batched(pm, @intCast(D), @intCast(D),
+                @ptrCast(k.gW8), @ptrCast(w.xs8), @intCast(E),
+                @intCast(D * D), @intCast(rows * D), @intCast(rows * D));
+            w.f8_pm = pm;
+        }
+        try w.f8.?.run(@ptrCast(k.Wq8), @ptrCast(w.Xg8), @ptrCast(k.Yg), &w.one[0], &w.zero[0]);
+        return;
+    }
+    for (0..E) |e| {
+        const erows = @divTrunc(k.hcnt[e] + 127, 128) * 128;
+        if (erows == 0) continue;
+        const off: usize = @intCast(k.phoff[e]);
+        const slot: usize = @intCast(@divTrunc(erows, 128));
+        if (slot >= FQ_SLOTS) continue;
+        if (w.f8s[slot] == null)
+            w.f8s[slot] = try fp4.Gemm.initFp8(erows, @intCast(D), @intCast(D),
+                @ptrCast(k.gW8), @ptrCast(w.xs8));
+        const g = &w.f8s[slot].?;
+        try g.run(@ptrCast(k.Wq8 + e * D * D), @ptrCast(w.Xg8 + off * D),
+            @ptrCast(k.Yg + off * D), &w.one[0], &w.zero[0]);
     }
 }
 
