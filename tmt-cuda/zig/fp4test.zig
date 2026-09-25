@@ -43,6 +43,8 @@ pub fn main(init: std.process.Init) !u8 {
     const blocks = n / 16;
     // bit 0 stochastic rounding, bit 1 Hadamard rotation inside the block
     const qmode: i32 = @intCast(try args.int(u32, "mode", 3));
+    const ctrl: bool = (try args.int(u32, "ctrl", 0)) != 0;
+    const noout: bool = (try args.int(u32, "noout", 0)) != 0;
 
     var mod = try gpu.Kernels.load(gpa, kernels_ptx);
     var mem = gpu.Memory.init(gpa);
@@ -117,7 +119,8 @@ pub fn main(init: std.process.Init) !u8 {
     // The matmul itself, against the bf16 one it would replace. The shapes
     // are the ones the model runs: an expert is D x D, and the rows are a
     // window's worth of tokens routed to it.
-    try p(w, &b, "\n%-28s %10s %10s %9s %10s\n", .{ "shape (M,N,K)", "bf16 us", "nvfp4 us", "speedup", "rel err" });
+    try p(w, &b, "\n%-28s %9s %9s %9s %9s %9s\n",
+        .{ "shape (M,N,K)", "bf16 us", "fp4 us", "encode", "net", "rel err" });
     const shapes = [_][3]i32{
         .{ 1024, 512, 512 }, .{ 2048, 512, 512 }, .{ 4096, 512, 512 },
         .{ 512, 512, 2048 }, .{ 2048, 2048, 2048 },
@@ -139,6 +142,7 @@ pub fn main(init: std.process.Init) !u8 {
         const Bs = try mem.allocT(u8, un * uk / 16);
         const Dq = try mem.allocT(u16, um * un);
         const ga = try mem.allocT(f32, 1);
+        const gb = try mem.allocT(f32, 1);
         const dal = try mem.allocT(f32, 1);
         const dze = try mem.callocT(f32, 1);
 
@@ -164,20 +168,40 @@ pub fn main(init: std.process.Init) !u8 {
                 }
             }
         }.f;
-        fill(ha, &st, true);
+        fill(ha, &st, !noout);
         fill(hb2, &st, false);
+        // Positive control: every value 1.0, which e2m1 represents exactly,
+        // so the product must come back as exactly K. Anything else is a
+        // layout or scaling fault rather than quantisation error.
+        if (ctrl) {
+            @memset(ha, bf(1.0));
+            @memset(hb2, bf(1.0));
+        }
         try gpu.upload(Ab, std.mem.sliceAsBytes(ha));
         try gpu.upload(Bb, std.mem.sliceAsBytes(hb2));
 
-        var amax: f32 = 0;
-        for (ha) |q| amax = @max(amax, @abs(unbf(q)));
-        for (hb2) |q| amax = @max(amax, @abs(unbf(q)));
-        var hg2: f32 = amax / 6.0 / 448.0;
-        try gpu.upload(ga, std.mem.asBytes(&hg2));
+        // One per-tensor scale each, as the model keeps them. Sharing a scale
+        // between operands of different dynamic range is what made this
+        // benchmark report a relative error of 1.8 on data the quantiser
+        // handles at 0.07: A's outliers set the scale, and B was measured
+        // against a ruler chosen for someone else.
+        var amaxA: f32 = 0;
+        var amaxB: f32 = 0;
+        for (ha) |q| amaxA = @max(amaxA, @abs(unbf(q)));
+        for (hb2) |q| amaxB = @max(amaxB, @abs(unbf(q)));
+        var hgA: f32 = amaxA / 6.0 / 448.0;
+        var hgB: f32 = amaxB / 6.0 / 448.0;
+        try gpu.upload(ga, std.mem.asBytes(&hgA));
+        try gpu.upload(gb, std.mem.asBytes(&hgB));
         const nbA = um * uk / 16;
         const nbB = un * uk / 16;
         try (try mod.get("fp4_quant")).launch(@intCast((nbA + 255) / 256), 256, .{ Ab, Aq, As, ga, qmode, @as(u32, 1), @as(i64, @intCast(nbA)) });
-        try (try mod.get("fp4_quant")).launch(@intCast((nbB + 255) / 256), 256, .{ Bb, Bq, Bs, ga, qmode, @as(u32, 2), @as(i64, @intCast(nbB)) });
+        // The A operand goes through the 2D quantiser, as the model's weights
+        // do: the block scales for that side are not one per sixteen
+        // contiguous values but one per 16x16 tile, replicated down the rows.
+        const tilesB: usize = (un / 16) * (uk / 16);
+        try (try mod.get("fp4_quant_w2d")).launch(@intCast((tilesB + 255) / 256), 256,
+            .{ Bb, Bq, Bs, gb, @as(i32, @intCast(un)), @as(i32, @intCast(uk)), @as(i64, @intCast(tilesB)) });
 
         var g = fp4.Gemm.init(M, NN, K, @ptrCast(Bs), @ptrCast(As)) catch {
             try p(w, &b, "%5d,%5d,%-14d %s\n", .{ M, NN, K, fp4.lastError().ptr });
@@ -188,7 +212,7 @@ pub fn main(init: std.process.Init) !u8 {
         const reps: usize = 50;
         try linalg.linearFwd(M, NN, K, Ab, Bb, Db);
         {
-            const a2 = hg2 * hg2;
+            const a2 = hgA * hgB;
             try gpu.upload(dal, std.mem.asBytes(&a2));
         }
         try g.run(@ptrCast(Bq), @ptrCast(Aq), @ptrCast(Dq), @ptrCast(dal), @ptrCast(dze));
@@ -197,14 +221,41 @@ pub fn main(init: std.process.Init) !u8 {
         for (0..reps) |_| try linalg.linearFwd(M, NN, K, Ab, Bb, Db);
         try gpu.synchronize();
         const t_bf = (now() - t0) / 1e3 / @as(f64, @floatFromInt(reps));
-        t0 = now();
-        for (0..reps) |_| {
-            const a2 = hg2 * hg2;
+        {
+            const a2 = hgA * hgB;
             try gpu.upload(dal, std.mem.asBytes(&a2));
         }
-        try g.run(@ptrCast(Bq), @ptrCast(Aq), @ptrCast(Dq), @ptrCast(dal), @ptrCast(dze));
+        t0 = now();
+        for (0..reps) |_|
+            try g.run(@ptrCast(Bq), @ptrCast(Aq), @ptrCast(Dq), @ptrCast(dal), @ptrCast(dze));
         try gpu.synchronize();
         const t_q = (now() - t0) / 1e3 / @as(f64, @floatFromInt(reps));
+
+        // What it costs to get there. Both operands have to be scanned for a
+        // maximum and encoded before the matmul can run, and in training that
+        // happens every step - so this belongs in the comparison, not beside
+        // it. A speedup that the quantiser eats is not a speedup.
+        const amaxk = try mod.get("fp4_absmax");
+        const quantk = try mod.get("fp4_quant");
+        t0 = now();
+        for (0..reps) |_| {
+            try gpu.zero(ga, 4);
+            try amaxk.launch(256, 256, .{ Ab, ga, @as(i64, @intCast(um * uk)) });
+            try gpu.zero(gb, 4);
+            try amaxk.launch(256, 256, .{ Bb, gb, @as(i64, @intCast(un * uk)) });
+            try quantk.launch(@intCast((nbA + 255) / 256), 256,
+                .{ Ab, Aq, As, ga, qmode, @as(u32, 1), @as(i64, @intCast(nbA)) });
+            try quantk.launch(@intCast((nbB + 255) / 256), 256,
+                .{ Bb, Bq, Bs, gb, qmode, @as(u32, 2), @as(i64, @intCast(nbB)) });
+        }
+        try gpu.synchronize();
+        const t_enc = (now() - t0) / 1e3 / @as(f64, @floatFromInt(reps));
+        try gpu.upload(ga, std.mem.asBytes(&hgA));
+        try gpu.upload(gb, std.mem.asBytes(&hgB));
+        try quantk.launch(@intCast((nbA + 255) / 256), 256, .{ Ab, Aq, As, ga, qmode, @as(u32, 1), @as(i64, @intCast(nbA)) });
+        try (try mod.get("fp4_quant_w2d")).launch(@intCast((tilesB + 255) / 256), 256,
+            .{ Bb, Bq, Bs, gb, @as(i32, @intCast(un)), @as(i32, @intCast(uk)), @as(i64, @intCast(tilesB)) });
+        try g.run(@ptrCast(Bq), @ptrCast(Aq), @ptrCast(Dq), @ptrCast(dal), @ptrCast(dze));
 
         const hd1 = try gpa.alloc(u16, um * un);
         const hd2 = try gpa.alloc(u16, um * un);
@@ -214,14 +265,25 @@ pub fn main(init: std.process.Init) !u8 {
         try gpu.download(std.mem.sliceAsBytes(hd2), Dq);
         var num: f64 = 0;
         var den: f64 = 0;
+        var cc: f64 = 0;
+        var dot: f64 = 0;
         for (hd1, hd2) |x, y| {
             const a = unbf(x);
             const c = unbf(y);
             num += @as(f64, a - c) * (a - c);
             den += @as(f64, a) * a;
+            cc += @as(f64, c) * c;
+            dot += @as(f64, a) * c;
         }
-        try p(w, &b, "%5d,%5d,%-14d %10.1f %10.1f %8.2fx %10.4f\n",
-            .{ M, NN, K, t_bf, t_q, t_bf / t_q, @sqrt(num / @max(den, 1e-30)) });
+        // A pure scale error and an uncorrelated result look alike in rel L2
+        // but not here: the correlation says whether the answer is the right
+        // shape, the norm ratio says whether it is the right size.
+        if (ctrl) try p(w, &b, "   control: bf16[0]=%.1f fp4[0]=%.1f (expect %d)\n",
+            .{ @as(f64, unbf(hd1[0])), @as(f64, unbf(hd2[0])), K });
+        try p(w, &b, "   |fp4|/|bf16| %.4f  corr %.4f\n",
+            .{ @sqrt(cc / @max(den, 1e-30)), dot / @sqrt(@max(cc * den, 1e-30)) });
+        try p(w, &b, "%5d,%5d,%-14d %9.1f %9.1f %9.1f %8.2fx %9.4f\n",
+            .{ M, NN, K, t_bf, t_q, t_enc, t_bf / (t_q + t_enc), @sqrt(num / @max(den, 1e-30)) });
     }
     // Does the batched form exist? The experts run batched, so an FP4 path
     // that cannot batch cannot replace them.

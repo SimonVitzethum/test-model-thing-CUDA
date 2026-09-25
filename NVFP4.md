@@ -125,6 +125,49 @@ is small.
 So this is built, correct, and currently a 2-5% loss. It is kept because the
 ratio is a property of the shape, not of the implementation.
 
+## The benchmark was measuring the wrong thing too
+
+`fp4test` reported the FP4 matmul at 3.5x to 61x. Those numbers are void:
+`g.run` sat *outside* the timing loop, which only uploaded alpha fifty
+times, so the column was one matmul divided by fifty. The giveaway was there
+to be read - 4.4 us at every shape, independent of M, N and K.
+
+Corrected, and with the cost of encoding the operands in the same table,
+since in training that happens every step:
+
+```
+shape (M,N,K)        bf16 us   fp4 us   encode     net
+ 1024, 512, 512         16.2     11.4     26.9    0.42x
+ 2048, 512, 512         29.0      9.5     35.0    0.65x
+ 4096, 512, 512         50.9     12.6     47.4    0.85x
+  512, 512,2048         26.5      9.0     45.5    0.49x
+ 2048,2048,2048        361.3     64.4    123.4    1.92x
+```
+
+The matmul alone is 1.4x to 5.6x faster. Net of encoding it is a *loss*
+below roughly 2048 cubed, which is where the expert shape sits, and that is
+the same statement as the training measurement above arrived at from the
+other end.
+
+A positive control settles that the path is correct: operands of all ones,
+which e2m1 represents exactly, come back as exactly K with correlation 1.0.
+Without it the accuracy column would have looked like a bug - it reports a
+relative error of 1.78 on gaussian data carrying a 25-sigma outlier every
+211 values. That is not a fault, it is the format: a 16-wide block holding
+one such outlier rounds its other fifteen values to zero. The quantiser's
+own round-trip hides this at 0.068, because the outliers carry most of the
+L2 energy and the values that were destroyed carry almost none. On the same
+data without outliers the matmul's error is 0.41 - still four times the
+operands' 0.10, because the block scale's rounding error is shared by all
+sixteen values of a block and does not average away over the contraction.
+
+The rotation modes are unverified. `hadamard16` does not normalise, so the
+transform has `H^T H = 16 I` and the inverse applies `H` a second time; the
+measured numbers (rotation helps on outliers, hurts without them) are
+consistent with a scaling that is absorbed somewhere rather than cancelled.
+It does not touch the training path, which runs round-to-nearest as the
+paper prescribes, but it has to be settled before the gradient path uses it.
+
 ## What is not built
 
 The backward path: `linearDX` and `linearDW` through `fp4.Gemm`, with
