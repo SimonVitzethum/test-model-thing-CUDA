@@ -128,6 +128,7 @@ fn run(init: std.process.Init, out: Out) !void {
     var mode: []const u8 = "train";
     var steps: u64 = 0;
     var saveevery: u64 = 500;
+    var lossout: []const u8 = "";
     for (argv[3..]) |a| {
         const eq = std.mem.indexOfScalar(u8, a, '=') orelse return fail("expected key=value", .{});
         const key = a[0..eq];
@@ -139,6 +140,8 @@ fn run(init: std.process.Init, out: Out) !void {
             steps = try integerOption(value);
         } else if (std.mem.eql(u8, key, "saveevery")) {
             saveevery = try integerOption(value);
+        } else if (std.mem.eql(u8, key, "lossout")) {
+            lossout = value;
         } else config.set(&cfg, key, value) catch return cfgFail();
     }
     if (!std.mem.eql(u8, mode, "train") and !std.mem.eql(u8, mode, "eval")) return fail("mode must be train or eval", .{});
@@ -210,6 +213,16 @@ fn run(init: std.process.Init, out: Out) !void {
     const begin_step = progress.step;
     var measured: u64 = 0;
     var ce_sum: f64 = 0;
+    // `lossout` writes the per-byte cross entropy back in corpus order, one
+    // f32 per byte of the evaluated range, NaN where nothing was scored. It
+    // is what lets an external predictor be interpolated against this model
+    // without the model having to know about it: at the true byte, mixing
+    // two distributions needs only both of their values there.
+    const perbyte: []f32 = if (evaluation and lossout.len > 0)
+        try arena.alloc(f32, data.bytes.len)
+    else
+        &.{};
+    if (perbyte.len > 0) @memset(perbyte, std.math.nan(f32));
     const ln2 = @log(2.0);
     const begin = std.Io.Clock.awake.now(io);
     // TMT_PROFILE=1 times every kernel and matmul; it costs throughput,
@@ -300,6 +313,17 @@ fn run(init: std.process.Init, out: Out) !void {
             for (losses, valid) |l, v| if (v) {
                 ce_sum += l;
             };
+            if (perbyte.len > 0) {
+                for (0..B) |b| {
+                    const st = size * b / B;
+                    for (0..T) |t| {
+                        const i = b * T + t;
+                        if (!valid[i]) continue;
+                        const off = st + progress.cursor + t;
+                        if (off < perbyte.len) perbyte[@intCast(off)] = losses[i];
+                    }
+                }
+            }
         } else {
             if (!std.math.isFinite(loss)) return fail("non-finite loss; update refused", .{});
             const diagnostics = (progress.step + 1) % 100 == 0;
@@ -367,6 +391,16 @@ fn run(init: std.process.Init, out: Out) !void {
         }
     }
     gpu.synchronize() catch return gpuFail();
+    if (perbyte.len > 0) {
+        const f = std.Io.Dir.cwd().createFile(io, lossout, .{}) catch
+            return fail("cannot write lossout", .{});
+        defer f.close(io);
+        var wbuf: [1 << 16]u8 = undefined;
+        var fw = f.writerStreaming(io, &wbuf);
+        fw.interface.writeAll(std.mem.sliceAsBytes(perbyte)) catch
+            return fail("cannot write lossout", .{});
+        fw.interface.flush() catch return fail("cannot write lossout", .{});
+    }
     const ns = begin.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     const seconds = @as(f64, @floatFromInt(ns)) / 1e9;
     if (!evaluation) {

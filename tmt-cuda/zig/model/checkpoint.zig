@@ -194,7 +194,8 @@ fn header(f: *File, cfg: *cfgmod.Cfg) !void {
             !std.mem.startsWith(u8, key, "muon") and !std.mem.startsWith(u8, key, "mup") and !std.mem.startsWith(u8, key, "patch") and
             !std.mem.eql(u8, key, "accum") and !std.mem.startsWith(u8, key, "wavg") and
             !std.mem.eql(u8, key, "mom_bf16") and !std.mem.eql(u8, key, "master_bf16") and
-            !std.mem.startsWith(u8, key, "fp4") and !std.mem.startsWith(u8, key, "fp8"))
+            !std.mem.startsWith(u8, key, "fp4") and !std.mem.startsWith(u8, key, "fp8") and
+            !std.mem.eql(u8, key, "rnoise") and !std.mem.eql(u8, key, "rwarm"))
         {
             return fail("checkpoint configuration schema mismatch", .{});
         }
