@@ -155,7 +155,8 @@ fn blocks(n: usize) u32 {
 /// auxiliary loss unless the caller collects the statistics itself.
 pub fn forward(gpa: std.mem.Allocator, kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16,
                Wexp: []const [*]bf16, wptr: u64, Y: [*]bf16, k: *Keep, w: *Ws,
-               N: usize, E: usize, K: usize, D: usize, beta: f32) !f32 {
+               N: usize, E: usize, K: usize, D: usize, beta: f32,
+               noise: f32, seed: u32) !f32 {
     k.N = @intCast(N);
     k.E = @intCast(E);
     k.K = @intCast(K);
@@ -169,9 +170,10 @@ pub fn forward(gpa: std.mem.Allocator, kern: *gpu.Kernels, X: [*]const bf16, Wro
         k.Tk = @intCast(N);
         return 0;
     }
-    try (try kern.get("router_topk")).launch(@intCast(N), 64,
+    // Eight lanes per expert; sixty-four threads only ever covered eight.
+    try (try kern.get("router_topk")).launch(@intCast(N), @intCast(E * 8),
         .{ X, Wrouter, k.logits, k.probs, k.idx, w.w, @as(i32, @intCast(N)), @as(i32, @intCast(E)),
-           @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
+           @as(i32, @intCast(K)), @as(i32, @intCast(D)), noise, seed });
     try gpu.zero(k.counts, E * 4);
     try (try kern.get("count_experts")).launch(blocks(N), 256,
         .{ k.idx, k.counts, @as(i32, @intCast(N)), @as(i32, @intCast(K)) });

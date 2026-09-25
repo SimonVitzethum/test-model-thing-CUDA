@@ -558,9 +558,34 @@ var moe_lp: [16]f32 addrspace(.shared) = undefined;
 
 /// Fused router and top-k: one block of 64 threads per row, eight experts in
 /// parallel (eight threads each), then softmax, top-k and renormalized weights.
+/// Zero-mean noise on a routing logit, reproducible from its coordinates so
+/// the same configuration routes the same way twice.
+inline fn routerNoise(row: u32, e: u32, seed: u32) f32 {
+    var h = (row *% 0x9e3779b9) ^ (e *% 0x85ebca6b) ^ (seed *% 0xc2b2ae35);
+    h ^= h >> 15;
+    h *%= 0x2545f491;
+    h ^= h >> 13;
+    const u = @as(f32, @floatFromInt(h >> 9)) * (1.0 / 8388608.0);
+    const v = @as(f32, @floatFromInt((h *% 2654435761) >> 9)) * (1.0 / 8388608.0);
+    return u + v - 1.0; // triangular on [-1,1], mean zero
+}
+
+/// Launched with eight lanes per expert, so the caller must provide `E*8`
+/// threads. An earlier version launched sixty-four regardless, which covers
+/// eight experts; beyond that the logits of experts 8 and up were never
+/// written and the row below read uninitialised shared memory. It did not
+/// crash - it silently routed on garbage, which looked exactly like a
+/// training instability.
+///
+/// `noise` is the current amplitude of the routing noise. Expert selection is
+/// a positive feedback loop - a slightly preferred expert gets more tokens,
+/// so more gradient, so gets preferred more - and it starts before any expert
+/// has learned anything to be preferred for. Noise early in training breaks
+/// that loop by making selection independent of the tiny initial differences,
+/// and it decays to nothing, so the converged model routes cleanly.
 export fn router_topk(X: cuda.ConstGlobal(bf16), Wr: cuda.ConstGlobal(bf16), logits: cuda.Global(f32),
                       probs: cuda.Global(f32), idx: cuda.Global(i32), w: cuda.Global(f32),
-                      N: i32, E: i32, K: i32, D: i32) callconv(.nvptx_kernel) void {
+                      N: i32, E: i32, K: i32, D: i32, noise: f32, seed: u32) callconv(.nvptx_kernel) void {
     const r = cuda.blockIdxX();
     if (r >= @as(u32, @bitCast(N))) return;
     const te = cuda.threadIdxX();
@@ -580,11 +605,19 @@ export fn router_topk(X: cuda.ConstGlobal(bf16), Wr: cuda.ConstGlobal(bf16), log
         }
         if (D & 1 != 0 and c == 0)
             acc += cuda.bf2f(X[@as(usize, r) * dim + dim - 1]) * cuda.bf2f(Wr[@as(usize, e) * dim + dim - 1]);
-        const mask: u32 = @as(u32, 0xFF) << @intCast(e * 8);
+        // The shuffle is warp-local, so the mask names this expert's eight
+        // lanes *within its warp*. Shifting by e*8 works only while all
+        // experts fit in one warp - at more than four it shifts past 32 and
+        // the mask comes out empty.
+        const mask: u32 = @as(u32, 0xFF) << @intCast((te % 32) / 8 * 8);
         var o: u32 = 4;
         while (o > 0) : (o >>= 1) acc += cuda.shflDown(mask, acc, o);
         if (c == 0) {
-            moe_lp[e] = acc;
+            // The noise enters the logit, so it shifts both the selection and
+            // the weight that selection carries. The stored logit stays clean,
+            // because the z-loss penalises the router's own magnitude and
+            // should not be charged for the exploration.
+            moe_lp[e] = if (noise != 0) acc + noise * routerNoise(r, e, seed) else acc;
             logits[r * @as(u32, @bitCast(E)) + e] = acc;
         }
     }

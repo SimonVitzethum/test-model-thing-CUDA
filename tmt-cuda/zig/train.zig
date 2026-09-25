@@ -277,6 +277,15 @@ fn run(init: std.process.Init, out: Out) !void {
             }
         }
         sess.setMtpTargets(mtp_targets) catch return gpuFail();
+        // Routing noise, decaying over `rwarm` steps and never applied while
+        // evaluating. Expert selection reinforces itself from the first step,
+        // before any expert has earned a preference; noise early on removes
+        // the tiny initial differences the loop would otherwise amplify.
+        sess.m.rnoise_now = if (evaluation or cfg.rnoise <= 0 or cfg.rwarm <= 0) 0 else blk: {
+            const f = 1.0 - @as(f32, @floatFromInt(progress.step)) / @as(f32, @floatFromInt(cfg.rwarm));
+            break :blk if (f <= 0) 0 else cfg.rnoise * f;
+        };
+        sess.m.rseed = @truncate(@as(u64, @intCast(progress.step)) *% 0x9e3779b97f4a7c15);
         const window = sess.forward(ids, targets, ends) catch return gpuFail();
         const loss = window.total;
         const ce = window.ce;

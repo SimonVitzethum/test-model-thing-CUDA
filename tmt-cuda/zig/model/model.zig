@@ -146,6 +146,11 @@ pub const Model = struct {
     grad_scale: f32 = 1,
     /// Whether this window starts a fresh accumulation.
     clear_grads: bool = true,
+    /// Amplitude of the routing noise for the window about to run, and the
+    /// stream it is drawn from. Set by the training loop and left at zero
+    /// everywhere else, so evaluation never routes noisily.
+    rnoise_now: f32 = 0,
+    rseed: u32 = 0,
     opt: MTParams = .{},
     /// The weights Muon updates instead of AdamW, with its scratch.
     muon_params: []usize = &.{},
@@ -877,7 +882,8 @@ fn layersForward(m: *Model, s: *StreamState, from: usize, to: usize, stream: [*]
         for (0..E) |e| Wx[e] = m.store.at(ly.exp[e]).work;
         // The residual add is folded into the combine (beta = 1).
         aux_acc += try moe.forward(m.gpa, k, m.H, m.store.at(ly.router).work, Wx[0..E], ly.exp_w,
-            stream, &ly.mc, &m.moeW, N, E, @intCast(c.topk), D, 1.0);
+            stream, &ly.mc, &m.moeW, N, E, @intCast(c.topk), D, 1.0,
+            m.rnoise_now, m.rseed +% @as(u32, @intCast(l)) *% 0x9e3779b9);
         if (c.mla != 0 and m.ML[l].use) {
             const ml = &m.ML[l];
             try gpu.copyDevice(ml.Xsnap, stream, ND * 2);
