@@ -170,6 +170,13 @@ pub fn ConstGlobal(comptime T: type) type {
 pub inline fn atomicAddF32(p: *addrspace(.global) f32, v: f32) void {
     _ = @atomicRmw(f32, p, .Add, v, .monotonic);
 }
+/// Maximum of non-negative floats through their integer bit pattern: for
+/// values >= 0 the IEEE ordering and the unsigned integer ordering agree.
+pub inline fn atomicMaxF32(p: *addrspace(.global) f32, v: f32) f32 {
+    const q: *addrspace(.global) u32 = @ptrCast(p);
+    return @bitCast(@atomicRmw(u32, q, .Max, @as(u32, @bitCast(v)), .monotonic));
+}
+
 pub inline fn atomicAddI32(p: *addrspace(.global) i32, v: i32) i32 {
     return @atomicRmw(i32, p, .Add, v, .monotonic);
 }

@@ -1694,3 +1694,139 @@ export fn emb_reduce(partial: cuda.ConstGlobal(f32), byte_tiles: cuda.ConstGloba
     while (t < to) : (t += 1) acc += partial[@as(usize, @intCast(t)) * dim + d];
     dW[@as(usize, r) * dim + d] += acc;
 }
+
+// ------------------------------------------------------------------ NVFP4
+//
+// NVFP4 is e2m1 - one sign bit, two exponent bits, one mantissa bit, so the
+// representable magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4, 6 - with one e4m3
+// scale per sixteen consecutive values. Two values share a byte.
+//
+// The format carries about two decimal digits, so everything depends on the
+// scale being chosen per block rather than per tensor: within sixteen
+// neighbouring weights the dynamic range is small, across a whole matrix it
+// is not.
+
+/// The eight magnitudes of e2m1, in order of their encoding.
+const FP4_MAG = [8]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 };
+
+/// Nearest e2m1 code for a value already divided by its block scale.
+/// Ties go to even, as they do in every other rounding in this file.
+inline fn toFp4(v: f32) u8 {
+    const a = @abs(v);
+    var code: u8 = 0;
+    // Eight magnitudes, so a linear scan beats any cleverness and stays
+    // branch-predictable.
+    var best: f32 = 1e30;
+    for (FP4_MAG, 0..) |m, i| {
+        const d = @abs(a - m);
+        if (d < best) {
+            best = d;
+            code = @intCast(i);
+        }
+    }
+    return code | (if (v < 0) @as(u8, 8) else 0);
+}
+
+inline fn fromFp4(c: u8) f32 {
+    const m = FP4_MAG[c & 7];
+    return if (c & 8 != 0) -m else m;
+}
+
+/// e4m3 for the block scales, without the fp8 intrinsics: the scale is
+/// always positive here, so only the exponent and three mantissa bits matter.
+inline fn toE4M3(v: f32) u8 {
+    if (!(v > 0)) return 0;
+    const b: u32 = @bitCast(v);
+    var e: i32 = @intCast((b >> 23) & 0xFF);
+    e -= 127;
+    if (e < -6) return 0; // underflows the format
+    if (e > 8) return 0x7E; // the largest finite value
+    const mant = (b >> 20) & 7;
+    // Round to nearest on the discarded mantissa bits.
+    const rest = b & 0xFFFFF;
+    var m = mant;
+    var ee = e;
+    if (rest > 0x80000 or (rest == 0x80000 and (mant & 1) != 0)) {
+        m += 1;
+        if (m == 8) {
+            m = 0;
+            ee += 1;
+            if (ee > 8) return 0x7E;
+        }
+    }
+    return @intCast(((@as(u32, @intCast(ee + 7)) & 0xF) << 3) | m);
+}
+
+inline fn fromE4M3(c: u8) f32 {
+    if (c == 0) return 0;
+    const e: i32 = @intCast((c >> 3) & 0xF);
+    const m: u32 = c & 7;
+    const bits: u32 = (@as(u32, @intCast(e - 7 + 127)) << 23) | (m << 20);
+    return @bitCast(bits);
+}
+
+/// The largest magnitude in the tensor, for the per-tensor scale. One block
+/// per launch slice, atomics into a single float.
+export fn fp4_absmax(src: cuda.ConstGlobal(bf16), out: cuda.Global(f32), n: i64) callconv(.nvptx_kernel) void {
+    const t = cuda.threadIdxX();
+    var m: f32 = 0;
+    var i: i64 = @intCast(cuda.globalIdX());
+    const stride: i64 = @intCast(cuda.blockDimX() * cuda.gridDimX());
+    while (i < n) : (i += stride) m = cuda.__nv_fmaxf(m, @abs(cuda.bf2f(src[@intCast(i)])));
+    mt_buf[t] = m;
+    cuda.syncThreads();
+    var half = cuda.blockDimX() / 2;
+    while (half > 0) : (half >>= 1) {
+        if (t < half) mt_buf[t] = cuda.__nv_fmaxf(@floatCast(mt_buf[t]), @floatCast(mt_buf[t + half]));
+        cuda.syncThreads();
+    }
+    if (t == 0) _ = cuda.atomicMaxF32(&out[0], @floatCast(mt_buf[0]));
+}
+
+/// Quantises a bf16 matrix to NVFP4: two e2m1 values per output byte, one
+/// e4m3 scale per sixteen values along the contiguous axis, and one fp32
+/// scale for the whole tensor.
+///
+/// The per-tensor scale is not optional. e4m3 spans 2^-6 to 2^8, so a block
+/// scale below about 0.016 underflows to zero - and for weights of magnitude
+/// 0.02 the natural block scale is 0.008. Without the outer scale every
+/// block quantises to zero, which is exactly what a first version of this
+/// did. `gscale` divides the block scales into e4m3's range; the decode
+/// multiplies it back.
+///
+/// Within a block the scale is the largest magnitude over 6, the largest
+/// e2m1 magnitude, so the extreme value lands on a representable point and
+/// nothing clips.
+export fn fp4_quant(src: cuda.ConstGlobal(bf16), dst: cuda.Global(u8), scale: cuda.Global(u8),
+                    gscale: cuda.ConstGlobal(f32), nblocks: i64) callconv(.nvptx_kernel) void {
+    const b: i64 = @intCast(cuda.globalIdX());
+    if (b >= nblocks) return;
+    const at: usize = @intCast(b * 16);
+    const g = gscale[0];
+    var mx: f32 = 0;
+    for (0..16) |i| mx = cuda.__nv_fmaxf(mx, @abs(cuda.bf2f(src[at + i])));
+    const s = if (mx > 0 and g > 0) cuda.fdiv(mx * (1.0 / 6.0), g) else @as(f32, 0);
+    const sc = toE4M3(s);
+    scale[@intCast(b)] = sc;
+    const eff = fromE4M3(sc) * g;
+    const inv = if (eff > 0) cuda.frcp(eff) else @as(f32, 0);
+    for (0..8) |i| {
+        const lo = toFp4(cuda.bf2f(src[at + 2 * i]) * inv);
+        const hi = toFp4(cuda.bf2f(src[at + 2 * i + 1]) * inv);
+        dst[@intCast(b * 8 + @as(i64, @intCast(i)))] = lo | (hi << 4);
+    }
+}
+
+/// The inverse, for checking the quantiser against the values it came from.
+export fn fp4_dequant(src: cuda.ConstGlobal(u8), scale: cuda.ConstGlobal(u8),
+                      gscale: cuda.ConstGlobal(f32), dst: cuda.Global(bf16),
+                      nblocks: i64) callconv(.nvptx_kernel) void {
+    const b: i64 = @intCast(cuda.globalIdX());
+    if (b >= nblocks) return;
+    const s = fromE4M3(scale[@intCast(b)]) * gscale[0];
+    for (0..8) |i| {
+        const byte = src[@intCast(b * 8 + @as(i64, @intCast(i)))];
+        dst[@intCast(b * 16 + @as(i64, @intCast(i)) * 2)] = cuda.f2bf(fromFp4(byte & 0xF) * s);
+        dst[@intCast(b * 16 + @as(i64, @intCast(i)) * 2 + 1)] = cuda.f2bf(fromFp4(byte >> 4) * s);
+    }
+}

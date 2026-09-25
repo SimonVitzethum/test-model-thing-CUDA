@@ -75,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "kbench", .cuda = true },
         .{ .name = "memprobe", .cuda = true },
         .{ .name = "needle", .cuda = true },
+        .{ .name = "fp4test", .cuda = true },
         .{ .name = "ktest", .cuda = true, .reference = true },
     };
     for (tools) |t| {
@@ -89,6 +90,7 @@ pub fn build(b: *std.Build) void {
             mod.addRPath(.{ .cwd_relative = b.pathJoin(&.{ cuda, "lib64" }) });
             mod.linkSystemLibrary("cudart", .{});
             mod.linkSystemLibrary("cublas", .{});
+            mod.linkSystemLibrary("cublasLt", .{}); // the FP4 matmul lives here
         }
         if (t.reference) { // nvcc's object needs the system libstdc++
             mod.addObjectFile(capi_obj);
