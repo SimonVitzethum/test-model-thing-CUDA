@@ -155,13 +155,44 @@ An infinite-gram over 50 MB of Wikipedia bytes is worth about 2.8 BPB on its
 own - worse than the model it is being mixed into, which is the point: the
 gain comes from where the two disagree and the index is right.
 
-### Not yet measured
+### The speedup, measured
 
-The speedup. That needs the baseline's own held-out curve, and the baseline
-is still training; only two checkpoints of the series exist. Note in advance
-that the curve is *flat* in this region - the training loss barely moves
-between steps 15000 and 30000 - which is exactly where a ratio gets
-inflated, so the curve gets reported with any number read off it.
+One doubling of training multiplies held-out BPB by 0.9767 at this point on
+the curve - measured, not assumed:
+
+```
+step 20000   1.8593
+step 40000   1.8159
+```
+
+Against that ruler, with a 50 MB store:
+
+```
+step    model    mixed    offset    baseline doublings to match    speedup
+20000   1.8593   1.6783   -0.1810              4.34                 20.2x
+40000   1.8159   1.6535   -0.1624              3.97                 15.6x
+```
+
+**The offset shrinks as the model trains** - 0.1810 to 0.1624 over one
+doubling. The model learns part of what the index supplies. So a single
+measurement produces a number that decays, and quoting one without the
+budget it was taken at is exactly the error this file warned about before
+any of it was measured.
+
+What is honest to say: **retrieval is currently worth 15 to 20 times the
+training compute, and the factor declines slowly.** With a 100 MB store the
+offset is a quarter larger, so the factor is higher again.
+
+### Caveats that travel with those numbers
+
+- Two points on the curve. The slope rests on a single doubling, and the
+  speedup is an extrapolation of four doublings from it. More points are
+  coming from the running baseline; the factor should be re-read then.
+- The offset declines, so this cannot be extrapolated far. Whether it
+  approaches a floor or keeps decaying is the next thing to measure, and it
+  decides whether retrieval is a constant advantage or a head start.
+- This is "retrieval replaces training", not "training runs faster". The
+  index has to be there at inference, and it is 950 MB of corpus.
 
 ## Runbook, for when the GPU is free again
 
