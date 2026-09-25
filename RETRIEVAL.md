@@ -194,6 +194,29 @@ offset is a quarter larger, so the factor is higher again.
 - This is "retrieval replaces training", not "training runs faster". The
   index has to be there at inference, and it is 950 MB of corpus.
 
+## Withdrawn: the speedup numbers above
+
+Every speedup in this file - 20x, 15.6x, the seven-point fit's 5.3x and the
+~3x plateau - was read off a baseline that trained at **10% of its peak
+learning rate from step 10000 on**. `decaysteps` was not set, its default
+is 8000, and the cosine finished there. The curve between steps 20000 and
+88000 is therefore a crippled schedule creeping along, not what the model
+does with compute, and a flat curve makes any constant offset look worth
+many doublings. This is exactly the failure the external review predicted
+under its first point.
+
+The retrieval *offsets* - how much the index lowers held-out loss at a given
+checkpoint, the prose/markup split, the near-duplicate analysis, the scaling
+with the store - stand, because they compare two predictors on the same
+checkpoint. What does not stand is the conversion of an offset into a
+speedup.
+
+The baseline is being redone as warmup-stable-decay: a nearly constant rate,
+raw and averaged weights kept at 24k, 48k, 100k, 200k, 400k and 480k steps,
+and a cooldown branch from each, so every point on the compute axis is a
+fairly cooled model. The retrieval mix is then measured at each of them.
+Script: `~/tmt-scratch/wsd/run.sh`.
+
 ## Runbook, for when the GPU is free again
 
 The baseline was paused at step ~17900; `train` resumes from an existing
