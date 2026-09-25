@@ -51,6 +51,7 @@ pub const Cfg = extern struct {
     patch_hi: i32 = 0,
     patch_max: i32 = 32,
     patch_decay: i32 = 0,
+    patch_ent: f32 = 4.128,
     accum: i32 = 1,
     mup: i32 = 0,
     mup_base: i32 = 256,
@@ -180,7 +181,7 @@ pub fn validate(c: Cfg) Error!void {
     try require(c.dialog == 0 or c.dialog == 1, "dialog must be 0 or 1");
     try require(c.accum >= 1 and c.accum <= 1024, "require 1 <= accum <= 1024");
     try require((c.mup == 0 or c.mup == 1) and c.mup_base > 0, "mup must be 0 or 1 with mup_base > 0");
-    try require(c.patch >= -1 and c.patch_lo >= 0 and c.patch_hi >= 0 and
+    try require(c.patch >= -2 and c.patch_lo >= 0 and c.patch_hi >= 0 and
         c.patch_lo + c.patch_hi <= c.layers and c.patch_max > 1 and
         (c.patch_decay == 0 or c.patch_decay == 1),
         "invalid patching configuration");

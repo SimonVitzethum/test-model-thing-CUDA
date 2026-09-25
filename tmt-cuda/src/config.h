@@ -17,7 +17,7 @@
     F(float, ce, 1.f) F(float, var, 0.f) F(float, stop, 0.f) \
     F(float, stopposw, 20.f) F(float, ematau, .99f) F(float, gradclip, 1.f) \
     F(int, maxcarry, 0) F(int, seed, 1234) F(int, traces, 0) F(float, trace_decay, 1.f) F(int, docsep, -1) F(int, dialog, 0) \
-    F(int, patch, 0) F(int, patch_lo, 2) F(int, patch_hi, 0) F(int, patch_max, 32) F(int, patch_decay, 0) \
+    F(int, patch, 0) F(int, patch_lo, 2) F(int, patch_hi, 0) F(int, patch_max, 32) F(int, patch_decay, 0) F(float, patch_ent, 4.128) \
     F(int, accum, 1) \
     F(int, mup, 0) F(int, mup_base, 256) F(int, muon, 0) F(float, muon_lr, .02f) \
     F(int, mtp, 0) F(float, mtp_weight, .3f) \

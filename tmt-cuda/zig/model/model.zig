@@ -84,6 +84,12 @@ pub const Model = struct {
     mem: gpu.Memory,
     kernels: *gpu.Kernels,
 
+    /// Conditional entropy of the next byte given the previous two, one f32
+    /// per 16-bit context, loaded from a file. `patch=-2` cuts a patch where
+    /// this exceeds `patch_ent`, which is the entropy patcher: boundaries go
+    /// where the model is about to be uncertain, rather than at punctuation.
+    ent: ?[]const f32 = null,
+
     emb: usize = 0,
     tgt: usize = 0,
     dec: usize = 0,
@@ -787,7 +793,23 @@ pub fn layoutPatches(m: *Model, ids: []const i32) !void {
             for (0..T) |t| {
                 since += 1;
                 const byte: u8 = @intCast(ids[b * T + t] & 0xff);
-                const separator = byte == ' ' or byte == '\n' or byte == '\t' or byte == '\r' or
+                const separator = if (c.patch == -2) blk: {
+                    // Entropy rule. The context is the two bytes ending here,
+                    // so the cut lands just before the byte that is hard to
+                    // predict - which is where a patch boundary earns its
+                    // position.
+                    const tbl = m.ent orelse break :blk false;
+                    const p1: u32 = @intCast(ids[b * T + t] & 0xff);
+                    const p0: u32 = if (t > 0) @intCast(ids[b * T + t - 1] & 0xff) else 0;
+                    // A negative threshold inverts the rule: cut where the
+                    // next byte is *easy*. Measured to be the right way
+                    // round - the expensive layers only ever see pooled
+                    // patches, and the local decoder does the byte
+                    // prediction, so cutting before a hard byte gives the
+                    // hardest prediction the least local context.
+                    const h = tbl[(p0 << 8) | p1];
+                    break :blk if (c.patch_ent < 0) h < -c.patch_ent else h > c.patch_ent;
+                } else byte == ' ' or byte == '\n' or byte == '\t' or byte == '\r' or
                     byte == ',' or byte == '.' or byte == ';' or byte == ':' or byte == '"' or byte == '\'';
                 // Cutting before a continuation byte would split a character.
                 const next_continues = t + 1 < T and (ids[b * T + t + 1] & 0xc0) == 0x80;

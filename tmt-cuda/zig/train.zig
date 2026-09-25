@@ -129,6 +129,7 @@ fn run(init: std.process.Init, out: Out) !void {
     var steps: u64 = 0;
     var saveevery: u64 = 500;
     var lossout: []const u8 = "";
+    var entfile: []const u8 = "";
     for (argv[3..]) |a| {
         const eq = std.mem.indexOfScalar(u8, a, '=') orelse return fail("expected key=value", .{});
         const key = a[0..eq];
@@ -142,6 +143,8 @@ fn run(init: std.process.Init, out: Out) !void {
             saveevery = try integerOption(value);
         } else if (std.mem.eql(u8, key, "lossout")) {
             lossout = value;
+        } else if (std.mem.eql(u8, key, "entfile")) {
+            entfile = value;
         } else config.set(&cfg, key, value) catch return cfgFail();
     }
     if (!std.mem.eql(u8, mode, "train") and !std.mem.eql(u8, mode, "eval")) return fail("mode must be train or eval", .{});
@@ -174,6 +177,14 @@ fn run(init: std.process.Init, out: Out) !void {
     defer data.close();
     if (data.bytes.len < B * (if (evaluation) 2 else T + 1)) return fail("dataset too small for batch/seqlen", .{});
     var sess = session.Session.init(arena, io, cfg, kernels_ptx) catch return gpuFail();
+    if (entfile.len > 0) {
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, entfile, arena, .unlimited) catch
+            return fail("cannot read entfile", .{});
+        if (raw.len != 65536 * 4) return fail("entfile must hold 65536 f32 values", .{});
+        const tbl = try arena.alloc(f32, 65536);
+        for (0..65536) |i| tbl[i] = @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little));
+        sess.m.ent = tbl;
+    }
     defer sess.deinit();
     var progress = checkpoint.Progress{};
     if (have) {
