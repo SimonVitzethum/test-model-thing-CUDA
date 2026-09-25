@@ -27,6 +27,8 @@ const DESC_B_SCALE_POINTER: c_int = 18;
 const DESC_A_SCALE_MODE: c_int = 31;
 const DESC_B_SCALE_MODE: c_int = 32;
 const PREF_MAX_WORKSPACE: c_int = 1;
+const LAYOUT_BATCH_COUNT: c_int = 5;
+const LAYOUT_STRIDED_BATCH_OFFSET: c_int = 6;
 /// One e4m3 scale per sixteen values: NVFP4 rather than the MXFP4 variant,
 /// which this GPU's cuBLASLt does not implement.
 const SCALE_VEC16_UE4M3: c_int = 1;
@@ -40,6 +42,7 @@ extern fn cublasLtMatmulDescCreate(d: *?*anyopaque, compute: c_int, scale: c_int
 extern fn cublasLtMatmulDescSetAttribute(d: ?*anyopaque, attr: c_int, buf: *const anyopaque, n: usize) c_int;
 extern fn cublasLtMatmulDescDestroy(d: ?*anyopaque) c_int;
 extern fn cublasLtMatrixLayoutCreate(l: *?*anyopaque, dtype: c_int, rows: u64, cols: u64, ld: i64) c_int;
+extern fn cublasLtMatrixLayoutSetAttribute(l: ?*anyopaque, attr: c_int, buf: *const anyopaque, n: usize) c_int;
 extern fn cublasLtMatrixLayoutDestroy(l: ?*anyopaque) c_int;
 extern fn cublasLtMatmulPreferenceCreate(p: *?*anyopaque) c_int;
 extern fn cublasLtMatmulPreferenceSetAttribute(p: ?*anyopaque, attr: c_int, buf: *const anyopaque, n: usize) c_int;
@@ -92,6 +95,13 @@ pub const Gemm = struct {
     /// a relative error of sqrt(2), the signature of two uncorrelated
     /// tensors rather than of a scale being off.
     pub fn init(M: i32, N: i32, K: i32, w_scale: *const anyopaque, x_scale: *const anyopaque) !Gemm {
+        return initBatched(M, N, K, w_scale, x_scale, 1, 0, 0, 0);
+    }
+
+    /// The experts run as one batched matmul, so the FP4 path has to batch
+    /// too or it cannot replace them. Strides are in elements, per operand.
+    pub fn initBatched(M: i32, N: i32, K: i32, w_scale: *const anyopaque, x_scale: *const anyopaque,
+                       batch: i32, sw: i64, sx: i64, sy: i64) !Gemm {
         if (lt == null) {
             const rc = cublasLtCreate(&lt);
             if (rc != 0) return fail("cublasLtCreate", rc);
@@ -124,6 +134,15 @@ pub const Gemm = struct {
         if (rc != 0) return fail("layout X", rc);
         rc = cublasLtMatrixLayoutCreate(&g.ld, CUDA_R_16BF, @intCast(N), @intCast(M), @intCast(N));
         if (rc != 0) return fail("layout Y", rc);
+
+        if (batch > 1) {
+            _ = cublasLtMatrixLayoutSetAttribute(g.la, LAYOUT_BATCH_COUNT, &batch, @sizeOf(c_int));
+            _ = cublasLtMatrixLayoutSetAttribute(g.lb, LAYOUT_BATCH_COUNT, &batch, @sizeOf(c_int));
+            _ = cublasLtMatrixLayoutSetAttribute(g.ld, LAYOUT_BATCH_COUNT, &batch, @sizeOf(c_int));
+            _ = cublasLtMatrixLayoutSetAttribute(g.la, LAYOUT_STRIDED_BATCH_OFFSET, &sw, @sizeOf(i64));
+            _ = cublasLtMatrixLayoutSetAttribute(g.lb, LAYOUT_STRIDED_BATCH_OFFSET, &sx, @sizeOf(i64));
+            _ = cublasLtMatrixLayoutSetAttribute(g.ld, LAYOUT_STRIDED_BATCH_OFFSET, &sy, @sizeOf(i64));
+        }
 
         var pref: ?*anyopaque = null;
         _ = cublasLtMatmulPreferenceCreate(&pref);

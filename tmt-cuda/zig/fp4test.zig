@@ -213,5 +213,27 @@ pub fn main(init: std.process.Init) !u8 {
         try p(w, &b, "%5d,%5d,%-14d %10.1f %10.1f %8.2fx %10.4f\n",
             .{ M, NN, K, t_bf, t_q, t_bf / t_q, @sqrt(num / @max(den, 1e-30)) });
     }
+    // Does the batched form exist? The experts run batched, so an FP4 path
+    // that cannot batch cannot replace them.
+    {
+        const M: i32 = 2048;
+        const NN: i32 = 512;
+        const K: i32 = 512;
+        const um: usize = @intCast(M);
+        const un: usize = @intCast(NN);
+        const uk: usize = @intCast(K);
+        for ([_]i32{ 2, 8, 16 }) |bc| {
+            const ub: usize = @intCast(bc);
+            const As = try mem.allocT(u8, ub * um * uk / 16);
+            const Bs = try mem.allocT(u8, ub * un * uk / 16);
+            var gg = fp4.Gemm.initBatched(M, NN, K, @ptrCast(Bs), @ptrCast(As), bc,
+                @intCast(un * uk), @intCast(um * uk), @intCast(um * un)) catch {
+                try p(w, &b, "batched x%-3d %s\n", .{ bc, fp4.lastError().ptr });
+                continue;
+            };
+            gg.deinit();
+            try p(w, &b, "batched x%-3d algorithm found\n", .{bc});
+        }
+    }
     return 0;
 }

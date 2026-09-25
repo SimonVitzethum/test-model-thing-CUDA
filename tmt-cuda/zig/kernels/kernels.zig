@@ -1836,6 +1836,11 @@ export fn fp4_absmax(src: cuda.ConstGlobal(bf16), out: cuda.Global(f32), n: i64)
 /// sixteen, which flattens exactly that. It is orthogonal and its own
 /// inverse up to a factor of 16, so the matmul stays correct as long as both
 /// operands are rotated - H x . H y = x . y.
+/// The random sign vector of the Random Hadamard Transform. NVIDIA's recipe
+/// uses one vector shared by every linear layer and held fixed for the whole
+/// run, so it is a constant here rather than state.
+const RHT_SIGN = [16]f32{ 1, -1, 1, 1, -1, 1, -1, -1, 1, 1, -1, -1, -1, 1, 1, -1 };
+
 inline fn hadamard16(v: *[16]f32) void {
     var step: usize = 1;
     while (step < 16) : (step *= 2) {
@@ -1852,6 +1857,16 @@ inline fn hadamard16(v: *[16]f32) void {
     for (v) |*q| q.* *= 0.25; // 1/sqrt(16), so the transform is orthonormal
 }
 
+/// H diag(s) with s the fixed sign vector. Orthogonal, so the dot product
+/// survives when both operands are transformed - which is why it may be
+/// applied to a GEMM's inputs at all. The signs matter because a plain
+/// Hadamard has a fixed pattern that some weight matrices are aligned with;
+/// randomising it makes the outlier spreading data-independent.
+inline fn rht16(v: *[16]f32) void {
+    for (v, RHT_SIGN) |*q, sg| q.* *= sg;
+    hadamard16(v);
+}
+
 /// `mode` bit 0: stochastic rounding. Bit 1: Hadamard rotation within the
 /// block. `seed` feeds the rounding and is ignored without it.
 export fn fp4_quant(src: cuda.ConstGlobal(bf16), dst: cuda.Global(u8), scale: cuda.Global(u8),
@@ -1863,7 +1878,7 @@ export fn fp4_quant(src: cuda.ConstGlobal(bf16), dst: cuda.Global(u8), scale: cu
     const g = gscale[0];
     var v: [16]f32 = undefined;
     for (0..16) |i| v[i] = cuda.bf2f(src[at + i]);
-    if (mode & 2 != 0) hadamard16(&v);
+    if (mode & 2 != 0) rht16(&v);
     var mx: f32 = 0;
     for (v) |q| mx = cuda.__nv_fmaxf(mx, @abs(q));
     const s = if (mx > 0 and g > 0) cuda.fdiv(mx * (1.0 / 6.0), g) else @as(f32, 0);
@@ -1893,6 +1908,53 @@ export fn fp4_dequant(src: cuda.ConstGlobal(u8), scale: cuda.ConstGlobal(u8),
         v[2 * i] = fromFp4(byte & 0xF) * s;
         v[2 * i + 1] = fromFp4(byte >> 4) * s;
     }
-    if (mode & 2 != 0) hadamard16(&v); // its own inverse when orthonormal
+    if (mode & 2 != 0) {
+        hadamard16(&v);
+        for (&v, RHT_SIGN) |*q, sg| q.* *= sg; // H and the signs are each their own inverse
+    }
     for (0..16) |i| dst[@intCast(b * 16 + @as(i64, @intCast(i)))] = cuda.f2bf(v[i]);
+}
+
+
+/// Weights need their scale shared across a 16x16 tile, not along a single
+/// row of sixteen. A weight is used untransposed in the forward pass and
+/// transposed in the input-gradient pass, so a scale that groups only along
+/// K is consistent in one direction and not the other. Scaling a tile of 16
+/// input channels by 16 output channels is consistent in both; the tensor
+/// cores still want one scale per 1x16 block, so the tile's scale is written
+/// into all sixteen of them.
+///
+/// `W` is (N,K) with K contiguous. `scale` is (N, K/16).
+export fn fp4_quant_w2d(W: cuda.ConstGlobal(bf16), dst: cuda.Global(u8), scale: cuda.Global(u8),
+                        gscale: cuda.ConstGlobal(f32), N: i32, K: i32,
+                        ntiles: i64) callconv(.nvptx_kernel) void {
+    const t: i64 = @intCast(cuda.globalIdX());
+    if (t >= ntiles) return;
+    const kt: usize = @intCast(@rem(t, @divTrunc(@as(i64, K), 16)));
+    const nt: usize = @intCast(@divTrunc(t, @divTrunc(@as(i64, K), 16)));
+    const uk: usize = @intCast(K);
+    const g = gscale[0];
+
+    var mx: f32 = 0;
+    for (0..16) |r| {
+        const row = nt * 16 + r;
+        if (row >= @as(usize, @intCast(N))) break;
+        for (0..16) |c| mx = cuda.__nv_fmaxf(mx, @abs(cuda.bf2f(W[row * uk + kt * 16 + c])));
+    }
+    const sv = if (mx > 0 and g > 0) cuda.fdiv(mx * (1.0 / 6.0), g) else @as(f32, 0);
+    const sc = toE4M3(sv);
+    const eff = fromE4M3(sc) * g;
+    const inv = if (eff > 0) cuda.frcp(eff) else @as(f32, 0);
+    const kblocks = uk / 16;
+    for (0..16) |r| {
+        const row = nt * 16 + r;
+        if (row >= @as(usize, @intCast(N))) break;
+        scale[row * kblocks + kt] = sc; // the tile's scale, replicated per row
+        for (0..8) |i| {
+            const base = row * uk + kt * 16 + 2 * i;
+            const lo = toFp4(cuda.bf2f(W[base]) * inv);
+            const hi = toFp4(cuda.bf2f(W[base + 1]) * inv);
+            dst[(row * uk + kt * 16) / 2 + i] = lo | (hi << 4);
+        }
+    }
 }
