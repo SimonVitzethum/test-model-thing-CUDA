@@ -71,15 +71,27 @@ fn parse(gpa: std.mem.Allocator, image: []const u8) !Layout {
     return l;
 }
 
-/// The three fp32 arrays of one parameter, in file order.
-fn arrays(image: []u8, l: Layout, i: usize) [3][]f32 {
+/// The three fp32 arrays of one parameter, in file order, as *bytes*.
+///
+/// They cannot be viewed as `[]f32`: the parameter blocks start at whatever
+/// offset the configuration text left them at - 811 in a current checkpoint -
+/// and `@alignCast` on an odd address panics. `dump` never noticed because it
+/// writes raw bytes; `patch` did, every time it was run on a real file.
+fn arrays(image: []u8, l: Layout, i: usize) [3][]u8 {
     const n: usize = @intCast(l.counts.items[i]);
-    var out: [3][]f32 = undefined;
+    var out: [3][]u8 = undefined;
     for (0..3) |k| {
         const at = l.master.items[i] + k * n * 4;
-        out[k] = @alignCast(std.mem.bytesAsSlice(f32, image[at..][0 .. n * 4]));
+        out[k] = image[at..][0 .. n * 4];
     }
     return out;
+}
+
+fn getF(b: []const u8, j: usize) f32 {
+    return @bitCast(std.mem.readInt(u32, b[j * 4 ..][0..4], .little));
+}
+fn putF(b: []u8, j: usize, v: f32) void {
+    std.mem.writeInt(u32, b[j * 4 ..][0..4], @bitCast(v), .little);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -129,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
     const weights = try std.Io.Dir.cwd().readFileAlloc(io, pos[2], gpa, .unlimited);
     defer gpa.free(weights);
     if (weights.len != l.total * 4) return cli.fail(io, "weight file is {d} floats, checkpoint holds {d}\n", .{ weights.len / 4, l.total });
-    const flat: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, weights));
+    const flat: []const u8 = weights;
 
     const moments = args.get("moments", "keep");
     const mscale: f32 = @floatCast(try args.float("mscale", 1));
@@ -138,14 +150,14 @@ pub fn main(init: std.process.Init) !void {
     for (0..l.counts.items.len) |i| {
         const n: usize = @intCast(l.counts.items[i]);
         const a = arrays(image, l, i);
-        @memcpy(a[0], flat[cursor..][0..n]);
+        @memcpy(a[0], flat[cursor * 4 ..][0 .. n * 4]);
         cursor += n;
         if (std.mem.eql(u8, moments, "zero")) {
             @memset(a[1], 0);
             @memset(a[2], 0);
         } else if (std.mem.eql(u8, moments, "scale")) {
-            for (a[1]) |*x| x.* *= mscale;
-            for (a[2]) |*x| x.* *= vscale;
+            for (0..n) |j| putF(a[1], j, getF(a[1], j) * mscale);
+            for (0..n) |j| putF(a[2], j, getF(a[2], j) * vscale);
         } else if (!std.mem.eql(u8, moments, "keep")) {
             return cli.fail(io, "moments must be keep, zero or scale\n", .{});
         }

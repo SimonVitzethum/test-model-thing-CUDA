@@ -532,3 +532,54 @@ Measured on the RTX 5070 Laptop, same run each time:
 Open: `gpu_nv_ctgp` and `gpu_nv_ppab` were zeroed by a bad probe script and
 need a reboot to come back from firmware. Until then Dynamic Boost has
 almost no budget to hand out and the GPU sits at 55 W of 115 W.
+
+## Measured and closed, 2026-09-25
+
+### 7. Patching - negative at equal wall clock
+
+Four configurations, all worse than the byte baseline on held-out bytes at
+matched wall clock. The patched runs were given 10% *more* time.
+
+```
+baseline, 16 byte layers, 6000 steps, 275 s      2.0525
+separator patches, 2/12/2, 10700 steps, 305 s    2.5465
+separator patches, 4/8/4,  8200 steps, 299 s     2.8844
+fixed P=4, 4/8/4, 7600 steps, 249 s              2.4565
+```
+
+Throughput is real - 1.6x to 2.5x more bytes per second - and the quality
+cost is larger. The estimate of 3-4x written into the moonshot discussion
+was wrong: it counted the FLOPs saved and not what they were buying. These
+are short runs and a hierarchical stack may need longer to pay off, but the
+burden of proof is on patching and at this budget it fails it.
+
+### A (moonshots). Trajectory extrapolation - negative for raw iterates
+
+`w_new = w + a*(w - w_prev)`, from the checkpoint series, evaluated
+held-out. A positive control at a=0 reproduces the source checkpoint to five
+decimals, so the round trip through `ckpttool` is exact.
+
+```
+s88000 (source)              1.70293
+control a=0                  1.70292
+short baseline, a=0.5        1.76692
+short baseline, a=1.0        1.92370
+long baseline,  a=0.5        1.78975
+long baseline,  a=1.0        2.03426
+```
+
+Monotonically worse at every distance and both baselines. The trajectory is
+not straight enough for it: cos between the direction over the last 8000
+steps and over the last 28000 is 0.605.
+
+Untested, and the variant the moonshot actually recommends: extrapolating
+the *averaged* weights rather than the iterates, which needs a run with
+`wavg=1`. Also untested is recovery - whether a jump that lands worse
+recovers faster than it cost.
+
+### ckpttool patch was broken
+
+It cast parameter blocks to `[]f32`, but they begin at whatever offset the
+configuration text ends at - 811 in a current checkpoint - so `@alignCast`
+panicked. `dump` never noticed because it writes raw bytes. Fixed to work
+bytewise; this is the tool moonshot A needs and it had never run.

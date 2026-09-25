@@ -351,6 +351,26 @@ pub fn main(init: std.process.Init) !u8 {
             std.fs.path.basename(lf).ptr, base, best, best_lam,
             s_prose[best_k] / fp, s_markup[best_k] / fm, per_len,
         });
+        // The overlap check, which is the one a retrieval result lives or
+        // dies by. Part of RETRO's reported gain was later attributed to
+        // near-duplicates between the database and the test set, and a
+        // random document split of one corpus puts mirrored pages,
+        // boilerplate and quotations on both sides. Longest match length is
+        // the overlap measure: if the gain sits almost entirely in the long
+        // buckets, it is duplicate retrieval rather than help.
+        try p(w, &b, "    %-8s %9s %9s %9s %9s\n",
+            .{ "match", "bytes", "share", "model", "gain" });
+        for (0..9) |j| {
+            if (n_bym[j] == 0) continue;
+            const nm: usize = if (j == 8) 0 else ms[j];
+            const fj: f64 = @floatFromInt(n_bym[j]);
+            var bmv: f64 = s_bym[j][0];
+            for (s_bym[j]) |v| bmv = @min(bmv, v);
+            try p(w, &b, "    m=%-6zu %9llu %8.1f%% %9.4f %+9.4f\n", .{
+                nm, @as(c_ulonglong, n_bym[j]), 100.0 * fj / fn_,
+                s_bym[j][0] / fj, (bmv - s_bym[j][0]) / fj,
+            });
+        }
         continue;
     }
 
