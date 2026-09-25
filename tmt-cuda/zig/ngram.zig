@@ -121,6 +121,21 @@ fn readAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
 }
 
+/// Read at most `cap` bytes. Reading all 950 MB of the corpus and then
+/// slicing it wastes most of a gigabyte that the index needs more, and on a
+/// machine that is also training this is the difference between fitting and
+/// swapping.
+fn readCapped(gpa: std.mem.Allocator, io: std.Io, path: []const u8, cap: usize) ![]u8 {
+    if (cap == 0) return readAll(gpa, io, path);
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const buf = try gpa.alloc(u8, cap);
+    var rbuf: [1 << 16]u8 = undefined;
+    var r = f.readerStreaming(io, &rbuf);
+    const got = r.interface.readSliceShort(buf) catch buf.len;
+    return buf[0..got];
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const gpa = init.arena.allocator();
@@ -157,12 +172,17 @@ pub fn main(init: std.process.Init) !u8 {
     // deterministic and a short one is nearly worthless.
     std.mem.sort(usize, ms[0..nms], {}, comptime std.sort.desc(usize));
 
-    var data = try readAll(gpa, io, argv[1]);
-    if (store_mb > 0 and data.len > store_mb << 20) data = data[0 .. store_mb << 20];
+    const data = try readCapped(gpa, io, argv[1], store_mb << 20);
     const held = try readAll(gpa, io, argv[2]);
-    const loss_bytes = try readAll(gpa, io, argv[3]);
-    const loss = std.mem.bytesAsSlice(f32, loss_bytes);
-    if (loss.len < held.len) return cli.fail(io, "loss file shorter than held data\n", .{});
+    // Every positional argument after the held data is a checkpoint's loss
+    // file. The index is the expensive part and does not depend on them, so
+    // a whole training curve is scored against one build of it.
+    var lossfiles: std.ArrayList([]const u8) = .empty;
+    for (argv[3..]) |a| {
+        if (std.mem.indexOfScalar(u8, a, '=') != null) continue;
+        try lossfiles.append(gpa, a);
+    }
+    if (lossfiles.items.len == 0) return cli.fail(io, "no loss files given\n", .{});
 
     try p(w, &b, "retrieval: datastore %.1f MB, held %.1f MB, contexts", .{
         @as(f64, @floatFromInt(data.len)) / 1048576.0,
@@ -210,18 +230,34 @@ pub fn main(init: std.process.Init) !u8 {
     // its own right.
     const NL = 16;
     const lambdas = [NL]f64{ 0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0 };
+    const limit: u64 = try args.int(u64, "limit", 0);
+    const alpha: f64 = try args.float("alpha", 2.0);
+    const longest = ms[0];
+    if (lossfiles.items.len > 1)
+        try p(w, &b, "\n%-28s %9s %9s %7s %9s %9s %9s\n",
+            .{ "checkpoint", "model", "mixed", "lambda", "prose", "markup", "per-len" });
+
+    for (lossfiles.items) |lf| {
+    const loss_bytes = try readAll(gpa, io, lf);
+    const loss = std.mem.bytesAsSlice(f32, loss_bytes);
+    if (loss.len < held.len) return cli.fail(io, "loss file shorter than held data\n", .{});
     var s_long: [NL]f64 = @splat(0);
     var s_back: [NL]f64 = @splat(0);
     var s_prose: [NL]f64 = @splat(0);
     var s_markup: [NL]f64 = @splat(0);
     var n_prose: u64 = 0;
     var n_markup: u64 = 0;
+    // Loss per (longest matched length, lambda). The positions partition by
+    // longest match, so each length's lambda can be optimised on its own and
+    // the optimum of the sum is the sum of the optima - exactly, not as an
+    // approximation. A 32-byte match is nearly deterministic and a 4-byte
+    // one is nearly worthless; one global lambda has to compromise between
+    // them and does.
+    var s_bym: [9][NL]f64 = @splat(@splat(0));
+    var n_bym: [9]u64 = @splat(0);
     var n: u64 = 0;
     var covered: u64 = 0;
     var per_m_n: [8]u64 = @splat(0);
-    const longest = ms[0];
-    const limit: u64 = try args.int(u64, "limit", 0);
-    const alpha: f64 = try args.float("alpha", 2.0);
 
     for (longest..held.len - 1) |off| {
         const l = loss[off];
@@ -261,6 +297,10 @@ pub fn main(init: std.process.Init) !u8 {
         n += 1;
         const is_markup = markup[off + 1];
         if (is_markup) n_markup += 1 else n_prose += 1;
+        // Bucket 8 is "no context found at all"; those bytes are the model's
+        // alone whatever lambda says.
+        const bucket: usize = if (have_long) best_i else 8;
+        n_bym[bucket] += 1;
         for (lambdas, 0..) |lam, k| {
             // Where nothing was retrieved the model stands alone, which is
             // the honest mixture rather than a penalty for a missing index.
@@ -268,11 +308,52 @@ pub fn main(init: std.process.Init) !u8 {
             s_long[k] += -@log2(@max(ml, 1e-30));
             const bk = -@log2(@max((1.0 - lam) * pm + lam * pr_back, 1e-30));
             s_back[k] += bk;
+            s_bym[bucket][k] += bk;
             if (is_markup) s_markup[k] += bk else s_prose[k] += bk;
         }
     }
 
     const fn_: f64 = @floatFromInt(@max(n, 1));
+    const fp: f64 = @floatFromInt(@max(n_prose, 1));
+    const fm: f64 = @floatFromInt(@max(n_markup, 1));
+    const base = s_long[0] / fn_;
+    var best: f64 = base;
+    var best_lam: f64 = 0;
+    var best_k: usize = 0;
+    for (lambdas, s_back, 0..) |lam, c, k| {
+        const bb = c / fn_;
+        if (bb < best) {
+            best = bb;
+            best_lam = lam;
+            best_k = k;
+        }
+    }
+
+    // Per-length lambda, chosen independently for each bucket.
+    var per_len_total: f64 = 0;
+    var best_lam_m: [9]f64 = @splat(0);
+    for (0..9) |j| {
+        if (n_bym[j] == 0) continue;
+        var bm: f64 = s_bym[j][0];
+        var bl: f64 = 0;
+        for (lambdas, s_bym[j]) |lam, v| if (v < bm) {
+            bm = v;
+            bl = lam;
+        };
+        per_len_total += bm;
+        best_lam_m[j] = bl;
+    }
+    const per_len = per_len_total / fn_;
+
+    if (lossfiles.items.len > 1) {
+        // One row per checkpoint: the curve is the point of the exercise.
+        try p(w, &b, "%-28s %9.4f %9.4f %7.2f %9.4f %9.4f %9.4f\n", .{
+            std.fs.path.basename(lf).ptr, base, best, best_lam,
+            s_prose[best_k] / fp, s_markup[best_k] / fm, per_len,
+        });
+        continue;
+    }
+
     try p(w, &b, "\nscored %llu bytes, %.1f%% had a context in the store\n",
         .{ @as(c_ulonglong, n), 100.0 * @as(f64, @floatFromInt(covered)) / fn_ });
     for (ms[0..nms], 0..) |m, i| {
@@ -282,26 +363,25 @@ pub fn main(init: std.process.Init) !u8 {
     }
     try p(w, &b, "\n%8s %10s %10s %10s %10s\n",
         .{ "lambda", "longest", "vs model", "backoff", "vs model" });
-    const base = s_long[0] / fn_;
-    var best: f64 = base;
-    var best_lam: f64 = 0;
     for (lambdas, s_long, s_back) |lam, a, c| {
         const bl = a / fn_;
         const bb = c / fn_;
-        if (bb < best) {
-            best = bb;
-            best_lam = lam;
-        }
         try p(w, &b, "%8.2f %10.4f %+9.4f %10.4f %+9.4f\n", .{ lam, bl, bl - base, bb, bb - base });
     }
     try p(w, &b, "\nmodel alone %.4f, best mix %.4f at lambda %.2f (%.1f%% better)\n",
         .{ base, best, best_lam, 100.0 * (base - best) / base });
+    try p(w, &b, "with one lambda per match length: %.4f (%.1f%% better)\n",
+        .{ per_len, 100.0 * (base - per_len) / base });
+    for (0..9) |j| {
+        if (n_bym[j] == 0) continue;
+        const nm: usize = if (j == 8) 0 else ms[j];
+        try p(w, &b, "   m=%-3zu lambda %.2f over %7llu bytes\n",
+            .{ nm, best_lam_m[j], @as(c_ulonglong, n_bym[j]) });
+    }
 
     // Split, because Wikipedia's markup is where an n-gram is unbeatable and
     // where a gain means least. A headline number that does not separate
     // them is mostly a statement about the dump's format.
-    const fp: f64 = @floatFromInt(@max(n_prose, 1));
-    const fm: f64 = @floatFromInt(@max(n_markup, 1));
     try p(w, &b, "\n%8s %12s %12s   (prose %.0f%% of bytes)\n",
         .{ "lambda", "prose", "markup", 100.0 * fp / fn_ });
     const bp0 = s_prose[0] / fp;
@@ -309,6 +389,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (lambdas, s_prose, s_markup) |lam, a, c| {
         try p(w, &b, "%8.2f %8.4f %+3.4f %8.4f %+3.4f\n",
             .{ lam, a / fp, a / fp - bp0, c / fm, c / fm - bm0 });
+    }
     }
     return 0;
 }

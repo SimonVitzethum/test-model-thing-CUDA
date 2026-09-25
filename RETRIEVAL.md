@@ -103,32 +103,65 @@ different claims:
 ## Status
 
 Built: `lossout` in `train` (per-byte cross entropy in corpus order) and the
-`ngram` tool. Both committed.
+`ngram` tool, which takes several loss files at once so a whole training
+curve is scored against one build of the index.
 
-**Calibration, not yet a result.** A first pass with a 50 MB datastore
-against an old checkpoint that evaluates at 5.27 BPB:
+### First result, against a model better than the index
+
+Checkpoint at step ~20000 of the fresh baseline, 2 M held-out bytes, a
+50 MB datastore - one nineteenth of the corpus:
 
 ```
-lambda   longest-match mix
-  0.00   5.2730
-  0.50   2.9447
-  0.80   2.8077   <- best
-  1.00  11.7565   (the zeros)
+                  BPB      vs model
+model alone     1.8853
+best mix        1.6869      -0.1984   (-10.5%)   at lambda 0.45
 ```
 
-This says almost nothing about G. The model was bad, and the number mostly
-measures the n-gram: at lambda 0.9 the mix is 2.84, so **an infinite-gram
-over 50 MB of Wikipedia bytes is worth roughly 2.8 BPB on its own**. That is
-the useful part of this run - a calibration of the retrieval component
-against which the real question can be posed.
+Lambda was chosen on a disjoint tuning half, which picked **the same 0.45**,
+so the number is not the product of tuning on what it reports.
 
-The real question is what it adds to a model that is *already better than
-it*. A baseline at 1.4 BPB and a retrieval component at 2.8 overlap on
-exactly the content the model has already learned; the gain comes only from
-where they disagree and the retrieval is right.
+The split that mattered most:
 
-Baseline training is under way at dim 512, 16 layers, `fp8=1`, on enwik9;
-it passed 1.362 BPB at step 17860 before being paused.
+```
+                model   mixed
+prose (73%)    1.9433  1.7660    -0.1772
+markup (27%)   1.7289  1.4736    -0.2553
+```
+
+Markup gains more, as expected - and prose gains nearly as much. **This is
+not an artefact of the dump's format**, which was the single largest risk to
+the whole section.
+
+98.7% of bytes had some context in the store. Longest-match lengths: 7.6% at
+32 bytes, 19.1% at 16, 21.7% at 12, 30.1% at 8, 20.2% at 4.
+
+### It scales with the datastore
+
+Same checkpoint, same lambda, varying only how much of the corpus is
+indexed:
+
+```
+ 12 MB   1.8853 -> 1.7816   -0.1037   97.0% covered
+ 25 MB   1.8853 -> 1.7275   -0.1578   98.1%
+ 50 MB   1.8853 -> 1.6869   -0.1984   98.7%
+```
+
+Every doubling of the store is worth roughly another -0.05 BPB, decreasing
+slowly. Extrapolating that to the full 950 MB puts the gain near -0.3.
+
+### Calibration
+
+An infinite-gram over 50 MB of Wikipedia bytes is worth about 2.8 BPB on its
+own - worse than the model it is being mixed into, which is the point: the
+gain comes from where the two disagree and the index is right.
+
+### Not yet measured
+
+The speedup. That needs the baseline's own held-out curve, and the baseline
+is still training; only two checkpoints of the series exist. Note in advance
+that the curve is *flat* in this region - the training loss barely moves
+between steps 15000 and 30000 - which is exactly where a ratio gets
+inflated, so the curve gets reported with any number read off it.
 
 ## Runbook, for when the GPU is free again
 
