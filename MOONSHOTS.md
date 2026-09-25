@@ -368,6 +368,37 @@ infrastructure for it is already built and measured.
 Kernels are written here in Zig through LLVM to PTX, so the arithmetic is
 reachable. Most groups cannot change the inside of a matmul.
 
+### Measured, and the correction that follows from it
+
+Stages 1-3 are now built and benchmarked, and the section's reasoning needs
+one amendment.
+
+```
+stage 1+2  bf16 moments and master, stochastic rounding   +4.3%
+stage 3    e4m3 expert matmul and dispatch buffers        +3.6% (dim 512)
+                                                          +5.0% (dim 1024)
+           NVFP4 (e2m1) expert matmul                     -4.7%
+```
+
+The argument above - quantisation reduces bandwidth, and bandwidth is the
+measured bottleneck - is right in direction and too generous in magnitude,
+because **encoding costs bandwidth too**. NVFP4 loses outright: its block
+scales have to be built in a pass of their own, and at these shapes that
+pass costs more than the matmul saves. The profile is unambiguous about why.
+The expert forward matmul is 266 ms of a 3160 ms step; making it free would
+save less than the 520 ms of quantisation needed to get there.
+
+So the rule is narrower than "quantise things": **quantisation pays when the
+encoding folds into a kernel that had to run anyway.** e4m3 works here
+because one fp32 scale per tensor means the gather can write its output
+already encoded - and because `cvt.rn.satfinite.e4m3x2.f32` makes the
+conversion one instruction rather than branchy ALU work that a
+bandwidth-bound kernel cannot hide. A hand-written encoder made the same
+gather *slower* than bf16 despite writing half the bytes.
+
+NVFP4.md carries the full arithmetic. Stage 3 is therefore done rather than
+open, and it delivered single digits, not a factor.
+
 ### The signal to stop
 
 Stage 5 stops if the gradient signal disappears into the rounding: the
@@ -525,6 +556,19 @@ And the claim changes shape. "This model reaches X BPB" becomes "this model
 plus an index over its training corpus reaches X BPB". Still a result from
 its own resources, since the index holds nothing that was not in the data,
 but it is a different sentence and both numbers should be reported.
+
+### Status
+
+Being built. **RETRIEVAL.md** carries the experiment design and the running
+record, including what "15x speedup" has to mean to be a real claim - the
+offset retrieval contributes is roughly constant while the baseline's curve
+flattens, so the ratio depends entirely on where the baseline is stopped and
+has to be quoted with its budget.
+
+First calibration: an infinite-gram over 50 MB of Wikipedia bytes is worth
+about 2.8 BPB on its own. The question is therefore not whether retrieval
+predicts bytes - it does - but what it adds to a model already well below
+that.
 
 ---
 
@@ -861,4 +905,8 @@ the body, solve the head, see whether the gap is anything at all.
 
 **A** - the checkpoints exist and the test costs an afternoon.
 
-**E stages 1 and 2** - done, measured at +4.3%, no longer a bet.
+**E stages 1 to 3** - done. +4.3% for the optimizer state, +3.6 to +5.0%
+for e4m3 in the experts, -4.7% for NVFP4. No longer bets, and collectively
+they are the measured size of the whole compute-side family: single digits.
+That is the strongest argument for spending the remaining effort on G and F,
+which attack the data limit instead.

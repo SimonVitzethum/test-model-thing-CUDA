@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dialogprep", .cuda = false },
         .{ .name = "kgprep", .cuda = false },
         .{ .name = "ckpttool", .cuda = false },
+        .{ .name = "ngram", .cuda = false },
         .{ .name = "sample", .cuda = true },
         .{ .name = "chat", .cuda = true },
         .{ .name = "train", .cuda = true },
