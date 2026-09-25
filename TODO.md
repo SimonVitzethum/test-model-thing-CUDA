@@ -553,6 +553,37 @@ was wrong: it counted the FLOPs saved and not what they were buying. These
 are short runs and a hierarchical stack may need longer to pay off, but the
 burden of proof is on patching and at this budget it fails it.
 
+### The entropy patcher, and what actually decides a boundary rule
+
+`patch=-2` cuts where the conditional entropy of the next byte given the
+previous two crosses a threshold, calibrated to the separator rule's own
+boundary density. At equal wall clock, held out:
+
+```
+plain byte baseline                       2.0525
+fixed stride P=4, 4/8/4                   2.4565
+separator rule, 2/12/2                    2.5465
+entropy, cut before hard bytes            4.4133
+entropy, cut before easy bytes            4.4124
+```
+
+The rules are genuinely different - mean patch length 5.12, 5.16 and 4.71,
+Tp of 38, 40 and 57 - so this is not a wiring fault. Both entropy directions
+fail equally, which rules out the first explanation (that a boundary should
+sit where prediction is easy) and leaves a better one:
+
+**consistency of the boundary rule beats content-awareness.** A fixed stride
+knows nothing and wins; separators are word-aligned and nearly as good;
+entropy boundaries are content-dependent, so the same word is cut
+differently depending on what surrounds it and the pooled patch
+representation never means the same thing twice. The expensive layers see
+only those pooled patches, and they cannot learn a unit that moves.
+
+That is the opposite of the Byte Latent Transformer's argument, and the
+reason is structural: BLT's global model reads bytes, this one reads pools.
+
+All of it still loses to the plain byte baseline.
+
 ### A (moonshots). Trajectory extrapolation - negative for raw iterates
 
 `w_new = w + a*(w - w_prev)`, from the checkpoint series, evaluated

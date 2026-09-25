@@ -89,6 +89,7 @@ pub const Model = struct {
     /// this exceeds `patch_ent`, which is the entropy patcher: boundaries go
     /// where the model is about to be uncertain, rather than at punctuation.
     ent: ?[]const f32 = null,
+    patch_reported: bool = false,
 
     emb: usize = 0,
     tgt: usize = 0,
@@ -826,6 +827,14 @@ pub fn layoutPatches(m: *Model, ids: []const i32) !void {
     }
     var Tp: usize = 0;
     for (counts) |n| Tp = @max(Tp, n);
+    if (!m.patch_reported) {
+        m.patch_reported = true;
+        var sum: usize = 0;
+        for (counts) |n| sum += n;
+        std.debug.print("patches: rule={d} thr={d:.3} ent={s} Tp={d} mean length {d:.2}\n",
+            .{ c.patch, c.patch_ent, if (m.ent == null) "none" else "loaded",
+               Tp, @as(f64, @floatFromInt(B * T)) / @as(f64, @floatFromInt(@max(sum, 1))) });
+    }
     if (Tp == 0) Tp = 1;
     m.patches.Tp = Tp;
 
