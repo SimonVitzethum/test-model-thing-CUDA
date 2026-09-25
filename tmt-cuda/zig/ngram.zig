@@ -91,6 +91,32 @@ const Table = struct {
     }
 };
 
+/// Crude but explicit: a byte counts as markup while inside `<...>`,
+/// `{{...}}` or `[[...]]`. Wikipedia bytes are full of XML and template
+/// boilerplate that an n-gram predicts almost perfectly, and which is not
+/// what anyone means by knowledge - so a headline number that mixes the two
+/// says more about the dump's format than about retrieval. The split is
+/// built into the measurement rather than argued about afterwards.
+fn markMarkup(gpa: std.mem.Allocator, d: []const u8) ![]bool {
+    const out = try gpa.alloc(bool, d.len);
+    var tag: i32 = 0;
+    var brace: i32 = 0;
+    var brack: i32 = 0;
+    var i: usize = 0;
+    while (i < d.len) : (i += 1) {
+        const c = d[i];
+        const nxt: u8 = if (i + 1 < d.len) d[i + 1] else 0;
+        if (c == '<') tag += 1;
+        if (c == '{' and nxt == '{') brace += 1;
+        if (c == '[' and nxt == '[') brack += 1;
+        out[i] = tag > 0 or brace > 0 or brack > 0;
+        if (c == '>' and tag > 0) tag -= 1;
+        if (c == '}' and nxt == '}' and brace > 0) brace -= 1;
+        if (c == ']' and nxt == ']' and brack > 0) brack -= 1;
+    }
+    return out;
+}
+
 fn readAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
 }
@@ -145,11 +171,21 @@ pub fn main(init: std.process.Init) !u8 {
     for (ms[0..nms]) |m| try p(w, &b, " %zu", .{m});
     try p(w, &b, "\n", .{});
 
+    // Eight bytes per position per context length adds up fast: the full
+    // 950 MB corpus at seven lengths would want 53 GB. Refuse rather than
+    // discover it by being killed.
+    const want_gb = @as(f64, @floatFromInt(data.len * nms * 8)) / (1 << 30);
+    const max_gb: f64 = try args.float("maxgb", 8.0);
+    try p(w, &b, "  index needs %.1f GB\n", .{want_gb});
+    if (want_gb > max_gb)
+        return cli.fail(io, "index would need {d:.1} GB; raise maxgb or lower store/ms\n", .{want_gb});
+
     var tables: [8]Table = undefined;
     for (ms[0..nms], 0..) |m, i| {
         tables[i] = try Table.build(gpa, data, m);
         try p(w, &b, "  m=%-3zu %zu entries\n", .{ m, tables[i].e.len });
     }
+    const markup = try markMarkup(gpa, held);
 
     // A unigram from the datastore itself, as the base of the backoff. Free
     // to compute and strictly better than a uniform prior.
@@ -176,6 +212,10 @@ pub fn main(init: std.process.Init) !u8 {
     const lambdas = [NL]f64{ 0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0 };
     var s_long: [NL]f64 = @splat(0);
     var s_back: [NL]f64 = @splat(0);
+    var s_prose: [NL]f64 = @splat(0);
+    var s_markup: [NL]f64 = @splat(0);
+    var n_prose: u64 = 0;
+    var n_markup: u64 = 0;
     var n: u64 = 0;
     var covered: u64 = 0;
     var per_m_n: [8]u64 = @splat(0);
@@ -194,28 +234,41 @@ pub fn main(init: std.process.Init) !u8 {
         var have_long = false;
         var pr_back: f64 = uni[target];
         // Shortest context first, each level refining the one below it.
+        var best_i: usize = 0;
         var i: usize = nms;
         while (i > 0) {
             i -= 1;
             const m = ms[i];
             const r = tables[i].look(held[off + 1 - m .. off + 1], target);
-            if (r.total == 0) continue;
+            // Every context here ends at the same byte, so a shorter one is
+            // a suffix of a longer one: if the short context occurs nowhere,
+            // no longer context can, and the remaining levels are skipped.
+            // Hash collisions can only invent matches, never hide them, so
+            // the shortcut is safe.
+            if (r.total == 0) break;
             pr_back = (@as(f64, @floatFromInt(r.hit)) + alpha * pr_back) /
                 (@as(f64, @floatFromInt(r.total)) + alpha);
             if (r.total >= minmatch) {
                 pr_long = @as(f64, @floatFromInt(r.hit)) / @as(f64, @floatFromInt(r.total));
-                if (!have_long) per_m_n[i] += 1;
+                best_i = i;
                 have_long = true;
             }
         }
-        if (have_long) covered += 1;
+        if (have_long) {
+            covered += 1;
+            per_m_n[best_i] += 1; // the longest that matched, not the first
+        }
         n += 1;
+        const is_markup = markup[off + 1];
+        if (is_markup) n_markup += 1 else n_prose += 1;
         for (lambdas, 0..) |lam, k| {
             // Where nothing was retrieved the model stands alone, which is
             // the honest mixture rather than a penalty for a missing index.
             const ml = if (have_long) (1.0 - lam) * pm + lam * pr_long else pm;
             s_long[k] += -@log2(@max(ml, 1e-30));
-            s_back[k] += -@log2(@max((1.0 - lam) * pm + lam * pr_back, 1e-30));
+            const bk = -@log2(@max((1.0 - lam) * pm + lam * pr_back, 1e-30));
+            s_back[k] += bk;
+            if (is_markup) s_markup[k] += bk else s_prose[k] += bk;
         }
     }
 
@@ -241,7 +294,21 @@ pub fn main(init: std.process.Init) !u8 {
         }
         try p(w, &b, "%8.2f %10.4f %+9.4f %10.4f %+9.4f\n", .{ lam, bl, bl - base, bb, bb - base });
     }
-    try p(w, &b, "\nmodel alone %.4f, best mix %.4f at lambda %.2f (%.1f%% of the gap to zero)\n",
+    try p(w, &b, "\nmodel alone %.4f, best mix %.4f at lambda %.2f (%.1f%% better)\n",
         .{ base, best, best_lam, 100.0 * (base - best) / base });
+
+    // Split, because Wikipedia's markup is where an n-gram is unbeatable and
+    // where a gain means least. A headline number that does not separate
+    // them is mostly a statement about the dump's format.
+    const fp: f64 = @floatFromInt(@max(n_prose, 1));
+    const fm: f64 = @floatFromInt(@max(n_markup, 1));
+    try p(w, &b, "\n%8s %12s %12s   (prose %.0f%% of bytes)\n",
+        .{ "lambda", "prose", "markup", 100.0 * fp / fn_ });
+    const bp0 = s_prose[0] / fp;
+    const bm0 = s_markup[0] / fm;
+    for (lambdas, s_prose, s_markup) |lam, a, c| {
+        try p(w, &b, "%8.2f %8.4f %+3.4f %8.4f %+3.4f\n",
+            .{ lam, a / fp, a / fp - bp0, c / fm, c / fm - bm0 });
+    }
     return 0;
 }

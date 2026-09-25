@@ -130,6 +130,42 @@ where they disagree and the retrieval is right.
 Baseline training is under way at dim 512, 16 layers, `fp8=1`, on enwik9;
 it passed 1.362 BPB at step 17860 before being paused.
 
+## Runbook, for when the GPU is free again
+
+The baseline was paused at step ~17900; `train` resumes from an existing
+checkpoint path, so step 1 continues rather than restarts.
+
+```bash
+cd ~/Schreibtisch/test-model-thing/tmt-cuda
+
+# 1. resume the baseline, keeping a checkpoint series beside it
+nohup ./zig-out/bin/train ~/tmt-data/enwik9/train.bin \
+  ~/tmt-data/runs/retr-base/base.ckpt \
+  dim=512 layers=16 experts=8 topk=2 batch=64 seqlen=128 traces=1 \
+  half_max=65536 warmup=2000 aux=0.1 fp8=1 steps=300000 saveevery=4000 \
+  > ~/tmt-scratch/retr/base.log 2>&1 &
+nohup ~/tmt-scratch/retr/keep.sh > ~/tmt-scratch/retr/keep.log 2>&1 &
+
+# 2. split the held-out data: tune lambda on one half, report on the other
+cd ~/tmt-scratch/retr
+head -c 4000000 ~/tmt-data/enwik9/held.bin > tune.bin
+tail -c +30000001 ~/tmt-data/enwik9/held.bin | head -c 4000000 > test.bin
+
+# 3. per checkpoint, dump losses and mix
+for c in ~/tmt-data/runs/retr-base/s*.ckpt; do
+  ./zig-out/bin/train ~/tmt-scratch/retr/test.bin "$c" mode=eval \
+      lossout=~/tmt-scratch/retr/$(basename $c).f32
+  ./zig-out/bin/ngram ~/tmt-data/enwik9/train.bin ~/tmt-scratch/retr/test.bin \
+      ~/tmt-scratch/retr/$(basename $c).f32 store=200 ms=32,24,16,12,8,4,2 \
+      limit=2000000 maxgb=12
+done
+```
+
+Step 3 is GPU-light (one eval per checkpoint) and CPU-heavy (the index is
+rebuilt each time). Building the index once and reusing it across
+checkpoints is the obvious next change to `ngram` if this becomes the
+bottleneck.
+
 ## What would make this fail
 
 - The offset is small. If interpolation buys 0.05 BPB against a flattened
