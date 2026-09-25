@@ -421,8 +421,25 @@ data is no longer the limit.
 
 - CUDA graphs: would remove most of the measured 8.3 ms fixed cost per step
 - kernel fusion: 361 launches per step is the reason that cost exists
-- Adam state in bf16: 30 -> 22 bytes per parameter on the largest kernel
+- ~~Adam state in bf16~~ **done, +4.3%**
+- ~~low-precision expert matmul~~ **done: e4m3 +3.6% at dim 512, +5.0% at
+  dim 1024; NVFP4 -4.7% and kept only for larger shapes. NVFP4.md.**
 - device-side expert counts, then grouped GEMM without padding
+- fuse the gather into the matmul: gather, combine, combine_bwd and
+  scatter_add are 38% of device time and do nothing but move rows so cuBLAS
+  sees contiguous operands. CUTLASS can gather A and scatter D. This is the
+  largest single item left in the profile.
+- the backward dispatch is still bf16 and re-gathers its own copy, so about
+  half the dispatch traffic is untouched by the e4m3 work
+
+**What the quantisation work established, beyond its own numbers.** The step
+runs at 82% of the streaming ceiling and 22% of the matmul ceiling, and the
+expert forward matmul is only 266 ms of a 3160 ms step. So the whole
+compute-side family is worth single digits, and quantisation only pays at
+all when the encoding folds into a kernel that had to run anyway - NVFP4's
+separate block-scale pass costs more than the matmul it accelerates. That is
+the measured argument for spending the remaining effort on the data limit
+instead, which is what moonshots G and F attack.
 
 ### Batch ramp-up - after the above, not before [35%]
 
