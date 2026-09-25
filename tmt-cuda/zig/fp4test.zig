@@ -41,6 +41,8 @@ pub fn main(init: std.process.Init) !u8 {
     const args = try cli.Args.parse(gpa, init.minimal.args);
     const n: usize = try args.int(usize, "n", 4 << 20);
     const blocks = n / 16;
+    // bit 0 stochastic rounding, bit 1 Hadamard rotation inside the block
+    const qmode: i32 = @intCast(try args.int(u32, "mode", 3));
 
     var mod = try gpu.Kernels.load(gpa, kernels_ptx);
     var mem = gpu.Memory.init(gpa);
@@ -89,9 +91,9 @@ pub fn main(init: std.process.Init) !u8 {
         hg = if (hg > 0) hg / 6.0 / 448.0 else 1.0;
         try gpu.upload(gscale, std.mem.asBytes(&hg));
         try (try mod.get("fp4_quant")).launch(@intCast((blocks + 255) / 256), 256,
-            .{ src, packed_, scale, gscale, @as(i64, @intCast(blocks)) });
+            .{ src, packed_, scale, gscale, qmode, @as(u32, 1), @as(i64, @intCast(blocks)) });
         try (try mod.get("fp4_dequant")).launch(@intCast((blocks + 255) / 256), 256,
-            .{ packed_, scale, gscale, back, @as(i64, @intCast(blocks)) });
+            .{ packed_, scale, gscale, qmode, back, @as(i64, @intCast(blocks)) });
         const got = try gpa.alloc(u16, n);
         defer gpa.free(got);
         try gpu.download(std.mem.sliceAsBytes(got), back);
@@ -142,24 +144,38 @@ pub fn main(init: std.process.Init) !u8 {
         const hb2 = try gpa.alloc(u16, un * uk);
         defer gpa.free(ha);
         defer gpa.free(hb2);
+        // Gaussian with the occasional outlier, because that is what weights
+        // and activations look like - and because uniform data is the one
+        // distribution on which neither stochastic rounding nor a rotation
+        // can help, so testing on it answers the wrong question.
         var st: u64 = 7;
-        for (ha) |*q| {
-            st = st *% 6364136223846793005 +% 1442695040888963407;
-            q.* = bf((@as(f32, @floatFromInt((st >> 40) & 0xFFFF)) / 65536.0 - 0.5) * 0.06);
-        }
-        for (hb2) |*q| {
-            st = st *% 6364136223846793005 +% 1442695040888963407;
-            q.* = bf((@as(f32, @floatFromInt((st >> 40) & 0xFFFF)) / 65536.0 - 0.5) * 0.06);
-        }
+        const fill = struct {
+            fn f(dst2: []u16, seed: *u64, outliers: bool) void {
+                for (dst2, 0..) |*q, i| {
+                    seed.* = seed.* *% 6364136223846793005 +% 1442695040888963407;
+                    const u1v = @as(f32, @floatFromInt((seed.* >> 33) & 0xFFFFFF)) / 16777216.0 + 1e-7;
+                    seed.* = seed.* *% 6364136223846793005 +% 1442695040888963407;
+                    const u2v = @as(f32, @floatFromInt((seed.* >> 33) & 0xFFFFFF)) / 16777216.0;
+                    var g2 = @sqrt(-2.0 * @log(u1v)) * @cos(6.2831853 * u2v) * 0.02;
+                    if (outliers and i % 211 == 0) g2 *= 25.0;
+                    q.* = bf(g2);
+                }
+            }
+        }.f;
+        fill(ha, &st, true);
+        fill(hb2, &st, false);
         try gpu.upload(Ab, std.mem.sliceAsBytes(ha));
         try gpu.upload(Bb, std.mem.sliceAsBytes(hb2));
 
-        var hg2: f32 = 0.06 / 2.0 / 6.0 / 448.0;
+        var amax: f32 = 0;
+        for (ha) |q| amax = @max(amax, @abs(unbf(q)));
+        for (hb2) |q| amax = @max(amax, @abs(unbf(q)));
+        var hg2: f32 = amax / 6.0 / 448.0;
         try gpu.upload(ga, std.mem.asBytes(&hg2));
         const nbA = um * uk / 16;
         const nbB = un * uk / 16;
-        try (try mod.get("fp4_quant")).launch(@intCast((nbA + 255) / 256), 256, .{ Ab, Aq, As, ga, @as(i64, @intCast(nbA)) });
-        try (try mod.get("fp4_quant")).launch(@intCast((nbB + 255) / 256), 256, .{ Bb, Bq, Bs, ga, @as(i64, @intCast(nbB)) });
+        try (try mod.get("fp4_quant")).launch(@intCast((nbA + 255) / 256), 256, .{ Ab, Aq, As, ga, qmode, @as(u32, 1), @as(i64, @intCast(nbA)) });
+        try (try mod.get("fp4_quant")).launch(@intCast((nbB + 255) / 256), 256, .{ Bb, Bq, Bs, ga, qmode, @as(u32, 2), @as(i64, @intCast(nbB)) });
 
         var g = fp4.Gemm.init(M, NN, K, @ptrCast(Bs), @ptrCast(As)) catch {
             try p(w, &b, "%5d,%5d,%-14d %s\n", .{ M, NN, K, fp4.lastError().ptr });

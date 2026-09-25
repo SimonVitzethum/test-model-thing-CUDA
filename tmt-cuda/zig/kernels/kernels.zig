@@ -1710,7 +1710,6 @@ export fn emb_reduce(partial: cuda.ConstGlobal(f32), byte_tiles: cuda.ConstGloba
 const FP4_MAG = [8]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 };
 
 /// Nearest e2m1 code for a value already divided by its block scale.
-/// Ties go to even, as they do in every other rounding in this file.
 inline fn toFp4(v: f32) u8 {
     const a = @abs(v);
     var code: u8 = 0;
@@ -1725,6 +1724,34 @@ inline fn toFp4(v: f32) u8 {
         }
     }
     return code | (if (v < 0) @as(u8, 8) else 0);
+}
+
+/// The same, rounding up with probability equal to the distance to the lower
+/// neighbour. Nearest rounding is biased whenever the values are not
+/// symmetric about the grid, and with only eight magnitudes that bias is
+/// large and systematic; stochastic rounding removes it at the cost of
+/// variance, which a dot product over K terms then averages away. This is
+/// the reason a four-bit matmul works at all.
+inline fn toFp4Stoch(v: f32, r: u32) u8 {
+    const a = @abs(v);
+    if (a >= FP4_MAG[7]) return 7 | (if (v < 0) @as(u8, 8) else 0);
+    var lo: usize = 0;
+    while (lo < 7 and FP4_MAG[lo + 1] <= a) lo += 1;
+    const span = FP4_MAG[lo + 1] - FP4_MAG[lo];
+    const frac = if (span > 0) cuda.fdiv(a - FP4_MAG[lo], span) else @as(f32, 0);
+    const u = @as(f32, @floatFromInt(r >> 8)) * (1.0 / 16777216.0);
+    const code: u8 = @intCast(if (u < frac) lo + 1 else lo);
+    return code | (if (v < 0) @as(u8, 8) else 0);
+}
+
+/// One draw per value, from its position and a per-call seed. Counter-based,
+/// so nothing has to be stored and a rerun rounds identically.
+inline fn srBits(i: usize, seed: u32) u32 {
+    var h = (@as(u32, @truncate(i)) *% 0x9e3779b9) ^ (seed *% 0x85ebca6b);
+    h ^= h >> 15;
+    h *%= 0x2545f491;
+    h ^= h >> 13;
+    return h;
 }
 
 inline fn fromFp4(c: u8) f32 {
@@ -1754,7 +1781,12 @@ inline fn toE4M3(v: f32) u8 {
             if (ee > 8) return 0x7E;
         }
     }
-    return @intCast(((@as(u32, @intCast(ee + 7)) & 0xF) << 3) | m);
+    const code: u8 = @intCast(((@as(u32, @intCast(ee + 7)) & 0xF) << 3) | m);
+    // 0x7F is NaN in e4m3, so the largest finite value is 0x7E = 448. The
+    // encoding above can reach 0x7F at the top of the exponent range, and a
+    // NaN block scale turns the whole matmul into NaN - which is what the
+    // Hadamard rotation exposed, by pushing block maxima against the ceiling.
+    return if (code >= 0x7F) 0x7E else code;
 }
 
 inline fn fromE4M3(c: u8) f32 {
@@ -1797,36 +1829,70 @@ export fn fp4_absmax(src: cuda.ConstGlobal(bf16), out: cuda.Global(f32), n: i64)
 /// Within a block the scale is the largest magnitude over 6, the largest
 /// e2m1 magnitude, so the extreme value lands on a representable point and
 /// nothing clips.
+/// A 16-point Hadamard transform, applied inside the block before
+/// quantising. Its purpose is the block scale: that scale is set by the
+/// largest magnitude in the block, so one outlier costs every other value in
+/// the block its resolution. The transform spreads each value over all
+/// sixteen, which flattens exactly that. It is orthogonal and its own
+/// inverse up to a factor of 16, so the matmul stays correct as long as both
+/// operands are rotated - H x . H y = x . y.
+inline fn hadamard16(v: *[16]f32) void {
+    var step: usize = 1;
+    while (step < 16) : (step *= 2) {
+        var i: usize = 0;
+        while (i < 16) : (i += step * 2) {
+            for (0..step) |j| {
+                const a = v[i + j];
+                const b2 = v[i + j + step];
+                v[i + j] = a + b2;
+                v[i + j + step] = a - b2;
+            }
+        }
+    }
+    for (v) |*q| q.* *= 0.25; // 1/sqrt(16), so the transform is orthonormal
+}
+
+/// `mode` bit 0: stochastic rounding. Bit 1: Hadamard rotation within the
+/// block. `seed` feeds the rounding and is ignored without it.
 export fn fp4_quant(src: cuda.ConstGlobal(bf16), dst: cuda.Global(u8), scale: cuda.Global(u8),
-                    gscale: cuda.ConstGlobal(f32), nblocks: i64) callconv(.nvptx_kernel) void {
+                    gscale: cuda.ConstGlobal(f32), mode: i32, seed: u32,
+                    nblocks: i64) callconv(.nvptx_kernel) void {
     const b: i64 = @intCast(cuda.globalIdX());
     if (b >= nblocks) return;
     const at: usize = @intCast(b * 16);
     const g = gscale[0];
+    var v: [16]f32 = undefined;
+    for (0..16) |i| v[i] = cuda.bf2f(src[at + i]);
+    if (mode & 2 != 0) hadamard16(&v);
     var mx: f32 = 0;
-    for (0..16) |i| mx = cuda.__nv_fmaxf(mx, @abs(cuda.bf2f(src[at + i])));
+    for (v) |q| mx = cuda.__nv_fmaxf(mx, @abs(q));
     const s = if (mx > 0 and g > 0) cuda.fdiv(mx * (1.0 / 6.0), g) else @as(f32, 0);
     const sc = toE4M3(s);
     scale[@intCast(b)] = sc;
     const eff = fromE4M3(sc) * g;
     const inv = if (eff > 0) cuda.frcp(eff) else @as(f32, 0);
     for (0..8) |i| {
-        const lo = toFp4(cuda.bf2f(src[at + 2 * i]) * inv);
-        const hi = toFp4(cuda.bf2f(src[at + 2 * i + 1]) * inv);
+        const x0 = v[2 * i] * inv;
+        const x1 = v[2 * i + 1] * inv;
+        const lo = if (mode & 1 != 0) toFp4Stoch(x0, srBits(at + 2 * i, seed)) else toFp4(x0);
+        const hi = if (mode & 1 != 0) toFp4Stoch(x1, srBits(at + 2 * i + 1, seed)) else toFp4(x1);
         dst[@intCast(b * 8 + @as(i64, @intCast(i)))] = lo | (hi << 4);
     }
 }
 
 /// The inverse, for checking the quantiser against the values it came from.
 export fn fp4_dequant(src: cuda.ConstGlobal(u8), scale: cuda.ConstGlobal(u8),
-                      gscale: cuda.ConstGlobal(f32), dst: cuda.Global(bf16),
+                      gscale: cuda.ConstGlobal(f32), mode: i32, dst: cuda.Global(bf16),
                       nblocks: i64) callconv(.nvptx_kernel) void {
     const b: i64 = @intCast(cuda.globalIdX());
     if (b >= nblocks) return;
     const s = fromE4M3(scale[@intCast(b)]) * gscale[0];
+    var v: [16]f32 = undefined;
     for (0..8) |i| {
         const byte = src[@intCast(b * 8 + @as(i64, @intCast(i)))];
-        dst[@intCast(b * 16 + @as(i64, @intCast(i)) * 2)] = cuda.f2bf(fromFp4(byte & 0xF) * s);
-        dst[@intCast(b * 16 + @as(i64, @intCast(i)) * 2 + 1)] = cuda.f2bf(fromFp4(byte >> 4) * s);
+        v[2 * i] = fromFp4(byte & 0xF) * s;
+        v[2 * i + 1] = fromFp4(byte >> 4) * s;
     }
+    if (mode & 2 != 0) hadamard16(&v); // its own inverse when orthonormal
+    for (0..16) |i| dst[@intCast(b * 16 + @as(i64, @intCast(i)))] = cuda.f2bf(v[i]);
 }
