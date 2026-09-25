@@ -151,6 +151,8 @@ pub const Model = struct {
     /// everywhere else, so evaluation never routes noisily.
     rnoise_now: f32 = 0,
     rseed: u32 = 0,
+    /// Bumped by the optimizer, so the quantised weights know they are stale.
+    fp4_stamp: i64 = 0,
     opt: MTParams = .{},
     /// The weights Muon updates instead of AdamW, with its scratch.
     muon_params: []usize = &.{},
@@ -883,7 +885,13 @@ fn layersForward(m: *Model, s: *StreamState, from: usize, to: usize, stream: [*]
         // The residual add is folded into the combine (beta = 1).
         aux_acc += try moe.forward(m.gpa, k, m.H, m.store.at(ly.router).work, Wx[0..E], ly.exp_w,
             stream, &ly.mc, &m.moeW, N, E, @intCast(c.topk), D, 1.0,
-            m.rnoise_now, m.rseed +% @as(u32, @intCast(l)) *% 0x9e3779b9);
+            m.rnoise_now, m.rseed +% @as(u32, @intCast(l)) *% 0x9e3779b9,
+            // The first and the last few blocks stay in bf16: the paper keeps
+            // 16% of linear layers high-precision and reports stability with
+            // only the last four.
+            c.fp4 != 0 and l >= @as(usize, @intCast(c.fp4_keep_first)) and
+                l + @as(usize, @intCast(c.fp4_keep_last)) < @as(usize, @intCast(c.layers)),
+            m.fp4_stamp);
         if (c.mla != 0 and m.ML[l].use) {
             const ml = &m.ML[l];
             try gpu.copyDevice(ml.Xsnap, stream, ND * 2);
@@ -1194,6 +1202,7 @@ pub fn backwardWindow(m: *Model, s: *StreamState) !void {
 /// computed on the device; the only host synchronization is the norm itself.
 pub fn optimizerStep(m: *Model, step: i32) !void {
     const c = m.c;
+    m.fp4_stamp += 1; // the weights are about to move
     const b1: f32 = 0.9;
     const b2: f32 = 0.999;
     const k = m.kernels;

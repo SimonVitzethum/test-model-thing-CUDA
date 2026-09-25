@@ -58,6 +58,9 @@ pub const Cfg = extern struct {
     muon_lr: f32 = 0.02,
     mtp: i32 = 0,
     mtp_weight: f32 = 0.3,
+    fp4: i32 = 0,
+    fp4_keep_first: i32 = 1,
+    fp4_keep_last: i32 = 2,
     rnoise: f32 = 0,
     rwarm: i32 = 0,
     wavg: f32 = 0,
@@ -195,6 +198,9 @@ pub fn validate(c: Cfg) Error!void {
     try require((c.muon == 0 or c.muon == 1) and c.muon_lr > 0, "muon must be 0 or 1 with muon_lr > 0");
     try require(c.mtp >= 0 and c.mtp <= 7 and c.mtp_weight >= 0,
         "require 0 <= mtp <= 7 and mtp_weight >= 0");
+    try require((c.fp4 == 0 or c.fp4 == 1) and c.fp4_keep_first >= 0 and c.fp4_keep_last >= 0 and
+        c.fp4_keep_first + c.fp4_keep_last < c.layers,
+        "fp4 must be 0 or 1 and the kept blocks must leave some layers");
     try require(c.rnoise >= 0 and c.rwarm >= 0,
         "require rnoise >= 0 and rwarm >= 0 (rnoise 0 is off)");
     try require(c.wavg >= 0 and c.wavg < 1 and c.wavg_every >= 1,

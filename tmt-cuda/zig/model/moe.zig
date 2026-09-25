@@ -15,6 +15,10 @@ pub fn uniformRows(N: usize, E: usize, K: usize) usize {
 /// work issued per expert, but it has to pad every expert to the longest one.
 /// It therefore only pays while the router is reasonably balanced, which is
 /// what this decides, per window.
+/// An expert's rows are padded to a multiple of 128, so a descriptor cache
+/// indexed by rows/128 covers every shape the router can produce.
+const FQ_SLOTS = 256;
+
 fn batchWorthIt(k: *const Keep, E: usize, pm: i32, capacity: usize) bool {
     if (pm <= 0 or @as(usize, @intCast(pm)) > capacity) return false;
     var own: i64 = 0;
@@ -52,6 +56,15 @@ pub const Keep = struct {
     Ptk: i32 = 0,
     /// Router statistics slot owned by the model, read for all layers at once.
     stat: ?[*]f32 = null,
+    /// The experts' weights in NVFP4, laid out contiguously so one strided
+    /// batched matmul covers them all - the bf16 originals are separate
+    /// allocations and cannot be batched that way. Refreshed when the
+    /// optimizer has moved the weights, which `stamp` records.
+    Wq: [*]u8 = undefined,
+    Wsc: [*]u8 = undefined,
+    gW: [*]f32 = undefined,
+    alpha: [*]f32 = undefined,
+    stamp: i64 = -1,
 
     pub fn alloc(k: *Keep, mem: *gpu.Memory, N: usize, E: usize, K: usize, D: usize) !void {
         const Tk = slotCapacity(N, E, K);
@@ -64,6 +77,10 @@ pub const Keep = struct {
         k.perm = try mem.allocT(i32, Tk);
         k.H = try mem.allocT(bf16, N * D);
         k.Yg = try mem.allocT(bf16, Tk * D);
+        k.Wq = try mem.allocT(u8, E * D * D / 2);
+        k.Wsc = try mem.allocT(u8, E * D * D / 16);
+        k.gW = try mem.callocT(f32, 1);
+        k.alpha = try mem.callocT(f32, 1);
     }
 };
 
@@ -91,6 +108,20 @@ pub const Ws = struct {
     dlog_b: [*]bf16 = undefined,
     dXg: [*]bf16 = undefined,
     Xf: [*]f32 = undefined, // (N,D) fp32 copy of H for the router weight gradient
+    /// The gathered rows in NVFP4, and the matmul descriptor for the current
+    /// padding. Querying the heuristic is not free, so it is kept until the
+    /// shape changes.
+    Xq: [*]u8 = undefined,
+    Xsc: [*]u8 = undefined,
+    gX: [*]f32 = undefined,
+    zero: [*]f32 = undefined, // a device-resident 0 for the matmul's beta
+    fq: ?fp4.Gemm = null,
+    fq_pm: i32 = -1,
+    /// The unbatched path needs one descriptor per row count, and the row
+    /// counts are whatever the router produced - so they are cached by
+    /// rows/128 and built once each. Without this the heuristic would be
+    /// queried per expert per window, which costs more than the format saves.
+    fqs: [FQ_SLOTS]?fp4.Gemm = @splat(null),
 
     pub fn alloc(w: *Ws, mem: *gpu.Memory, N: usize, E: usize, K: usize, D: usize) !void {
         // Room for every expert to be padded to the same length, up to twice
@@ -109,6 +140,10 @@ pub const Ws = struct {
         w.dlog_b = try mem.allocT(bf16, N * E);
         w.dXg = try mem.allocT(bf16, Tk * D);
         w.Xf = try mem.allocT(f32, N * D);
+        w.Xq = try mem.allocT(u8, Tk * D / 2);
+        w.Xsc = try mem.allocT(u8, Tk * D / 16);
+        w.gX = try mem.callocT(f32, 1);
+        w.zero = try mem.callocT(f32, 1);
         w.pxg = @intFromPtr(try mem.allocT(u64, E));
         w.pyg = @intFromPtr(try mem.allocT(u64, E));
         w.pdyg = @intFromPtr(try mem.allocT(u64, E));
@@ -136,6 +171,7 @@ pub const Ws = struct {
 };
 
 const linalg = @import("linalg.zig");
+const fp4 = @import("fp4.zig");
 
 /// Auxiliary load-balancing loss from the statistics the forward deferred.
 pub fn auxFrom(k: *Keep, hsum: []const f32) f32 {
@@ -156,7 +192,7 @@ fn blocks(n: usize) u32 {
 pub fn forward(gpa: std.mem.Allocator, kern: *gpu.Kernels, X: [*]const bf16, Wrouter: [*]const bf16,
                Wexp: []const [*]bf16, wptr: u64, Y: [*]bf16, k: *Keep, w: *Ws,
                N: usize, E: usize, K: usize, D: usize, beta: f32,
-               noise: f32, seed: u32) !f32 {
+               noise: f32, seed: u32, use_fp4: bool, stamp: i64) !f32 {
     k.N = @intCast(N);
     k.E = @intCast(E);
     k.K = @intCast(K);
@@ -205,7 +241,9 @@ pub fn forward(gpa: std.mem.Allocator, kern: *gpu.Kernels, X: [*]const bf16, Wro
     if (tk > 0) {
         try (try kern.get("gather_slot")).launch(blocks(N * K * D), 256,
             .{ X, k.slot_of, w.Xg, @as(i32, @intCast(N)), @as(i32, @intCast(K)), @as(i32, @intCast(D)) });
-        if (uniform) {
+        if (use_fp4) {
+            try fp4Experts(kern, Wexp, k, w, E, D, pm, ptk, uniform, stamp);
+        } else if (uniform) {
             try w.setPointers(gpa, E, D, @intCast(pm), k);
             try linalg.linearFwdBatched(pm, @intCast(D), @intCast(D), w.pxg, wptr, w.pyg, @intCast(E));
         } else for (0..E) |e| {
@@ -230,6 +268,84 @@ pub fn forward(gpa: std.mem.Allocator, kern: *gpu.Kernels, X: [*]const bf16, Wro
     var hsum: [17]f32 = undefined;
     try gpu.download(std.mem.sliceAsBytes(hsum[0 .. E + 1]), w.sum_p);
     return auxFrom(k, hsum[0 .. E + 1]);
+}
+
+/// The experts' forward matmul in NVFP4. Weights are quantised only when the
+/// optimizer has moved them; activations every window, since they are new
+/// every time.
+///
+/// Round-to-nearest for both, and no rotation: the paper is explicit that
+/// stochastic rounding and Hadamard transforms belong on the gradient path
+/// and hurt the forward pass.
+fn fp4Experts(kern: *gpu.Kernels, Wexp: []const [*]bf16, k: *Keep, w: *Ws,
+              E: usize, D: usize, pm: i32, ptk: i32, uniform: bool, stamp: i64) !void {
+    const quant = try kern.get("fp4_quant_w2d");
+    const amax = try kern.get("fp4_absmax");
+    const mkscale = try kern.get("fp4_scale");
+    const qa = try kern.get("fp4_quant");
+
+    if (k.stamp != stamp) {
+        // One scale over all experts of this layer, so the batched matmul
+        // carries it in a single alpha.
+        try gpu.zero(k.gW, 4);
+        for (0..E) |e|
+            try amax.launch(256, 256, .{ Wexp[e], k.gW, @as(i64, @intCast(D * D)) });
+        try mkscale.launch(1, 32, .{ k.gW, k.alpha, k.gW, @as(i32, 0) });
+        const tiles = D / 16 * (D / 16);
+        for (0..E) |e|
+            try quant.launch(blocks(tiles), 256, .{
+                Wexp[e], k.Wq + e * D * D / 2, k.Wsc + e * D * D / 16, k.gW,
+                @as(i32, @intCast(D)), @as(i32, @intCast(D)), @as(i64, @intCast(tiles)),
+            });
+        k.stamp = stamp;
+    }
+
+    // Every gathered row, in whichever layout the dispatch chose. One scale
+    // for the whole buffer, so each expert's slice carries the same alpha.
+    const nq: usize = @as(usize, @intCast(@max(ptk, 1))) * D;
+    try gpu.zero(w.gX, 4);
+    try amax.launch(256, 256, .{ w.Xg, w.gX, @as(i64, @intCast(nq)) });
+    // Writes the activation scale and, from it and the weight scale, alpha.
+    try mkscale.launch(1, 32, .{ w.gX, k.alpha, k.gW, @as(i32, 1) });
+    try qa.launch(blocks(nq / 16), 256, .{
+        w.Xg, w.Xq, w.Xsc, w.gX, @as(i32, 0), @as(u32, 0), @as(i64, @intCast(nq / 16)),
+    });
+
+    if (uniform) {
+        const rows: usize = @intCast(pm);
+        if (w.fq == null or w.fq_pm != pm) {
+            if (w.fq) |*g| g.deinit();
+            w.fq = try fp4.Gemm.initBatched(pm, @intCast(D), @intCast(D),
+                @ptrCast(k.Wsc), @ptrCast(w.Xsc), @intCast(E),
+                @intCast(D * D), @intCast(rows * D), @intCast(rows * D));
+            w.fq_pm = pm;
+        }
+        try w.fq.?.run(@ptrCast(k.Wq), @ptrCast(w.Xq), @ptrCast(k.Yg), &k.alpha[0], &w.zero[0]);
+        return;
+    }
+
+    // Unbatched. Tying the format to the batched dispatch is what made the
+    // first integration measure nothing at all: with a real router the
+    // padding test rejects batching in nearly every window, so the FP4 path
+    // never ran and the numbers that came back were bf16's.
+    for (0..E) |e| {
+        const erows = @divTrunc(k.hcnt[e] + 127, 128) * 128;
+        if (erows == 0) continue;
+        const off: usize = @intCast(k.phoff[e]);
+        const slot: usize = @intCast(@divTrunc(erows, 128));
+        if (slot >= FQ_SLOTS) { // beyond the cache: bf16 rather than a stall
+            try linalg.linearFwd(@intCast(erows), @intCast(D), @intCast(D),
+                w.Xg + off * D, Wexp[e], k.Yg + off * D);
+            continue;
+        }
+        if (w.fqs[slot] == null)
+            w.fqs[slot] = try fp4.Gemm.init(erows, @intCast(D), @intCast(D),
+                @ptrCast(k.Wsc), @ptrCast(w.Xsc));
+        const g = &w.fqs[slot].?;
+        g.setScales(@ptrCast(k.Wsc + e * D * D / 16), @ptrCast(w.Xsc + off * D / 16));
+        try g.run(@ptrCast(k.Wq + e * D * D / 2), @ptrCast(w.Xq + off * D / 2),
+            @ptrCast(k.Yg + off * D), &k.alpha[0], &w.zero[0]);
+    }
 }
 
 /// Backward through combine, the experts and the router, including the

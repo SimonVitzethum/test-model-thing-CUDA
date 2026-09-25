@@ -87,13 +87,54 @@ And one about measurement rather than the format: the first benchmark used
 uniform data, on which neither stochastic rounding nor a rotation can help.
 It reported both as harmful, correctly and uselessly.
 
+## Integration, and why it does not pay at this size
+
+The expert forward GEMM now runs in NVFP4 behind `fp4=1`, with the first
+block and the last two left in bf16 as the paper prescribes. Weights are
+quantised when the optimizer has moved them, activations every window.
+
+The first integration measured nothing. It ran FP4 only when the dispatch
+had chosen its batched form, and with a real router that test - at most a
+quarter more work than one matmul per expert - is rejected in nearly every
+window: measured padding ratios of 2.2 to 3.7. `fp4_quant` was called four
+times in two hundred steps. The identical loss and the 1% slowdown that came
+back were bf16's own numbers, twice. The format is no longer tied to the
+batched dispatch; the unbatched path caches one descriptor per row count.
+
+With it actually running, the cost is visible and the arithmetic is against
+it. At dim 512, 16 layers, the quantisation kernels take 520 ms out of a
+3160 ms step. The entire bf16 expert forward GEMM is 11.2 TFLOP over that
+same step, which at the measured 42 TFLOPS ceiling is 266 ms. **Making the
+GEMM free would save less than quantising for it costs.**
+
+```
+dim    layers   bf16 B/s   nvfp4 B/s
+512      16      173208     164997     -4.7%
+1024      8       83924      82518     -1.7%
+2048      8       28014      27203     -2.9%
+```
+
+The ratio that decides it is `MN/(M+N)`: quantisation cost scales with the
+tensors, the GEMM's work with their product. Here that is about 250. The
+shapes NVIDIA reports gains on put it an order of magnitude higher, and they
+need both M and N large at once - on 16 GB, widening the model shrinks the
+batch and the ratio does not move. Held-out loss is consistently a little
+worse (4.966 against 4.925 at dim 512), which is the quantisation error and
+is small.
+
+So this is built, correct, and currently a 2-5% loss. It is kept because the
+ratio is a property of the shape, not of the implementation.
+
 ## What is not built
 
-Integration into the training path. That means: a config flag, quantising
-the expert weights after each optimizer step and the activations each
-forward, routing `linearFwd`/`linearDX`/`linearDW` through `fp4.Gemm`,
-applying the three modes by tensor role rather than globally, and excluding
-the first and last blocks.
+The backward path: `linearDX` and `linearDW` through `fp4.Gemm`, with
+stochastic rounding on the gradients and the Hadamard rotation on the Wgrad
+inputs only, and the three modes applied by tensor role rather than
+globally. Worth noting before building it that it is not the free
+amortisation it looks like: each of the three GEMMs contracts over a
+different axis, and NVFP4's block scales run along the contraction axis, so
+each tensor needs quantising twice rather than once. The saving triples and
+the cost doubles.
 
 MXFP4 is not available through cuBLASLt on sm_120 - zero algorithms - though
 the PTX assembles, so it would need hand-written MMA. NVFP4 does not.

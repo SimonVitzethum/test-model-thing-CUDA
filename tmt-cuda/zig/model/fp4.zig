@@ -20,6 +20,8 @@ const CUDA_R_16BF: c_int = 14;
 const CUDA_R_4F_E2M1: c_int = 33;
 const CUBLAS_COMPUTE_32F: c_int = 68;
 
+const DESC_POINTER_MODE: c_int = 2;
+const POINTER_MODE_DEVICE: c_int = 1;
 const DESC_TRANSA: c_int = 3;
 const DESC_TRANSB: c_int = 4;
 const DESC_A_SCALE_POINTER: c_int = 17;
@@ -115,6 +117,9 @@ pub const Gemm = struct {
         const ta: c_int = OP_T;
         const tb: c_int = OP_N;
         const mode: c_int = SCALE_VEC16_UE4M3;
+        // alpha lives on the device, so the scales never have to be read back.
+        const pm: c_int = POINTER_MODE_DEVICE;
+        _ = cublasLtMatmulDescSetAttribute(g.desc, DESC_POINTER_MODE, &pm, @sizeOf(c_int));
         _ = cublasLtMatmulDescSetAttribute(g.desc, DESC_TRANSA, &ta, @sizeOf(c_int));
         _ = cublasLtMatmulDescSetAttribute(g.desc, DESC_TRANSB, &tb, @sizeOf(c_int));
         _ = cublasLtMatmulDescSetAttribute(g.desc, DESC_A_SCALE_MODE, &mode, @sizeOf(c_int));
@@ -155,15 +160,27 @@ pub const Gemm = struct {
         return g;
     }
 
+    /// The block-scale pointers are descriptor attributes, not arguments, so
+    /// running the same shape over a different operand - one expert after
+    /// another out of one gathered buffer - means moving them between calls.
+    pub fn setScales(g: *const Gemm, w_scale: *const anyopaque, x_scale: *const anyopaque) void {
+        const ap: usize = @intFromPtr(w_scale);
+        const bp: usize = @intFromPtr(x_scale);
+        _ = cublasLtMatmulDescSetAttribute(g.desc, DESC_A_SCALE_POINTER, &ap, @sizeOf(usize));
+        _ = cublasLtMatmulDescSetAttribute(g.desc, DESC_B_SCALE_POINTER, &bp, @sizeOf(usize));
+    }
+
     /// `alpha` carries the two per-tensor scales. cuBLASLt applies the e4m3
     /// block scales and nothing else, so the outer fp32 scale that keeps
     /// those blocks inside e4m3's range has to be multiplied back in here -
     /// leaving it out makes the result too large by 1/(gA*gB), which for
     /// weights of this size is a factor of about 8e9.
-    pub fn run(g: *const Gemm, W: *const anyopaque, X: *const anyopaque, Y: *anyopaque, alpha: f32) !void {
-        const al: f32 = alpha;
-        const be: f32 = 0;
-        const rc = cublasLtMatmul(lt, g.desc, &al, W, g.la, X, g.lb, &be, Y, g.ld, Y, g.ld,
+    /// `alpha` and `beta` are device pointers; see the pointer mode above.
+    pub fn run(g: *const Gemm, W: *const anyopaque, X: *const anyopaque, Y: *anyopaque,
+               alpha: *const f32, beta: *const f32) !void {
+        const al = alpha;
+        const be = beta;
+        const rc = cublasLtMatmul(lt, g.desc, al, W, g.la, X, g.lb, be, Y, g.ld, Y, g.ld,
             &g.algo, workspace, WS_BYTES, null);
         if (rc != 0) return fail("cublasLtMatmul", rc);
     }

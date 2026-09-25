@@ -1815,6 +1815,21 @@ export fn fp4_absmax(src: cuda.ConstGlobal(bf16), out: cuda.Global(f32), n: i64)
     if (t == 0) _ = cuda.atomicMaxF32(&out[0], @floatCast(mt_buf[0]));
 }
 
+/// Turns an absolute maximum into the per-tensor encode scale, on the device,
+/// so nothing has to travel to the host and back between two kernels. The
+/// first version of this path downloaded the value, and with one download per
+/// layer per window it cost more than the four-bit matmul saved.
+export fn fp4_scale(amax: cuda.Global(f32), alpha: cuda.Global(f32),
+                    other: cuda.ConstGlobal(f32), write_alpha: i32) callconv(.nvptx_kernel) void {
+    if (cuda.globalIdX() != 0) return;
+    const a = amax[0];
+    const s = if (a > 0) a * (1.0 / 6.0 / 448.0) else @as(f32, 1);
+    amax[0] = s;
+    // The matmul's alpha is the product of both operands' scales, since
+    // cuBLASLt applies only the e4m3 block scales.
+    if (write_alpha != 0) alpha[0] = s * other[0];
+}
+
 /// Quantises a bf16 matrix to NVFP4: two e2m1 values per output byte, one
 /// e4m3 scale per sixteen values along the contiguous axis, and one fp32
 /// scale for the whole tensor.

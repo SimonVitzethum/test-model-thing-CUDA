@@ -21,6 +21,7 @@
     F(int, accum, 1) \
     F(int, mup, 0) F(int, mup_base, 256) F(int, muon, 0) F(float, muon_lr, .02f) \
     F(int, mtp, 0) F(float, mtp_weight, .3f) \
+    F(int, fp4, 0) F(int, fp4_keep_first, 1) F(int, fp4_keep_last, 2) \
     F(float, rnoise, 0.f) F(int, rwarm, 0) \
     F(float, wavg, 0.f) F(int, wavg_every, 8) \
     F(int, mom_bf16, 0) F(int, master_bf16, 0) \
@@ -79,7 +80,7 @@ static void validate_cfg(const Cfg& c) {
     // but switching them on would silently train a different model.
     require(c.patch == 0 && c.patch_hi == 0 && c.mup == 0 && c.muon == 0 && c.mtp == 0 &&
                 c.accum == 1 && c.wavg == 0 && c.mom_bf16 == 0 && c.master_bf16 == 0 &&
-                c.rnoise == 0,
+                c.rnoise == 0 && c.fp4 == 0,
             "patch, mup, muon, mtp, accum, wavg and the bf16 optimizer state need the Zig build");
     require(c.mem == 0 || c.mem == 1, "mem must be 0 or 1");
     if (c.mem) {

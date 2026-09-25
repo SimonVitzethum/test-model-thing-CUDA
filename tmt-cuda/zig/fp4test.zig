@@ -139,6 +139,8 @@ pub fn main(init: std.process.Init) !u8 {
         const Bs = try mem.allocT(u8, un * uk / 16);
         const Dq = try mem.allocT(u16, um * un);
         const ga = try mem.allocT(f32, 1);
+        const dal = try mem.allocT(f32, 1);
+        const dze = try mem.callocT(f32, 1);
 
         const ha = try gpa.alloc(u16, um * uk);
         const hb2 = try gpa.alloc(u16, un * uk);
@@ -185,14 +187,22 @@ pub fn main(init: std.process.Init) !u8 {
 
         const reps: usize = 50;
         try linalg.linearFwd(M, NN, K, Ab, Bb, Db);
-        try g.run(@ptrCast(Bq), @ptrCast(Aq), @ptrCast(Dq), hg2 * hg2);
+        {
+            const a2 = hg2 * hg2;
+            try gpu.upload(dal, std.mem.asBytes(&a2));
+        }
+        try g.run(@ptrCast(Bq), @ptrCast(Aq), @ptrCast(Dq), @ptrCast(dal), @ptrCast(dze));
         try gpu.synchronize();
         var t0 = now();
         for (0..reps) |_| try linalg.linearFwd(M, NN, K, Ab, Bb, Db);
         try gpu.synchronize();
         const t_bf = (now() - t0) / 1e3 / @as(f64, @floatFromInt(reps));
         t0 = now();
-        for (0..reps) |_| try g.run(@ptrCast(Bq), @ptrCast(Aq), @ptrCast(Dq), hg2 * hg2);
+        for (0..reps) |_| {
+            const a2 = hg2 * hg2;
+            try gpu.upload(dal, std.mem.asBytes(&a2));
+        }
+        try g.run(@ptrCast(Bq), @ptrCast(Aq), @ptrCast(Dq), @ptrCast(dal), @ptrCast(dze));
         try gpu.synchronize();
         const t_q = (now() - t0) / 1e3 / @as(f64, @floatFromInt(reps));
 
